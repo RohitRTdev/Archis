@@ -79,9 +79,12 @@ fn generate_interrupt_stubs(arch: &str, is_test: bool) {
     }
 
     rs.push_str("];\n");
-
-    write_if_changed(&format!("src/hal/{}/asm/int_stub.S", arch), &asm);
-    write_if_changed(&format!("src/hal/{}/asm/int_stub.rs", arch), &rs);
+    let int_stub_asm = format!("src/hal/{}/asm/int_stub.S", arch);
+    let int_stub_rs = format!("src/hal/{}/asm/int_stub.rs", arch);
+    write_if_changed(&int_stub_asm, &asm);
+    write_if_changed(&int_stub_rs, &rs);
+    println!("cargo:rerun-if-changed={}", int_stub_asm);
+    println!("cargo:rerun-if-changed={}", int_stub_rs);
 }
 
 fn generate_stubs(arch: &str) {
@@ -108,8 +111,10 @@ fn generate_stubs(arch: &str) {
             output.push_str("}\n\n");
         }
     }
-
-    write_if_changed(&format!("src/hal/{}/asm/stub.rs", arch), &output);
+    
+    let stub = format!("src/hal/{}/asm/stub.rs", arch);  
+    write_if_changed(&stub, &output);
+    println!("cargo:rerun-if-changed={}", stub);
 }
 
 fn assemble_and_link(path: &Path, out_dir: &Path, asm_dir: &Path, target: &str) {
@@ -302,6 +307,8 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
         fs::write(&stub_path, &generated)
             .map_err(|e| e.to_string())?;
 
+        println!("cargo:rerun-if-changed={}", stub_path.display());
+
         let driver_conf_path =
             driver_dir.join("driver.conf");
 
@@ -409,14 +416,14 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
     #[derive(Clone, Copy)]
     enum VisitState {
         Visiting,
-        Visited,
+        Visited
     }
 
     fn dfs(
         node: &str,
         graph: &HashMap<String, Vec<String>>,
         states: &mut HashMap<String, VisitState>,
-        ordering: &mut Vec<String>,
+        ordering: &mut Vec<String>
     ) -> Result<(), String> {
         match states.get(node) {
             Some(VisitState::Visited) => {
@@ -458,13 +465,13 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
                 dep,
                 graph,
                 states,
-                ordering,
+                ordering
             )?;
         }
 
         states.insert(
             node.to_string(),
-            VisitState::Visited,
+            VisitState::Visited
         );
 
         ordering.push(node.to_string());
@@ -472,8 +479,7 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
         Ok(())
     }
 
-    let mut states =
-        HashMap::<String, VisitState>::new();
+    let mut states = HashMap::<String, VisitState>::new();
 
     let mut ordering = Vec::new();
 
@@ -482,7 +488,7 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
             driver,
             &dep_graph,
             &mut states,
-            &mut ordering,
+            &mut ordering
         )?;
     }
 
@@ -550,6 +556,7 @@ fn main() {
 
     generate_interrupt_stubs(&arch, is_test);
     generate_stubs(&arch);
+    generate_import_stubs("src/drivers").expect("Failed to build driver import stubs!");
     if is_test {
         println!("cargo:warning=Skipping build.rs logic during tests.");
         return;
@@ -579,6 +586,5 @@ fn main() {
         build_acpica(out_dir.as_path(), target.as_str());
     } 
 
-    generate_import_stubs("src/drivers").expect("Failed to build driver import stubs!");
 
 }
