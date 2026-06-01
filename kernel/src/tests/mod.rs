@@ -1,7 +1,8 @@
 use core::{alloc::Layout, ptr::NonNull};
 use std::{sync::{Arc, Mutex, OnceLock}};
 
-use crate::{ds::*, mem};
+use crate::mem::{self, FixedList};
+use kernel_intf::list::List;
 use kernel_intf::KError;
 use common::test_log;
 
@@ -19,14 +20,15 @@ fn get_test_lock() -> &'static Arc<Mutex<bool>> {
     TEST_LOCK.get_or_init(|| Arc::new(Mutex::new(false)))
 }
 
+
 #[test]
 fn list_clear_test() {
     let _guard = get_test_lock().lock().unwrap();
     mem::clear_heap();
     mem::setup_heap();
 
-    let mut structure: FixedList<Sample, {mem::Regions::Region0 as usize}> = List::new();
     test_log!("Starting list_clear_test");
+    let mut structure: FixedList<Sample, {mem::Regions::Region0 as usize}> = List::new();
 
     #[derive(Debug, Clone)]
     struct TestStruct {
@@ -114,7 +116,6 @@ fn list_clear_test() {
             assert!(false, "List deallocations failed!");
         }
     }
-
 }
 
 
@@ -133,27 +134,27 @@ fn fixed_allocator_test() {
     let (heap, r0_bm) = mem::get_heap(mem::Regions::Region0);
 
     // This should allocate first 3 slots in heap from region 0
-    let ptr1 = <Allocator as mem::Allocator<Sample>>::alloc(layout).unwrap();
+    let ptr1 = <Allocator as kernel_intf::mem::Allocator<Sample>>::alloc(layout).unwrap();
     assert_eq!(ptr1.as_ptr() as *const u8, heap);
     assert_eq!(unsafe {*r0_bm}, 0x07);
     
-    let ptr2 = <Allocator as mem::Allocator<Sample>>::alloc(layout).unwrap();
+    let ptr2 = <Allocator as kernel_intf::mem::Allocator<Sample>>::alloc(layout).unwrap();
     assert_eq!(ptr2.as_ptr() as *const u8, unsafe {heap.add(size_of::<Sample>() * 3)});
     assert_eq!(unsafe {*r0_bm}, 0x3f);
     unsafe {
-        <Allocator as mem::Allocator<Sample>>::dealloc(ptr1, layout);
+        <Allocator as kernel_intf::mem::Allocator<Sample>>::dealloc(ptr1, layout);
     }
 
     assert_eq!(unsafe {*r0_bm}, 0x38);
 
     layout = Layout::array::<Sample>(4).unwrap();
-    let ptr3 = <Allocator as mem::Allocator<Sample>>::alloc(layout).unwrap();
+    let ptr3 = <Allocator as kernel_intf::mem::Allocator<Sample>>::alloc(layout).unwrap();
     assert_eq!(ptr3.as_ptr() as *const u8, unsafe {heap.add(size_of::<Sample>() * 6)});
     assert_eq!(unsafe {*r0_bm}, 0xf8);
     assert_eq!(unsafe {*r0_bm.add(1)}, 0x03);
-    
+
     // Check allocation on different region
-    let ptr1 = <Allocator1 as mem::Allocator<Sample>>::alloc(layout).unwrap();
+    let ptr1 = <Allocator1 as kernel_intf::mem::Allocator<Sample>>::alloc(layout).unwrap();
     let (heap1, r1_bm) = mem::get_heap(mem::Regions::Region1);
     assert_eq!(ptr1.as_ptr() as *const u8, heap1);
     assert_eq!(unsafe {*r1_bm}, 0x0f);
@@ -201,38 +202,6 @@ fn list_alloc_test() {
     
     assert_eq!(unsafe {*r0_bm}, 0x7);
 }
-
-#[test]
-fn queue_alloc_test() {
-    let mut structure: Queue<Sample, mem::FixedAllocator<ListNode<Sample>, {mem::Regions::Region0 as usize}>> = Queue::new();
-    let _guard = get_test_lock().lock().unwrap();
-    mem::clear_heap();
-    mem::setup_heap();
-    test_log!("Starting queue_alloc_test");
-    let (_, r0_bm) = mem::get_heap(mem::Regions::Region0);
-
-    structure.push(Sample{_a:14, _b: 23}).unwrap();
-    structure.push(Sample{_a:214, _b: 223}).unwrap();
-    structure.push(Sample{_a:-1024, _b: 90}).unwrap();
- 
-    assert_eq!(unsafe {*r0_bm}, 0x7);
-
-    let mut val = structure.pop_node();
-    while val.is_some() {
-        println!("{:?}", *val.unwrap());
-        val = structure.pop_node();
-    }
-    assert_eq!(unsafe {*r0_bm}, 0x0);
-
-    structure.push(Sample{_a:55, _b:11}).unwrap();
-    let data = structure.pop_node().unwrap();
-    assert_eq!(unsafe {*r0_bm}, 0x1); 
-    structure.push_node(ListNode::into_inner(data));
-    assert_eq!(unsafe {*r0_bm}, 0x1);
-    println!("{:?}", *structure.pop_node().unwrap());
-    assert_eq!(unsafe {*r0_bm}, 0x0);
-}
-
 
 #[test]
 fn phy_alloc_test() {

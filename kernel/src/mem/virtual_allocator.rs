@@ -1,7 +1,8 @@
 use crate::{REMAP_LIST, cpu::{self, PerCpu}, mem::{KERNEL_HALF_OFFSET, KERNEL_HALF_OFFSET_RAW, PageDescriptor, fixed_allocator::Regions::*}};
 use crate::sync::{Once, Spinlock};
 use crate::hal::{self, PageMapper};
-use crate::ds::*;
+use crate::mem::FixedList;
+use kernel_intf::list::{List, ListNode};
 use crate::cpu::MAX_CPUS;
 use kernel_intf::KError;
 use kernel_intf::{info, debug};

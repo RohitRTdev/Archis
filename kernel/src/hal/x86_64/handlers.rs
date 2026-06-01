@@ -14,8 +14,9 @@ use super::MAX_INTERRUPT_VECTORS;
 use super::asm;
 use crate::hal::halt;
 use crate::devices::ioapic::add_redirection_entry;
-use crate::ds::*;
-use crate::mem::Regions::Region4;
+use crate::mem::FixedList;
+use kernel_intf::list::List;
+use crate::mem::Regions::Region3;
 
 pub const PAGE_FAULT_VECTOR: usize = 14;
 pub const DOUBLE_FAULT_VECTOR: usize = 8;
@@ -53,7 +54,7 @@ static PER_CPU_GLOBAL_CONTEXT: PerCpu<AtomicUsize> = PerCpu::new_with(
     [const {AtomicUsize::new(0)}; MAX_CPUS]
 );
 
-static IPI_REQUESTS: Spinlock<FixedList<IPIRequest, {Region4 as usize}>> = Spinlock::new(List::new());
+static IPI_REQUESTS: Spinlock<FixedList<IPIRequest, {Region3 as usize}>> = Spinlock::new(List::new());
 
 static mut VECTOR_TABLE: [fn(usize); MAX_INTERRUPT_VECTORS] = [default_handler; MAX_INTERRUPT_VECTORS];
 const UNDEFINED_STRING: &'static str = "Undefined";

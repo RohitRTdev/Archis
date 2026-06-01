@@ -1,148 +1,13 @@
-use core::alloc::Layout;
-use core::marker::PhantomData;
 use alloc::sync::Arc;
 use alloc::string::String;
 use alloc::borrow::ToOwned;
-use common::{MemoryRegion, PAGE_SIZE};
 use kernel_intf::{KError, info};
 use crate::INIT_FS;
-use crate::hal::copy_user_memory;
-use crate::mem::{PageDescriptor, PoolAllocatorGlobal, allocate_memory, deallocate_memory};
-use crate::sched::{add_new_handle, Handle::FileHandle};
 use crate::sync::Spinlock;
+use kernel_intf::mem::PoolAllocatorGlobal;
+use super::{FileBuffer, FilePath};
 
 pub type FileInstance = Arc<Spinlock<FileInst>, PoolAllocatorGlobal>;
-
-pub struct FileBuffer {
-    region: MemoryRegion,
-    is_user: bool,
-    own: bool,
-
-    // Send trait is unsafe here, because if the buffer refers 
-    // to user memory, it is only valid in the current process context
-    _nosend: PhantomData<*const ()> 
-}
-
-impl FileBuffer {
-    pub fn into_inner(buf: &mut Self) {
-        buf.own = false;
-    }
-
-    pub fn new(size: usize, is_user: bool) -> Result<Self, KError> {
-        let base_address = allocate_memory(
-            Layout::from_size_align(size, PAGE_SIZE).unwrap(),
-        PageDescriptor::VIRTUAL | (if is_user {PageDescriptor::USER} else {0})
-        )?.addr();
-
-        Ok(
-            Self {
-                region: MemoryRegion {
-                    base_address,
-                    size
-                },
-                is_user,
-                own: true,
-                _nosend: PhantomData
-            }
-        )
-    }
-
-    pub fn from(base_address: usize, size: usize, is_user: bool) -> Self {
-        Self {
-            region: MemoryRegion { 
-                base_address, 
-                size 
-            },
-            is_user,
-            own: false,
-            _nosend: PhantomData
-        }
-    }
-
-    // dest pointer here must be kernel memory
-    pub fn read(&self, to: usize, len: usize, offset: usize) {
-        assert!(len + offset <= self.region.size);
-        if len == 0 {
-            return;
-        }
-        
-        if self.is_user {
-            unsafe {
-                copy_user_memory(
-                    to as *mut u8, 
-                    (self.region.base_address as *mut u8).add(offset),
-                    len
-                );
-            }
-        }
-        else {
-            unsafe {
-                core::ptr::copy(
-                    (self.region.base_address as *const u8).add(offset),
-                    to as *mut u8,
-                    len
-                )
-            }
-        }
-    }
-    
-    // src pointer here must be kernel memory
-    pub fn write(&self, from: usize, len: usize, offset: usize) {
-        assert!(len + offset <= self.region.size);
-        if len == 0 {
-            return;
-        }
-
-        if self.is_user {
-            unsafe {
-                copy_user_memory(
-                    (self.region.base_address as *mut u8).add(offset),
-                    from as *const u8, 
-                    len
-                );
-            }
-        }
-        else {
-            unsafe {
-                core::ptr::copy(
-                    from as *const u8,
-                    (self.region.base_address as *mut u8).add(offset),
-                    len
-                )
-            }
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.region.size
-    }
-
-    pub fn as_slice<'a>(&'a self) -> &'a [u8] {
-        unsafe {
-            core::slice::from_raw_parts(
-                self.region.base_address as *const u8,
-                self.len()
-            )
-        }
-    }
-}
-
-impl Drop for FileBuffer {
-    fn drop(&mut self) {
-        if !self.own {
-            return;
-        }
-
-        deallocate_memory(
-            self.region.base_address as *mut u8,
-            Layout::from_size_align(
-                self.region.size,
-                PAGE_SIZE
-            ).unwrap(),
-            PageDescriptor::VIRTUAL | (if self.is_user {PageDescriptor::USER} else {0})
-        ).expect("Filebuffer memory deallocation failed!");
-    }
-}
 
 pub struct FileInst {
     file_name: String,
@@ -184,8 +49,12 @@ impl FileInst {
     pub fn get_offset(&self) -> usize {
         self.offset
     }
+    
+    pub fn get_path(&self) -> FilePath<'_> {
+        FilePath::from(self.file_name.as_str())
+    }
 
-    pub fn get_path(&self) -> &str {
+    pub fn get_name(&self) -> &str {
         self.file_name.as_str()
     }
 }

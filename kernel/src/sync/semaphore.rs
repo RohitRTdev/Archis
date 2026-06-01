@@ -1,7 +1,9 @@
 use core::ptr::NonNull;
 use alloc::sync::Arc;
 use super::Spinlock;
-use crate::{ds::*, mem::PoolAllocatorGlobal, sched::{self, KTimerInnerType}};
+use crate::{sched::{self, KTimerInnerType}};
+use kernel_intf::mem::PoolAllocatorGlobal;
+use kernel_intf::list::{List, DynList};
 use kernel_intf::KError;
 use crate::sched::KThread;
 

@@ -4,7 +4,7 @@ use crate::infra;
 use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use crate::BOOT_INFO;
 use crate::mem::PHY_MEM_CB;
-use crate::ds::*;
+use kernel_intf::list::{List, DynList};
 use crate::sync::Spinlock;
 use crate::cpu::{self, MAX_CPUS};
 use kernel_intf::{debug, info};

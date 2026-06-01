@@ -1,8 +1,11 @@
 #![no_std]
+#![feature(allocator_api)]
 
 mod log;
 pub use log::*;
-use core::{fmt, panic::PanicInfo};
+pub mod mem;
+pub mod list;
+use core::fmt;
 use common::StrRef;
 
 #[repr(C)]
@@ -94,6 +97,10 @@ unsafe extern "C" {
     pub fn unmap_memory_ffi(virt_addr: *mut u8, size: usize) -> KError; 
     pub fn allocate_memory_ffi(size: usize, align: usize, flags: u8) -> KError;
     pub fn deallocate_memory_ffi(addr: *mut u8, size: usize, align: usize, flags: u8) -> KError;
+    pub fn pool_alloc_ffi(size: usize, align: usize, out: *mut *mut u8) -> KError;
+    pub fn pool_dealloc_ffi(ptr: *mut u8, size: usize, align: usize) -> KError;
+    pub fn heap_alloc_ffi(size: usize, align: usize, out: *mut *mut u8) -> KError;
+    pub fn heap_dealloc_ffi(ptr: *mut u8, size: usize, align: usize) -> KError;
     pub fn panic_router(mod_name: StrRef, info: StrRef) -> !;
     pub fn exported_function();
 }

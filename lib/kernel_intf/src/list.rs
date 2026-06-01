@@ -1,5 +1,5 @@
-use kernel_intf::KError;
-use crate::mem::{Allocator, FixedAllocator, PoolAllocator};
+use crate::KError;
+use crate::mem::{Allocator, PoolAllocator};
 use core::alloc::Layout;
 use core::mem;
 use core::ops::{Deref, DerefMut};
@@ -7,8 +7,7 @@ use core::ptr::NonNull;
 use core::marker::PhantomData;
 use core::fmt::{self, Debug};
 
-pub type FixedList<T, const REGION: usize> = List<T, FixedAllocator<ListNode<T>, REGION>>;
-pub type DynList<T> = List<T, PoolAllocator<ListNode<T>>>;
+pub type DynList<T> = List<T, PoolAllocator>;
 
 pub struct ListIter<'a, T> {
     current: Option<&'a ListNode<T>>,
@@ -20,6 +19,7 @@ pub struct ListIterMut<'a, T> {
     head: Option<NonNull<ListNode<T>>>,
     _marker: PhantomData<&'a mut ListNode<T>>
 }
+
 pub struct ListNode<T> {
     data: T,
     prev: NonNull<ListNode<T>>,
@@ -85,9 +85,10 @@ impl<T, A: Allocator<ListNode<T>>> DerefMut for ListNodeGuard<T, A> {
 impl<T, A: Allocator<ListNode<T>>> Drop for ListNodeGuard<T, A> {
     fn drop(&mut self) {
         unsafe {
-            let layout = Layout::new::<ListNode<T>>();
+            let size = mem::size_of::<ListNode<T>>();
+            let align = mem::align_of::<ListNode<T>>();
             core::ptr::drop_in_place(self.guard.as_ptr());
-            A::dealloc(self.guard, layout);
+            A::dealloc(self.guard, Layout::from_size_align(size, align).unwrap());
         }
     }
 }
@@ -119,7 +120,7 @@ impl<T, A: Allocator<ListNode<T>>> List<T, A> {
             _marker: PhantomData
         }
     }
-    
+
     pub fn first(&self) -> Option<&ListNode<T>> {
         if let Some(head) = self.head {
             unsafe { Some(&*head.as_ptr()) }
@@ -149,8 +150,9 @@ impl<T, A: Allocator<ListNode<T>>> List<T, A> {
 
 
     pub fn add_node(&mut self, data: T) -> Result<(), KError> {
-        let layout = Layout::new::<ListNode<T>>();
-        let ptr = A::alloc(layout)?.as_ptr();
+        let size = mem::size_of::<ListNode<T>>();
+        let align = mem::align_of::<ListNode<T>>();
+        let ptr = A::alloc(Layout::from_size_align(size, align).unwrap())?.as_ptr();
         let node = NonNull::new(ptr).unwrap();
 
         unsafe {
@@ -230,7 +232,7 @@ impl<T, A: Allocator<ListNode<T>>> List<T, A> {
         }
     }
 
-    // This is unsafe, since it is caller's responsibility to ensure that the given ListNode is a valid node that is 
+    // This is unsafe, since it is caller's responsibility to ensure that the given ListNode is a valid node that is
     // part of this list
     pub unsafe fn remove_node(&mut self, this: NonNull<ListNode<T>>) -> ListNodeGuard<T, A> {
         let node = unsafe { &mut *this.as_ptr() };

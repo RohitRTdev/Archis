@@ -1,5 +1,5 @@
 use crate::sync::{KSem, Spinlock};
-use crate::mem::PoolAllocatorGlobal;
+use kernel_intf::mem::PoolAllocatorGlobal;
 use alloc::sync::Arc;
 use kernel_intf::KError;
 

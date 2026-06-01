@@ -1,5 +1,7 @@
 use common::{MemType, MemoryDesc, PAGE_SIZE};
-use crate::{ds::*, RemapEntry, RemapType::*, BOOT_INFO, REMAP_LIST};
+use crate::{RemapEntry, RemapType::*, BOOT_INFO, REMAP_LIST};
+use crate::mem::FixedList;
+use kernel_intf::list::{List, ListNode};
 use crate::sync::{Once, Spinlock};
 use kernel_intf::KError;
 use kernel_intf::info;

@@ -1,10 +1,10 @@
-use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 use core::mem::{size_of, align_of};
 use common::{align_up, PAGE_SIZE};
 use crate::mem::{allocate_memory, PageDescriptor};
 use crate::sync::Spinlock;
-use kernel_intf::info;
+use kernel_intf::{info, KError};
+use core::alloc::Layout;
 
 pub struct ListNode {
     size: usize,
@@ -19,7 +19,6 @@ pub struct LinkedListAllocator {
 unsafe impl Send for LinkedListAllocator {}
 
 impl LinkedListAllocator {
-    #[cfg(not(test))]
     pub const fn new() -> Self {
         Self {
             head: core::ptr::null_mut(),
@@ -27,9 +26,7 @@ impl LinkedListAllocator {
         }
     }
 
-    fn find_fit(&mut self, layout: Layout) -> Option<*mut ListNode> {
-        let size = layout.size();
-        let align = layout.align();
+    fn find_fit(&mut self, size: usize, align: usize) -> Option<*mut ListNode> {
         let mut prev: *mut ListNode = core::ptr::null_mut();
         let mut current = self.head;
         while !current.is_null() {
@@ -63,10 +60,8 @@ impl LinkedListAllocator {
         self.head = node;
     }
 
-    // Given a ListNode pointer, layout, and allocator, split the node and return the aligned pointer.
-    fn use_list_node(&mut self, node_ptr: *mut ListNode, layout: Layout) -> *mut u8 {
-        let size = layout.size();
-        let align = layout.align();
+    // Given a ListNode pointer, size/align, split the node and return the aligned pointer.
+    fn use_list_node(&mut self, node_ptr: *mut ListNode, size: usize, align: usize) -> *mut u8 {
         let node = unsafe { &mut *node_ptr };
         let addr = node_ptr as usize;
         let aligned_addr = align_up(addr, align);
@@ -84,53 +79,62 @@ impl LinkedListAllocator {
         if remaining >= size_of::<ListNode>() {
             self.add_free_region(next_aligned_addr, remaining);
         }
-        
+
         aligned_addr as *mut u8
     }
 }
 
-unsafe impl GlobalAlloc for Spinlock<LinkedListAllocator> {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let size = layout.size().max(size_of::<ListNode>());
-        let align = layout.align().max(align_of::<ListNode>());
-        let layout = Layout::from_size_align(size, align).unwrap();
-        let mut allocator = self.lock();
+static HEAP: Spinlock<LinkedListAllocator> = Spinlock::new(LinkedListAllocator::new());
 
-        // If not enough memory is reserved, just skip the search and ask virtual allocator for memory
-        if allocator.backing_memory >= size {
-            if let Some(node_ptr) = allocator.find_fit(layout) {
-                return allocator.use_list_node(node_ptr, layout);
-            }
-        }
+fn heap_alloc_impl(size: usize, align: usize) -> *mut u8 {
+    let size = size.max(size_of::<ListNode>());
+    let align = align.max(align_of::<ListNode>());
+    let mut allocator = HEAP.lock();
 
-        // Out of memory, request more from virtual allocator and retry
-        let alloc_size = align_up(size, PAGE_SIZE);
-        match allocate_memory(Layout::from_size_align(alloc_size, PAGE_SIZE).unwrap(), PageDescriptor::VIRTUAL).as_ref() {
-            Ok(mem) => {
-                allocator.add_free_region(*mem as usize, alloc_size);
-                allocator.backing_memory += alloc_size;
-                if let Some(node_ptr) = allocator.find_fit(layout) {
-                    allocator.use_list_node(node_ptr, layout)
-                } else {
-                    info!("Heap allocator could not find a fit for allocation size:{} and alignment:{} despite adding new memory", size, align);
-                    null_mut()
-                }
-            },
-            Err(_) => {
-                info!("Frame allocator has run out of memory for allocation size:{} and alignment:{}", size, align); 
-                null_mut()
-            }
+    // If not enough memory is reserved, just skip the search and ask virtual allocator for memory
+    if allocator.backing_memory >= size {
+        if let Some(node_ptr) = allocator.find_fit(size, align) {
+            return allocator.use_list_node(node_ptr, size, align);
         }
     }
 
-    unsafe fn dealloc(&self, addr: *mut u8, layout: Layout) {
-        let size = layout.size().max(size_of::<ListNode>());
-        let mut allocator = self.lock();
-        allocator.add_free_region(addr as usize, size);
-        allocator.backing_memory += size;
+    // Out of memory, request more from virtual allocator and retry
+    let alloc_size = align_up(size, PAGE_SIZE);
+    match allocate_memory(Layout::from_size_align(alloc_size, PAGE_SIZE).unwrap(), PageDescriptor::VIRTUAL).as_ref() {
+        Ok(mem) => {
+            allocator.add_free_region(*mem as usize, alloc_size);
+            allocator.backing_memory += alloc_size;
+            if let Some(node_ptr) = allocator.find_fit(size, align) {
+                allocator.use_list_node(node_ptr, size, align)
+            } else {
+                info!("Heap allocator could not find a fit for allocation size:{} and alignment:{} despite adding new memory", size, align);
+                null_mut()
+            }
+        },
+        Err(_) => {
+            info!("Frame allocator has run out of memory for allocation size:{} and alignment:{}", size, align);
+            null_mut()
+        }
     }
 }
 
-#[cfg(not(test))]
-#[global_allocator]
-pub static GLOBAL_ALLOCATOR: Spinlock<LinkedListAllocator> = Spinlock::new(LinkedListAllocator::new()); 
+fn heap_dealloc_impl(addr: *mut u8, size: usize, _align: usize) {
+    let size = size.max(size_of::<ListNode>());
+    let mut allocator = HEAP.lock();
+    allocator.add_free_region(addr as usize, size);
+    allocator.backing_memory += size;
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn heap_alloc_ffi(size: usize, align: usize, out: *mut *mut u8) -> KError {
+    let ptr = heap_alloc_impl(size, align);
+    unsafe { *out = ptr; }
+    if ptr.is_null() { KError::OutOfMemory } else { KError::Success }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn heap_dealloc_ffi(ptr: *mut u8, size: usize, align: usize) -> KError {
+    if ptr.is_null() { return KError::InvalidArgument; }
+    heap_dealloc_impl(ptr, size, align);
+    KError::Success
+}

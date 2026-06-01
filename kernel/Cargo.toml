@@ -13,7 +13,7 @@ default = []
 stack_down = []
 deadlock_detection = []
 acpi = ["common/acpi"]
-test-kernel = ["common/test-kernel"]
+test-kernel = ["common/test-kernel", "kernel_intf/test-kernel"]
 
 [dependencies]
 kernel_intf = {workspace = true, features = ["link-kernel"]}

@@ -7,13 +7,13 @@ mod infra;
 mod hal;
 mod sync;
 mod mem;
-mod ds;
 mod logger;
 mod cpu;
 mod devices;
 mod sched;
 mod fs;
 mod loader;
+mod io;
 
 #[cfg(feature = "acpi")]
 mod acpica;
@@ -34,13 +34,14 @@ mod tests;
 
 use sync::{Once, Spinlock};
 use cpu::install_interrupt_handler;
-use fs::FileBuffer;
 use hal::read_port_u8;
 use mem::Regions::*;
-use ds::*;
+use mem::FixedList;
+use kernel_intf::list::{List, DynList};
 use sched::KThread;
-use sched::get_current_process;
 use sync::KSem;
+
+use crate::fs::FilePath;
 
 static BOOT_INFO: Once<BootInfo> = Once::new();
 
@@ -65,7 +66,7 @@ struct InitFS {
 }
 
 static INIT_FS: Once<InitFS> = Once::new();  
-static REMAP_LIST: Spinlock<FixedList<RemapEntry, {Region3 as usize}>> = Spinlock::new(List::new());
+static REMAP_LIST: Spinlock<FixedList<RemapEntry, {Region2 as usize}>> = Spinlock::new(List::new());
 
 fn clear_keyboard_output_buffer() {
     unsafe {
@@ -215,44 +216,7 @@ fn kern_main() -> ! {
     sched::init();
     loader::init();
 
-    // Drop test for img1 and img2
-    {
-        let img1 = loader::load_image("/sys/drivers/libtest1.so", false)
-        .expect("Failed to load driver!");
-        
-        let img2 = loader::load_image("/sys/drivers/libtest2.so", false)
-        .expect("Failed to load driver!");
 
-        sched::create_thread(|| {
-            info!("Loading driver from different thread");
-            loader::load_image("/sys/drivers/libtest1.so", false)
-            .expect("Failed to load driver in different thread!");
-
-            sched::exit_thread();
-        }).unwrap();
-
-        sched::create_process(|| {
-            info!("Loading driver from different process");
-            loader::load_image("/sys/drivers/libtest2.so", false)
-            .expect("Failed to load driver in different process!");
-
-            sched::delay_ms(1000);
-
-            sched::exit_process(); 
-        }, false).unwrap();
-
-        // Check if we can call driver entry function
-        let img_guard = img2.lock();
-        let entry = unsafe {core::mem::transmute::<usize, extern "C" fn()>(img_guard.info.entry)};
-        entry();
-
-        let img_guard = img1.lock();
-        let entry = unsafe {core::mem::transmute::<usize, extern "C" fn()>(img_guard.info.entry)};
-
-        info!("Calling module init!");
-        entry();
-    }
-    
     // Some tests just to test out process and thread subsystem
     //{
     //    let spawn_proc = sched::create_process(process_spawn, false).expect("Failed to create second process");
@@ -265,12 +229,12 @@ fn kern_main() -> ! {
     //    spawn_task.wait().expect("Unable to wait on task id 1");
     //}
 
-    //{
-    //    let user_proc0 = sched::create_process(|| -> ! {loop{}}, true)
-    //    .expect("Failed to create user process 0");
-    //    
-    //    sched::create_thread(watchdog).unwrap();
-    //}
+    {
+        let user_proc0 = sched::create_process(|| -> ! {loop{}}, true)
+        .expect("Failed to create user process 0");
+        
+        sched::create_thread(watchdog).unwrap();
+    }
 
     //sched::create_thread(thread_creator).expect("Failed to create kernel thread!");
 

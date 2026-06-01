@@ -15,11 +15,12 @@ use crate::KERNEL_PATH;
 use crate::fs::{FileBuffer, open, resolve_symlink};
 use crate::infra::disable_preloader_phase;
 use crate::loader::module::ModuleDescriptor;
-use crate::mem::{PageDescriptor, PoolAllocatorGlobal, allocate_memory, deallocate_memory};
+use crate::mem::{PageDescriptor, allocate_memory, deallocate_memory};
+use kernel_intf::mem::PoolAllocatorGlobal;
 use crate::sched::Handle::ImgHandle;
 use crate::sched::add_new_handle;
 use crate::sync::Spinlock;
-use crate::ds::{List, DynList};
+use kernel_intf::list::{List, DynList};
 use super::module;
 
 pub static KERNEL_MODULES: Spinlock<DynList<Weak<Spinlock<ModuleDescriptor>, PoolAllocatorGlobal>>> = Spinlock::new(List::new());
@@ -171,7 +172,7 @@ fn find_loaded_module(
             let guard = entry.lock();
             let fh = guard.file_handle.as_ref().unwrap();
             let file_guard = fh.lock();
-            file_guard.get_path() == resolved
+            file_guard.get_name() == resolved
         };
         if matches {
             return Some(entry);

@@ -1,14 +1,18 @@
 #![allow(static_mut_refs)]
 
-use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::mem;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use core::alloc::Layout;
 use common::{ceil_div, PAGE_SIZE};
 use kernel_intf::KError;
+use kernel_intf::mem::Allocator;
+use kernel_intf::list::{List, ListNode};
 use crate::sync::Spinlock;
 use kernel_intf::info;
+
+pub type FixedList<T, const REGION: usize> = List<T, FixedAllocator<ListNode<T>, REGION>>;
 
 #[repr(usize)]
 pub enum Regions {
@@ -16,14 +20,13 @@ pub enum Regions {
     Region1,
     Region2,
     Region3,
-    Region4,
-    Region5
+    Region4
 }
 
-const TOTAL_REGIONS: usize = 6;
-pub const BOOT_REGIONS: [usize; TOTAL_REGIONS] = [40 * PAGE_SIZE, 4 * PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, PAGE_SIZE];
+const TOTAL_REGIONS: usize = 5;
+pub const BOOT_REGIONS: [usize; TOTAL_REGIONS] = [40 * PAGE_SIZE, 4 * PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, PAGE_SIZE];
 const TOTAL_BOOT_MEMORY: usize = BOOT_REGIONS[0] + BOOT_REGIONS[1] + BOOT_REGIONS[2] + BOOT_REGIONS[3]
- + BOOT_REGIONS[4] + BOOT_REGIONS[5];
+ + BOOT_REGIONS[4];
 
 // Here we simply divide given memory into slots each of size 8 bytes
 // 8 is chosen to represent an average DS size
@@ -111,19 +114,19 @@ where [(); mem::size_of::<T>() - MIN_SLOT_SIZE]: {
 }
 
 
-impl<T, const REGION: usize> super::Allocator<T> 
-for FixedAllocator<T, REGION> 
+impl<T, const REGION: usize> Allocator<T>
+for FixedAllocator<T, REGION>
 where [(); mem::size_of::<T>() - MIN_SLOT_SIZE]: {
 
     fn alloc(layout: Layout) -> Result<NonNull<T>, KError> {
         assert!(layout.size() != 0 && layout.size() % mem::size_of::<T>() == 0);
-        
-        let mut heap = HEAP.lock(); 
+
+        let mut heap = HEAP.lock();
         let (base_offset, hdr_offset) = Self::fetch_hdr_and_base();
-        
+
         let slot_size = mem::size_of::<T>();
         let num_slots = Self::calculate_total_slots();
-        
+
         let mut slots_required = ceil_div(layout.size(), slot_size);
         let mut start_slot = 0;
         let mut num_slots_found = 0;
@@ -178,13 +181,13 @@ where [(); mem::size_of::<T>() - MIN_SLOT_SIZE]: {
     unsafe fn dealloc(address: NonNull<T>, layout: Layout) {
         assert!(layout.size() != 0 && layout.size() % mem::size_of::<T>() == 0);
 
-        let mut heap = HEAP.lock(); 
+        let mut heap = HEAP.lock();
         let (base_offset, hdr_offset) = Self::fetch_hdr_and_base();
 
         let mut address = address.as_ptr().addr();
         let old_heap_ptr = OLD_HEAP_PTR.load(Ordering::Relaxed);
         let heap_rgn_base = heap.buffer.as_ptr().addr() + base_offset;
-        
+
         // The allocation was made prior to kernel address space init. Translate those addresses here
         if address >= old_heap_ptr && address < old_heap_ptr + size_of::<HeapWrapper>() {
             address = heap.buffer.as_ptr().addr() + address - old_heap_ptr;
