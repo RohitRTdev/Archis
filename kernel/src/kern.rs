@@ -41,7 +41,7 @@ use kernel_intf::list::{List, DynList};
 use sched::KThread;
 use sync::KSem;
 
-use crate::fs::FilePath;
+use crate::sync::KEvent;
 
 static BOOT_INFO: Once<BootInfo> = Once::new();
 
@@ -77,8 +77,6 @@ fn clear_keyboard_output_buffer() {
 }
 
 static TASK_COUNTER: Once<KSem> = Once::new();
-static WAIT_EVENT: Once<KSem> = Once::new();
-static WAIT_EVENT2: Once<KSem> = Once::new();
 
 // Checking thread subsystem
 fn task_spawn() -> ! {
@@ -87,13 +85,8 @@ fn task_spawn() -> ! {
         KSem::new(0, 5)
     });
 
-    WAIT_EVENT.call_once(|| {
-        KSem::new(0, 1)
-    });
-
     let task_id = sched::get_current_task_id().unwrap();
     info!("Starting task spawner, id={}", task_id);
-
 
     for idx in 0..5 {
         info!("Creating task {} in task spawner", idx);
@@ -177,9 +170,6 @@ fn process_spawn() -> ! {
 
     // This is here incase this process is killed before it gets a chance to wait forever
     sched::exit_thread();
-
-    // Just to appease the type system
-    hal::halt();
 }
 
 static QUEUE: Spinlock<DynList<[i64; 64]>> = Spinlock::new(List::new());
@@ -206,7 +196,7 @@ fn kern_main() -> ! {
     info!("Starting main kernel init");
     
     KEYBOARD_EVENT.call_once(|| {
-        KSem::new(0, 1)
+        KEvent::new(true)
     });
 
     // Sample invocation to test out interrupt subsystem
@@ -216,7 +206,6 @@ fn kern_main() -> ! {
     sched::init();
     loader::init();
     io::init();
-    io::submit_read();
 
     // Some tests just to test out process and thread subsystem
     //{
@@ -272,7 +261,7 @@ fn kern_main() -> ! {
         info!("Main task looping");
     }
 
-    hal::sleep();
+    //hal::sleep();
 }
 
 // This will be called from the entry point for the corresponding arch
@@ -296,7 +285,7 @@ unsafe extern "C" fn kern_start(boot_info: *const BootInfo) -> ! {
     hal::init();
 }
 
-static KEYBOARD_EVENT: Once<KSem> = Once::new();
+static KEYBOARD_EVENT: Once<KEvent> = Once::new();
 
 fn key_notifier(_: usize) {
     let stack_base = hal::get_current_stack_base();
@@ -337,7 +326,6 @@ fn watchdog() -> ! {
             WATCHDOG_MARK.store(false, Ordering::Release);
         }
     }
-
 }
 
 #[unsafe(no_mangle)]

@@ -19,11 +19,16 @@ use crate::mem::{PageDescriptor, allocate_memory, deallocate_memory};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use crate::sched::Handle::ImgHandle;
 use crate::sched::add_new_handle;
-use crate::sync::Spinlock;
+use crate::sync::{Spinlock, KSem, Once};
 use kernel_intf::list::{List, DynList};
 use super::module;
 
 pub static KERNEL_MODULES: Spinlock<DynList<Weak<Spinlock<ModuleDescriptor>, PoolAllocatorGlobal>>> = Spinlock::new(List::new());
+
+// Serializes the (recursive) image load operation. Replaces holding the
+// KERNEL_MODULES spinlock across the whole load, so blocking calls like open()
+// no longer run with the registry lock held.
+static LOAD_LOCK: Once<KSem> = Once::new();
 
 pub type LoadedImage = Arc<Spinlock<ModuleDescriptor>, PoolAllocatorGlobal>;
 
@@ -52,6 +57,8 @@ impl Drop for ModuleDescriptor {
 
 
 pub fn init() {
+    LOAD_LOCK.call_once(|| KSem::new(1, 1));
+
     let mut kernel_img = module::ARIS.get().unwrap().lock().clone();
     kernel_img.file_handle = Some(
         open(KERNEL_PATH).expect("Failed to open kernel image!")
@@ -75,22 +82,28 @@ pub fn init() {
 
 pub fn load_image(path: &str, is_user: bool) -> Result<LoadedImage, KError> {
     info!("Start load_image for {}", path);
+
+    // Serialize the whole recursive load
+    let load_lock = LOAD_LOCK.get().expect("loader::init() not called before load_image()");
+    load_lock.wait()?;
+
     let mut in_progress: Vec<String> = Vec::new();
-    let mut registry = KERNEL_MODULES.lock();
-    load_image_inner(path, is_user, &mut in_progress, &mut *registry)
+    let result = load_image_inner(path, is_user, &mut in_progress);
+
+    load_lock.signal();
+    result
 }
 
 fn load_image_inner(
-    path: &str, 
-    is_user: bool, 
-    in_progress: &mut Vec<String>,
-    registry: &mut DynList<Weak<Spinlock<ModuleDescriptor>, PoolAllocatorGlobal>>
+    path: &str,
+    is_user: bool,
+    in_progress: &mut Vec<String>
 ) -> Result<LoadedImage, KError> {
     if is_user {
         todo!("User-mode image loading not implemented");
     }
 
-    if let Some(cached) = find_loaded_module(path, registry) {
+    if let Some(cached) = find_loaded_module(path) {
         info!("Loading image {} from cache", path);
         return Ok(cached);
     }
@@ -101,10 +114,9 @@ fn load_image_inner(
     in_progress.push(path.to_owned());
 
     let result = load_image_uncached(
-        path, 
-        is_user, 
-        in_progress,
-        registry
+        path,
+        is_user,
+        in_progress
     );
 
     in_progress.pop();
@@ -114,8 +126,7 @@ fn load_image_inner(
 fn load_image_uncached(
     path: &str,
     is_user: bool,
-    in_progress: &mut Vec<String>,
-    registry: &mut DynList<Weak<Spinlock<ModuleDescriptor>, PoolAllocatorGlobal>>
+    in_progress: &mut Vec<String>
 ) -> Result<LoadedImage, KError> {
     info!("Loading image {} from disk", path);
     let file = open(path)?;
@@ -135,7 +146,7 @@ fn load_image_uncached(
     let bytes = buf.as_slice();
 
     let mod_info = build_image_layout(bytes)?;
-    let deps = load_dependencies(&mod_info, is_user, in_progress, registry)?;
+    let deps = load_dependencies(&mod_info, is_user, in_progress)?;
     apply_relocations(&mod_info, &deps)?;
 
     let module_name = configure_module(&mod_info);
@@ -150,8 +161,7 @@ fn load_image_uncached(
     let arc = Arc::new_in(Spinlock::new(descriptor), PoolAllocatorGlobal);
     let weak = Arc::downgrade(&arc);
 
-    // Add the newly loaded module to the cache
-    registry.add_node(weak)
+    KERNEL_MODULES.lock().add_node(weak)
     .expect("Failed to add image reference to module registry");
 
     info!("Loaded image '{}' with name={}", path, module_name);
@@ -159,13 +169,11 @@ fn load_image_uncached(
     Ok(arc)
 }
 
-fn find_loaded_module(
-    path: &str,
-    registry: &DynList<Weak<Spinlock<ModuleDescriptor>, PoolAllocatorGlobal>>
-) -> Option<LoadedImage> {
+fn find_loaded_module(path: &str) -> Option<LoadedImage> {
     let resolved = resolve_symlink(path);
     info!("Resolved symlink:{} -> {}", path, resolved);
 
+    let registry = KERNEL_MODULES.lock();
     for node in registry.iter() {
         let entry = match node.upgrade() { Some(e) => e, None => continue };
         let matches = {
@@ -466,8 +474,7 @@ fn build_image_layout(bytes: &[u8]) -> Result<ModuleInfo, KError> {
 fn load_dependencies(
     mod_info: &ModuleInfo,
     is_user: bool,
-    in_progress: &mut Vec<String>,
-    registry: &mut DynList<Weak<Spinlock<ModuleDescriptor>, PoolAllocatorGlobal>>
+    in_progress: &mut Vec<String>
 ) -> Result<Vec<LoadedImage>, KError> {
     let mut deps: Vec<LoadedImage> = Vec::new();
 
@@ -495,10 +502,9 @@ fn load_dependencies(
         for prefix in PREDEFINED_DIRECTORIES {
             let filename = format!("{}/{}", prefix, name);
             let res = load_image_inner(
-                filename.as_str(), 
-                is_user, 
-                in_progress, 
-                registry
+                filename.as_str(),
+                is_user,
+                in_progress
             );
 
             match res {

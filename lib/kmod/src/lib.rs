@@ -88,36 +88,61 @@ pub fn export(
 }
 
 #[proc_macro_attribute]
-pub fn handler(
+pub fn dispatch_handler(
     _attr: TokenStream,
     item: TokenStream
 ) -> TokenStream {
-    const ALLOWED_FUNCTIONS: [&str; 2] = ["dispatch_read", "dispatch_write"];
-    let func = parse_macro_input!(item as ItemFn);
+    const DEVICE_HANDLERS: [&str; 5] = [
+        "dispatch_read",
+        "dispatch_write",
+        "dispatch_start",
+        "dispatch_stop",
+        "dispatch_enumerate"
+    ];
 
+    let func = parse_macro_input!(item as ItemFn);
     let ident = &func.sig.ident;
-    if !ALLOWED_FUNCTIONS.iter().any(|s|  {
-        *s == ident.to_string()
-    }) {
-        return syn::Error::new_spanned(
-            &func.sig.ident,
-            "Handler name must one of predefined dispatch_* names",
-        )
-        .to_compile_error()
-        .into(); 
+    let name = ident.to_string();
+    let shim_ident = format_ident!("shim_{}", ident);
+
+    if name == "dispatch_add" {
+        return quote! {
+            #func
+
+            unsafe extern "C" fn #shim_ident(
+                driver: *const kernel_intf::driver::DriverObject,
+                pdo: *const kernel_intf::driver::DeviceObject
+            ) -> kernel_intf::driver::Status {
+                let driver = unsafe { &*driver };
+                let pdo = if pdo.is_null() {
+                    None
+                } else {
+                    Some(unsafe { &*pdo })
+                };
+
+                #ident(driver, pdo)
+            }
+        }.into();
     }
 
-    let shim_ident = format_ident!("shim_{}", ident);
+    if !DEVICE_HANDLERS.contains(&name.as_str()) {
+        return syn::Error::new_spanned(
+            &func.sig.ident,
+            "Handler name must be one of: dispatch_add, dispatch_read, dispatch_write, dispatch_start, dispatch_stop, dispatch_enumerate"
+        )
+        .to_compile_error()
+        .into();
+    }
 
     quote! {
         #func
 
-        #[unsafe(no_mangle)]
-        unsafe extern "C" fn #shim_ident(device: *const kernel_intf::driver::DeviceObject,
-            req: *const kernel_intf::driver::Irp) -> Status {
-            
+        unsafe extern "C" fn #shim_ident(
+            device: *const kernel_intf::driver::DeviceObject,
+            req: *mut kernel_intf::driver::Irp
+        ) -> kernel_intf::driver::Status {
             let dev = unsafe { &*device };
-            let irp = unsafe { &*req };
+            let irp = unsafe { &mut *req };
 
             #ident(dev, irp)
         }

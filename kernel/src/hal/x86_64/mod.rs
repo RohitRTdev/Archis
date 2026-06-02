@@ -55,6 +55,12 @@ pub fn enable_interrupts(int_status: bool) {
     }
 }
 
+#[cfg(not(test))]
+pub fn are_interrupts_enabled() -> bool {
+    // RFLAGS bit 9 is IF -> 1 means interrupts enabled.
+    (asm::read_rflags() & (1 << 9)) != 0
+}
+
 #[cfg(test)]
 pub fn disable_interrupts() -> bool {
     true
@@ -62,6 +68,11 @@ pub fn disable_interrupts() -> bool {
 
 #[cfg(test)]
 pub fn enable_interrupts(_: bool) {
+}
+
+#[cfg(test)]
+pub fn are_interrupts_enabled() -> bool {
+    true
 }
 
 pub use asm::read_port_u8;

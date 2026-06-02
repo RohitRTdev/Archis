@@ -18,7 +18,8 @@ pub enum KError {
     ProcessTerminated,
     WaitFailed,
     CircularDependency,
-    DriverLoadFailed
+    DriverLoadFailed,
+    Unsupported
 }
 
 pub const E_SUCCESS: i64 = 0;
@@ -38,6 +39,7 @@ impl From<KError> for i64 {
             KError::Success => E_SUCCESS,
             KError::InvalidArgument => E_INVALID,
             KError::OutOfMemory => E_OOM,
+            KError::Unsupported => E_INVALID,
             KError::ProcessTerminated | KError::WaitFailed |
             KError::CircularDependency | KError::DriverLoadFailed => E_INTERNAL_FAILURE
         }
@@ -54,6 +56,7 @@ impl fmt::Display for KError {
             KError::WaitFailed => "Wait internal failure",
             KError::CircularDependency => "Circular dependency in module load",
             KError::DriverLoadFailed => "Driver load failed",
+            KError::Unsupported => "Operation not supported",
             KError::Success => "Success"
         };
         write!(f, "{}", description)
@@ -107,5 +110,10 @@ unsafe extern "C" {
     pub fn heap_dealloc_ffi(ptr: *mut u8, size: usize, align: usize) -> KError;
     pub fn panic_router(mod_name: StrRef, info: StrRef) -> !;
     pub fn exported_function();
+    pub fn io_create_device(driver_id: usize, name: StrRef, ctx: *mut core::ffi::c_void) -> *mut driver::DeviceObject;
+
+    #[allow(improper_ctypes)]
+    pub fn create_kernel_thread(handler: fn() -> !) -> KError;
+    pub fn exit_kernel_thread() -> !;
 }
 
