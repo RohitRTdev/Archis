@@ -90,7 +90,7 @@ build_drivers: build_kernel
 			(cd $$driver_path && \
 				RUSTFLAGS="$(DRIVER_FLAGS)" \
 				cargo build $(BUILD_OPTIONS) \
-				-Z build-std=core,compiler_builtins \
+				-Z build-std=core,compiler_builtins,alloc \
 				-Z build-std-features=compiler-builtins-mem \
 				--target ../../../$(KERNEL_TARGET)); \
 			cp target/$(KERNEL_ARCH)/$(CONFIG)/lib$$name.so $(OUTPUT_DIR)/drivers; \

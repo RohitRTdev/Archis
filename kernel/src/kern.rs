@@ -215,7 +215,8 @@ fn kern_main() -> ! {
 
     sched::init();
     loader::init();
-
+    io::init();
+    io::submit_read();
 
     // Some tests just to test out process and thread subsystem
     //{
@@ -229,12 +230,12 @@ fn kern_main() -> ! {
     //    spawn_task.wait().expect("Unable to wait on task id 1");
     //}
 
-    {
-        let user_proc0 = sched::create_process(|| -> ! {loop{}}, true)
-        .expect("Failed to create user process 0");
-        
-        sched::create_thread(watchdog).unwrap();
-    }
+    //{
+    //    let user_proc0 = sched::create_process(|| -> ! {loop{}}, true)
+    //    .expect("Failed to create user process 0");
+    //    
+    //    sched::create_thread(watchdog).unwrap();
+    //}
 
     //sched::create_thread(thread_creator).expect("Failed to create kernel thread!");
 

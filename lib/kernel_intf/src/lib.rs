@@ -5,6 +5,7 @@ mod log;
 pub use log::*;
 pub mod mem;
 pub mod list;
+pub mod driver;
 use core::fmt;
 use common::StrRef;
 
@@ -16,7 +17,8 @@ pub enum KError {
     OutOfMemory,
     ProcessTerminated,
     WaitFailed,
-    CircularDependency
+    CircularDependency,
+    DriverLoadFailed
 }
 
 pub const E_SUCCESS: i64 = 0;
@@ -36,7 +38,8 @@ impl From<KError> for i64 {
             KError::Success => E_SUCCESS,
             KError::InvalidArgument => E_INVALID,
             KError::OutOfMemory => E_OOM,
-            KError::ProcessTerminated | KError::WaitFailed | KError::CircularDependency => E_INTERNAL_FAILURE
+            KError::ProcessTerminated | KError::WaitFailed |
+            KError::CircularDependency | KError::DriverLoadFailed => E_INTERNAL_FAILURE
         }
     }
 }
@@ -50,6 +53,7 @@ impl fmt::Display for KError {
             KError::ProcessTerminated => "Process terminated",
             KError::WaitFailed => "Wait internal failure",
             KError::CircularDependency => "Circular dependency in module load",
+            KError::DriverLoadFailed => "Driver load failed",
             KError::Success => "Success"
         };
         write!(f, "{}", description)

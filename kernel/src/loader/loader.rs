@@ -154,7 +154,7 @@ fn load_image_uncached(
     registry.add_node(weak)
     .expect("Failed to add image reference to module registry");
 
-    info!("Loaded image '{}' with name={} having module_desc={:?}", path, module_name, arc.lock().info);
+    info!("Loaded image '{}' with name={}", path, module_name);
 
     Ok(arc)
 }
