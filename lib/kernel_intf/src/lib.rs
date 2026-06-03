@@ -19,13 +19,16 @@ pub enum KError {
     WaitFailed,
     CircularDependency,
     DriverLoadFailed,
-    Unsupported
+    Unsupported,
+    DeviceStopped
 }
 
 pub const E_SUCCESS: i64 = 0;
 pub const E_INVALID: i64 = -1;
 pub const E_OOM: i64 = -2;
 pub const E_INTERNAL_FAILURE: i64 = -3;
+pub const E_NOT_SUPPORTED: i64 = -4;
+pub const E_DEV_STOPPED: i64 = -5;
 
 impl<T> From<Result<T, KError>> for KError {
     fn from(e: Result<T, KError>) -> Self {
@@ -39,7 +42,8 @@ impl From<KError> for i64 {
             KError::Success => E_SUCCESS,
             KError::InvalidArgument => E_INVALID,
             KError::OutOfMemory => E_OOM,
-            KError::Unsupported => E_INVALID,
+            KError::Unsupported => E_NOT_SUPPORTED,
+            KError::DeviceStopped => E_DEV_STOPPED,
             KError::ProcessTerminated | KError::WaitFailed |
             KError::CircularDependency | KError::DriverLoadFailed => E_INTERNAL_FAILURE
         }
@@ -57,6 +61,7 @@ impl fmt::Display for KError {
             KError::CircularDependency => "Circular dependency in module load",
             KError::DriverLoadFailed => "Driver load failed",
             KError::Unsupported => "Operation not supported",
+            KError::DeviceStopped => "Device is stopped",
             KError::Success => "Success"
         };
         write!(f, "{}", description)
@@ -110,7 +115,27 @@ unsafe extern "C" {
     pub fn heap_dealloc_ffi(ptr: *mut u8, size: usize, align: usize) -> KError;
     pub fn panic_router(mod_name: StrRef, info: StrRef) -> !;
     pub fn exported_function();
-    pub fn io_create_device(driver_id: usize, name: StrRef, ctx: *mut core::ffi::c_void) -> *mut driver::DeviceObject;
+    pub fn io_create_device(
+        driver_id: usize, 
+        name: StrRef, 
+        ctx: *mut core::ffi::c_void, 
+        parent: *const driver::DeviceObject) 
+    -> *mut driver::DeviceObject;
+
+    pub fn io_send_request(
+        device: *const driver::DeviceObject,
+        major: usize,
+        minor: usize,
+        buf_base: usize,
+        buf_size: usize,
+        offset: usize,
+        completion: Option<extern "C" fn(*mut driver::Irp, *mut core::ffi::c_void)>,
+        completion_ctx: *mut core::ffi::c_void
+    ) -> driver::Status;
+    
+    pub fn io_get_driver_id(device: *const driver::DeviceObject) -> usize;
+    pub fn io_invalidate_device(device: *const driver::DeviceObject) -> driver::Status;
+
 
     #[allow(improper_ctypes)]
     pub fn create_kernel_thread(handler: fn() -> !) -> KError;

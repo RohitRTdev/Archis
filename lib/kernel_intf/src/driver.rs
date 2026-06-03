@@ -9,16 +9,43 @@ use super::StrRef;
 pub enum IrpMajor {
     Read = 0,
     Write = 1,
-    Add = 2,
-    Start = 3,
-    Enumerate = 4,
-    Stop = 5
+    Start = 2,
+    Stop = 3,
+    Configure = 4,
+    Remove = 5
+}
+
+impl IrpMajor {
+    pub fn from_usize(v: usize) -> Option<Self> {
+        match v {
+            0 => Some(Self::Read),
+            1 => Some(Self::Write),
+            2 => Some(Self::Start),
+            3 => Some(Self::Stop),
+            4 => Some(Self::Configure),
+            5 => Some(Self::Remove),
+            _ => None
+        }
+    }
 }
 
 #[repr(usize)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IrpMinor {
-    None = 0
+    None = 0,
+    Enumerate = 1,
+    Query = 2
+}
+
+impl IrpMinor {
+    pub fn from_usize(v: usize) -> Option<Self> {
+        match v {
+            0 => Some(Self::None),
+            1 => Some(Self::Enumerate),
+            2 => Some(Self::Query),
+            _ => None
+        }
+    }
 }
 
 #[repr(isize)]
@@ -64,6 +91,7 @@ impl Irp {
 
     pub fn complete_irp(&mut self, status: Status) {
         if let Some(routine) = self.completion_routine {
+            assert!(status == Status::Success || status == Status::Failed);
             self.status = status;
             routine(self as *mut _, self.completion_ctx);
         }
@@ -80,7 +108,8 @@ pub struct DispatchTable {
     pub dispatch_write: Option<DeviceDispatch>,
     pub dispatch_start: Option<DeviceDispatch>,
     pub dispatch_stop: Option<DeviceDispatch>,
-    pub dispatch_enumerate: Option<DeviceDispatch>
+    pub dispatch_configure: Option<DeviceDispatch>,
+    pub dispatch_remove: Option<DeviceDispatch>
 }
 
 impl DispatchTable {
@@ -91,7 +120,8 @@ impl DispatchTable {
             dispatch_write: None,
             dispatch_start: None,
             dispatch_stop: None,
-            dispatch_enumerate: None
+            dispatch_configure: None,
+            dispatch_remove: None
         }
     }
 
@@ -122,8 +152,12 @@ impl DispatchTable {
         Self::invoke_device(self.dispatch_stop, device, irp)
     }
 
-    pub fn invoke_enumerate(&self, device: *const DeviceObject, irp: *mut Irp) -> Status {
-        Self::invoke_device(self.dispatch_enumerate, device, irp)
+    pub fn invoke_configure(&self, device: *const DeviceObject, irp: *mut Irp) -> Status {
+        Self::invoke_device(self.dispatch_configure, device, irp)
+    }
+
+    pub fn invoke_remove(&self, device: *const DeviceObject, irp: *mut Irp) -> Status {
+        Self::invoke_device(self.dispatch_remove, device, irp)
     }
 
     pub fn invoke_add(&self, driver: *const DriverObject, pdo: *const DeviceObject) -> Status {
@@ -142,6 +176,7 @@ impl Default for DispatchTable {
 
 #[repr(C)]
 pub struct DeviceObject {
+    pub id: usize,
     pub name: StrRef,
     pub ctx: *mut c_void
 }
@@ -150,13 +185,44 @@ unsafe impl Sync for DeviceObject {}
 unsafe impl Send for DeviceObject {}
 
 impl DeviceObject {
-    pub fn new(name: StrRef, ctx: *mut c_void) -> Self {
-        Self { name, ctx }
+    pub fn new(id: usize, name: Option<&'static str>, ctx: *mut c_void) -> Self {
+        let str_ref = name.map_or(StrRef::from_str(""), StrRef::from_str);
+        Self { id, name: str_ref, ctx }
     }
 
-    pub fn get_name(&self) -> &str {
-        unsafe { self.name.as_str() }
+    pub fn get_name(&self) -> Option<&str> {
+        let name = unsafe { self.name.as_str() };
+        if name.is_empty() {
+            None
+        }
+        else {
+            Some(name)
+        }
     }
+
+    pub fn get_driver_id(&self) -> usize {
+        unsafe { super::io_get_driver_id(self as *const _) }
+    }
+}
+
+pub fn create_device_by_id(
+    driver_id: usize,
+    name: Option<&'static str>,
+    ctx: *mut c_void,
+    parent: Option<&DeviceObject>
+) -> *mut DeviceObject {
+    let name = name.map_or(StrRef::from_str(""), StrRef::from_str);
+    let parent = parent.map(|p| p as *const DeviceObject).unwrap_or(core::ptr::null());
+    unsafe { super::io_create_device(driver_id, name, ctx, parent) }
+}
+
+pub fn create_device(
+    driver: &DriverObject,
+    name: Option<&'static str>,
+    ctx: *mut c_void,
+    parent: Option<&DeviceObject>
+) -> *mut DeviceObject {
+    create_device_by_id(driver.id, name, ctx, parent)
 }
 
 #[repr(C)]

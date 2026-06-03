@@ -11,6 +11,7 @@ use crate::hal;
 use crate::mem::{self, PageDescriptor, VCB, VirtMemConBlk, deallocate_memory, get_physical_address};
 use crate::sched::{self, *};
 use crate::sync::{KSem, Spinlock};
+use crate::io::DeviceHandleK;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::ptr::NonNull;
 use core::alloc::Layout;
@@ -22,7 +23,8 @@ pub type KProcess = Arc<Spinlock<Process>, PoolAllocatorGlobal>;
 
 pub enum Handle {
     FileHandle(FileInstance),
-    ImgHandle(LoadedImage)
+    ImgHandle(LoadedImage),
+    DeviceHandle(DeviceHandleK)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -158,6 +160,7 @@ impl Process {
     pub fn print_handles(&self) {
         let mut file_handles = 0;
         let mut img_handles = 0;
+        let mut device_handles = 0;
         self.file_table.iter().for_each(|handle| {
             match handle.as_ref() {
                 Some(h) => {
@@ -167,6 +170,9 @@ impl Process {
                         },
                         Handle::ImgHandle(_) => {
                             img_handles += 1;
+                        },
+                        Handle::DeviceHandle(_) => {
+                            device_handles += 1;
                         }
                     }
                 },
@@ -174,7 +180,7 @@ impl Process {
             }
         });
 
-        debug!("proc_id = {}, File handles = {}, image handles = {}", self.id, file_handles, img_handles);
+        debug!("proc_id = {}, File handles = {}, image handles = {}, device handles = {}", self.id, file_handles, img_handles, device_handles);
     }
 }
 

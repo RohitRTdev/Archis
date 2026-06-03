@@ -44,6 +44,7 @@ install_kernel_image() {
     mkdir -p "$dst_blr/efi/boot"
 
     cp "$src"/drivers/*.so "$dst_kernel/sys/drivers/" || echo "No drivers found..."
+    cp "$src"/drivers/boot.conf "$dst_kernel/sys/drivers/" || echo "boot.conf not found..."
     cp "$src"/aris "$dst_kernel/sys/" || echo "Kernel not found..."
     cp "$src"/bootx64.efi "$dst_blr/efi/boot/" || echo "Bootloader not found..."
 }

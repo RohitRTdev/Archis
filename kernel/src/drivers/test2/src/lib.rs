@@ -1,12 +1,73 @@
 #![cfg_attr(not(test), no_std)]
+#![feature(allocator_api)]
 
-use kernel_intf::driver::{Status, DriverObject};
+use core::ffi::c_void;
+
+use kernel_intf::info;
+use kernel_intf::driver::{DeviceObject, DriverObject, Irp, Status, create_device};
+use kernel_intf::mem::PoolAllocatorGlobal;
+
+struct Test2Device {
+    _x: u64
+}
 
 #[kmod::init]
-fn driver_init(driver: &DriverObject) -> Status {
-    kernel_intf::info!("Initializing {}...", driver.get_name());
-    unsafe {kernel_intf::exported_function();}
+fn driver_init(driver: &mut DriverObject) -> Status {
+    info!("{} initializing (id={})...", driver.get_name(), driver.id);
 
+    kmod::dispatch_init!(
+        driver,
+        dispatch_add,
+        dispatch_start,
+        dispatch_stop,
+        dispatch_remove,
+        dispatch_read
+    );
+
+    Status::Success
+}
+
+#[kmod::dispatch_handler]
+fn dispatch_add(driver: &DriverObject, pdo: Option<&DeviceObject>) -> Status {
+    info!("test2 add_device: creating function FDO on PDO");
+
+    let ctx = alloc::boxed::Box::new_in(Test2Device { _x: 0 }, PoolAllocatorGlobal);
+    let ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(ctx).0 as *mut c_void;
+
+    let dev = create_device(driver, Some("test2"), ctx_ptr, pdo);
+    if dev.is_null() {
+        info!("test2 add_device: create_device failed");
+        return Status::Failed;
+    }
+    Status::Success
+}
+
+#[kmod::dispatch_handler]
+fn dispatch_start(device: &DeviceObject, _request: &mut Irp) -> Status {
+    info!("test2 start_device {}", device.id);
+    Status::Success
+}
+
+#[kmod::dispatch_handler]
+fn dispatch_stop(device: &DeviceObject, _request: &mut Irp) -> Status {
+    info!("test2 stop_device {}", device.id);
+    Status::Success
+}
+
+#[kmod::dispatch_handler]
+fn dispatch_remove(device: &DeviceObject, _request: &mut Irp) -> Status {
+    info!("test2 remove_device {}", device.id);
+    if !device.ctx.is_null() {
+        unsafe {
+            drop(alloc::boxed::Box::from_raw_in(device.ctx as *mut Test2Device, PoolAllocatorGlobal));
+        }
+    }
+    Status::Success
+}
+
+#[kmod::dispatch_handler]
+fn dispatch_read(_device: &DeviceObject, _request: &mut Irp) -> Status {
+    info!("test2 read");
     Status::Success
 }
 

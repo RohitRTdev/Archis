@@ -25,9 +25,6 @@ use super::module;
 
 pub static KERNEL_MODULES: Spinlock<DynList<Weak<Spinlock<ModuleDescriptor>, PoolAllocatorGlobal>>> = Spinlock::new(List::new());
 
-// Serializes the (recursive) image load operation. Replaces holding the
-// KERNEL_MODULES spinlock across the whole load, so blocking calls like open()
-// no longer run with the registry lock held.
 static LOAD_LOCK: Once<KSem> = Once::new();
 
 pub type LoadedImage = Arc<Spinlock<ModuleDescriptor>, PoolAllocatorGlobal>;
@@ -498,34 +495,47 @@ fn load_dependencies(
         let name = unsafe { read_cstr(dyn_str.base_address, entry.val as usize) };
         let mut found_entry = false;
 
-        // Check for this image in all of these predefined directories
-        for prefix in PREDEFINED_DIRECTORIES {
-            let filename = format!("{}/{}", prefix, name);
+        // This is an absolute path, use it directly
+        if name.starts_with("/") {
             let res = load_image_inner(
-                filename.as_str(),
+                name,
                 is_user,
                 in_progress
-            );
+            )?;
+            
+            info!("Loaded dependency {}", name);
+            deps.push(res);
+        }
+        else {
+            // Check for this image in all of these predefined directories
+            for prefix in PREDEFINED_DIRECTORIES {
+                let filename = format!("{}/{}", prefix, name);
+                let res = load_image_inner(
+                    filename.as_str(),
+                    is_user,
+                    in_progress
+                );
 
-            match res {
-                Err(InvalidArgument) => {
-                    continue;
-                },
-                Err(e) => {
-                    return Err(e);
-                },
-                Ok(dep) => {
-                    info!("Loaded dependency {}", filename);
-                    found_entry = true;
-                    deps.push(dep);
-                    break;
+                match res {
+                    Err(InvalidArgument) => {
+                        continue;
+                    },
+                    Err(e) => {
+                        return Err(e);
+                    },
+                    Ok(dep) => {
+                        info!("Loaded dependency {}", filename);
+                        found_entry = true;
+                        deps.push(dep);
+                        break;
+                    }
                 }
             }
-        }
-
-        if !found_entry {
-            return Err(KError::InvalidArgument);
-        }
+            
+            if !found_entry {
+                return Err(KError::InvalidArgument);
+            }
+        } 
     }
 
     Ok(deps)

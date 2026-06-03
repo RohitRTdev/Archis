@@ -96,6 +96,7 @@ build_drivers: build_kernel
 			cp target/$(KERNEL_ARCH)/$(CONFIG)/lib$$name.so $(OUTPUT_DIR)/drivers; \
 		fi \
 	done
+	@cp kernel/src/drivers/boot.conf $(OUTPUT_DIR)/drivers/ || echo "boot.conf not found..."
 
 run_unit_test: build_kernel_test
 	@cargo test --manifest-path=boot/blr/Cargo.toml -- --nocapture

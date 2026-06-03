@@ -265,7 +265,7 @@ fn kern_main() -> ! {
 }
 
 // This will be called from the entry point for the corresponding arch
-// For now, we support only x86_64, so the entry point is at kernel/src/hal/x86_64/asm/kernel_entry_stub.S
+// For now, we support only x86_64, so the entry point is at kernel/src/hal/x86_64/asm/kernel_entry.S
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kern_start(boot_info: *const BootInfo) -> ! {
     BOOT_INFO.call_once(|| {
