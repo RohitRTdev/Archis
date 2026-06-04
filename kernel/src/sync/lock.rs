@@ -163,4 +163,3 @@ extern "C" fn release_spinlock(lock: &mut Lock) {
         hal::enable_interrupts(int_status);
     }
 }
-        

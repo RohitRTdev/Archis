@@ -58,9 +58,23 @@ pub enum Status {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ResourceList {
+    irq: usize,
+    ports: &'static [usize]
+}
+
+#[repr(C)]
+pub union ReqInfo {
+    pub start: ResourceList,
+    pub enumerate: &'static [*const DeviceObject]
+}
+
+#[repr(C)]
 pub struct Irp {
     pub major_code: IrpMajor,
     pub minor_code: IrpMinor,
+    pub req_params: Option<ReqInfo>,
     pub buffer: MemoryRegion,
     pub offset: usize,
     pub status: Status,
@@ -80,6 +94,7 @@ impl Irp {
         Self {
             major_code,
             minor_code: IrpMinor::None,
+            req_params: None, 
             buffer,
             offset,
             status: Status::Pending,

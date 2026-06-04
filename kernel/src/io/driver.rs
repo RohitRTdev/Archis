@@ -1,5 +1,5 @@
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -9,13 +9,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use common::{MemoryRegion, StrRef};
-use kernel_intf::driver::{DeviceObject, DriverObject, Irp, IrpMajor, IrpMinor, Status};
+use kernel_intf::driver::{DeviceObject, DriverObject, Irp, IrpMajor, IrpMinor, ReqInfo, Status};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::{KError, info};
 
 use crate::loader::{LoadedImage, load_image};
-use crate::sync::{KEvent, KSem, Once, Spinlock};
-
+use crate::sync::{ConfigGuard, KEvent, KSem, Once, Spinlock, semaphore_guard};
 use super::stack::{self, DeviceStack, LevelState};
 
 pub type DriverHandle = Arc<DriverObjectK, PoolAllocatorGlobal>;
@@ -29,6 +28,7 @@ static DRIVER_REGISTRY: Spinlock<BTreeMap<usize, DriverHandle>> = Spinlock::new(
 static DRIVER_BY_NAME: Spinlock<BTreeMap<String, DriverHandle>> = Spinlock::new(BTreeMap::new());
 static DEVICE_REGISTRY: Spinlock<BTreeMap<usize, DeviceHandleK>> = Spinlock::new(BTreeMap::new());
 static ROOT_DEVICE: Once<DeviceHandleK> = Once::new();
+static DRIVER_LOAD_LOCK: Once<KSem> = Once::new();
 
 #[repr(usize)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,17 +57,12 @@ pub struct DeviceObjectK {
     config_sem: KSem
 }
 
-pub struct ConfigGuard<'a> {
-    sem: &'a KSem
-}
-
-impl Drop for ConfigGuard<'_> {
-    fn drop(&mut self) {
-        self.sem.signal();
-    }
-}
 
 impl DeviceObjectK {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
     pub fn device_ptr(&self) -> *const DeviceObject {
         &self.device as *const DeviceObject
     }
@@ -88,13 +83,12 @@ impl DeviceObjectK {
         *self.parent.lock() = Some(pid);
     }
 
-    pub fn config_guard(&self) -> ConfigGuard<'_> {
-        self.config_sem.wait().expect("config sem wait failed");
-        ConfigGuard { sem: &self.config_sem }
-    }
-
     fn is_started(&self) -> bool {
         self.state.load(Ordering::Acquire) == DeviceState::Started as usize
+    }
+
+    pub fn config_guard(&self) -> ConfigGuard<'_> {
+        semaphore_guard(&self.config_sem)
     }
 
     pub fn children_snapshot(&self) -> Vec<usize> {
@@ -112,7 +106,9 @@ impl DeviceObjectK {
     }
 
     pub fn set_stack(&self, stack: Arc<DeviceStack>, level: usize) {
-        *self.stack.lock() = Some((stack, level));
+        let mut slot = self.stack.lock();
+        assert!(slot.is_none(), "physical device object is supposed to be part of atmost 1 device stack!");
+        *slot = Some((stack, level));
     }
 
     // PDOs are created by a bus during enumerate and are always "started" — they
@@ -129,11 +125,11 @@ impl DeviceObjectK {
     }
 
     pub fn read(&self, req: ReadRequest) -> Result<Status, KError> {
-        Ok(io_request_sync(self, IrpMajor::Read, IrpMinor::None, req.buffer, req.offset)?.status)
+        Ok(io_request_sync(self, IrpMajor::Read, IrpMinor::None, None, req.buffer, req.offset)?.status)
     }
 
     pub fn write(&self, req: ReadRequest) -> Result<Status, KError> {
-        Ok(io_request_sync(self, IrpMajor::Write, IrpMinor::None, req.buffer, req.offset)?.status)
+        Ok(io_request_sync(self, IrpMajor::Write, IrpMinor::None, None, req.buffer, req.offset)?.status)
     }
 
     pub fn attach_child(&self, child_id: usize) {
@@ -157,7 +153,7 @@ impl DeviceObjectK {
             }
         }
 
-        let irp = io_request_sync(self, IrpMajor::Start, IrpMinor::None, EMPTY_REGION, 0)?;
+        let irp = io_request_sync(self, IrpMajor::Start, IrpMinor::None, None, EMPTY_REGION, 0)?;
         if irp.status == Status::Success {
             self.state.store(DeviceState::Started as usize, Ordering::Release);
             self.update_stack_state(LevelState::Started);
@@ -173,7 +169,7 @@ impl DeviceObjectK {
             return Status::Success;
         }
         self.state.store(DeviceState::Stopped as usize, Ordering::Release);
-        let status = io_request_sync(self, IrpMajor::Stop, IrpMinor::None, EMPTY_REGION, 0)
+        let status = io_request_sync(self, IrpMajor::Stop, IrpMinor::None, None, EMPTY_REGION, 0)
             .map(|irp| irp.status)
             .unwrap_or(Status::Failed);
         self.update_stack_state(LevelState::Stopped);
@@ -184,13 +180,14 @@ impl DeviceObjectK {
     // result); then this device stops. PDOs skip their own stop dispatch but
     // still propagate the stop to their children.
     pub fn stop(&self) -> Result<Status, KError> {
+        let _g = self.config_guard();
+
         for cid in self.children_snapshot() {
             if let Some(child) = get_device(cid) {
                 let _ = child.stop();
             }
         }
 
-        let _g = self.config_guard();
         Ok(self.stop_self())
     }
 }
@@ -226,6 +223,7 @@ pub fn io_request_sync(
     dev: &DeviceObjectK,
     major: IrpMajor,
     minor: IrpMinor,
+    req_params: Option<ReqInfo>,
     buffer: MemoryRegion,
     offset: usize
 ) -> Result<Irp, KError> {
@@ -237,10 +235,11 @@ pub fn io_request_sync(
     let event = KEvent::new(false);
     let mut irp = Irp::new(major, buffer, offset, Some(io_complete), &event as *const KEvent as *mut c_void);
     irp.minor_code = minor;
+    irp.req_params = req_params;
 
     let status = dispatch(driver, major, dev.device_ptr(), &mut irp);
     if status == Status::Pending {
-        event.wait()?;
+        event.wait().expect("io_request_sync: completion wait failed with a pending IRP outstanding");
     } else {
         irp.status = status;
     }
@@ -261,26 +260,46 @@ extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
 struct AsyncCtx {
     routine: extern "C" fn(*mut Irp, *mut c_void),
     ctx: *mut c_void,
-    irp: *mut Irp
+    irp: AtomicPtr<Irp>,
+    refs: AtomicUsize
 }
 
-unsafe fn finalize_async(actx: *mut AsyncCtx) {
+// Run the caller routine + free the IRP exactly once. Returns true iff this call
+// performed the finalize (i.e. won the swap).
+unsafe fn finalize_async(actx: *mut AsyncCtx) -> bool {
+    let irp = unsafe { (*actx).irp.swap(core::ptr::null_mut(), Ordering::AcqRel) };
+    if irp.is_null() {
+        // If this is true then that means that this caller is late.
+        // Either driver or the caller frame came here first
+        return false;
+    }
     let routine = unsafe { (*actx).routine };
     let ctx = unsafe { (*actx).ctx };
-    let irp = unsafe { (*actx).irp };
     routine(irp, ctx);
     drop(unsafe { Box::from_raw_in(irp, PoolAllocatorGlobal) });
-    drop(unsafe { Box::from_raw_in(actx, PoolAllocatorGlobal) });
+    true
+}
+
+// Drop one reference to the shared ctx; the last owner frees it.
+unsafe fn release_async(actx: *mut AsyncCtx) {
+    if unsafe { (*actx).refs.fetch_sub(1, Ordering::AcqRel) } == 1 {
+        drop(unsafe { Box::from_raw_in(actx, PoolAllocatorGlobal) });
+    }
 }
 
 extern "C" fn io_complete_async(_irp: *mut Irp, ctx: *mut c_void) {
-    unsafe { finalize_async(ctx as *mut AsyncCtx) };
+    let actx = ctx as *mut AsyncCtx;
+    unsafe {
+        finalize_async(actx);
+        release_async(actx);
+    }
 }
 
 pub fn io_request_async(
     dev: &DeviceObjectK,
     major: IrpMajor,
     minor: IrpMinor,
+    req_params: Option<ReqInfo>,
     buffer: MemoryRegion,
     offset: usize,
     routine: extern "C" fn(*mut Irp, *mut c_void),
@@ -292,7 +311,13 @@ pub fn io_request_async(
     let driver = dev.driver.as_ref().ok_or(KError::Unsupported)?;
 
     let actx = Box::into_raw_with_allocator(Box::new_in(
-        AsyncCtx { routine, ctx, irp: core::ptr::null_mut() },
+        AsyncCtx {
+            routine,
+            ctx,
+            irp: AtomicPtr::new(core::ptr::null_mut()),
+            // Two refs: this frame + the IRP/completion routine.
+            refs: AtomicUsize::new(2)
+        },
         PoolAllocatorGlobal
     )).0;
 
@@ -301,17 +326,33 @@ pub fn io_request_async(
         PoolAllocatorGlobal
     );
     irp_box.minor_code = minor;
+    irp_box.req_params = req_params;
     let irp_raw = Box::into_raw_with_allocator(irp_box).0;
-    unsafe { (*actx).irp = irp_raw; }
+    unsafe { (*actx).irp.store(irp_raw, Ordering::Release); }
 
     let status = dispatch(driver, major, dev.device_ptr(), irp_raw);
     if status == Status::Pending {
+        // The completion will run later (possibly on another thread) and owns the
+        // IRP plus the other ref; just release this frame's ref.
+        unsafe { release_async(actx); }
         Ok(Status::Pending)
     } else {
-        // Driver completed synchronously without calling complete_irp.
         unsafe {
-            (*irp_raw).status = status;
-            finalize_async(actx);
+            // This code here is to ensure that kernel continues to run 
+            // smoothly in case the driver decided to call io_complete_irp()
+            // even when it returned SUCCESS.
+
+            // Only stamp status if the driver hasn't already completed the IRP.
+            if (*actx).irp.load(Ordering::Acquire) == irp_raw {
+                (*irp_raw).status = status;
+            }
+            let finalized_here = finalize_async(actx);
+            release_async(actx);
+            // If we performed the finalize, no io_complete_async will ever run to
+            // release the completion's ref — release it here too.
+            if finalized_here {
+                release_async(actx);
+            }
         }
         Ok(status)
     }
@@ -375,6 +416,10 @@ fn load_driver(path: &str) -> Result<DriverHandle, KError> {
 }
 
 pub fn load_driver_by_name(name: &str) -> Result<DriverHandle, KError> {
+    let _guard = semaphore_guard(
+        DRIVER_LOAD_LOCK.get().expect("io::init() not called before load_driver_by_name()")
+    );
+
     if let Some(driver) = DRIVER_BY_NAME.lock().get(name) {
         return Ok(driver.clone());
     }
@@ -458,7 +503,7 @@ pub fn remove_device(dev: &DeviceObjectK) {
     {
         let _g = dev.config_guard();
         dev.stop_self();
-        let _ = io_request_sync(dev, IrpMajor::Remove, IrpMinor::None, EMPTY_REGION, 0);
+        let _ = io_request_sync(dev, IrpMajor::Remove, IrpMinor::None, None, EMPTY_REGION, 0);
     }
 
     if let Some(pid) = dev.parent_id() {
@@ -466,6 +511,12 @@ pub fn remove_device(dev: &DeviceObjectK) {
             parent.children.lock().retain(|&c| c != dev.id);
         }
     }
+
+    // Notify the device's stack instance
+    if let Some((stack, level)) = dev.stack.lock().take() {
+        stack::on_device_removed(&stack, level);
+    }
+
     DEVICE_REGISTRY.lock().remove(&dev.id);
     info!("remove_device: dropped device {}", dev.id);
 }
@@ -493,6 +544,7 @@ pub extern "C" fn io_send_request(
     device: *const DeviceObject,
     major: usize,
     minor: usize,
+    req_params_ptr: *const u8,
     buf_base: usize,
     buf_size: usize,
     offset: usize,
@@ -509,10 +561,16 @@ pub extern "C" fn io_send_request(
     };
     let minor = IrpMinor::from_usize(minor).unwrap_or(IrpMinor::None);
     let buffer = MemoryRegion { base_address: buf_base, size: buf_size };
+    let req_params = if req_params_ptr.is_null() {
+        None
+    }
+    else {
+        Some(unsafe { (req_params_ptr as *const ReqInfo).read() })
+    };
 
     let result = match completion {
-        None => io_request_sync(&dev, major, minor, buffer, offset).map(|irp| irp.status),
-        Some(routine) => io_request_async(&dev, major, minor, buffer, offset, routine, completion_ctx)
+        None => io_request_sync(&dev, major, minor, req_params, buffer, offset).map(|irp| irp.status),
+        Some(routine) => io_request_async(&dev, major, minor, req_params, buffer, offset, routine, completion_ctx)
     };
 
     result.unwrap_or(Status::Failed)
@@ -536,6 +594,7 @@ pub extern "C" fn exit_kernel_thread() -> ! {
 }
 
 pub fn init() {
+    DRIVER_LOAD_LOCK.call_once(|| KSem::new(1, 1));
     ROOT_DEVICE.call_once(create_root_device);
 
     // Parse boot.conf and bring up every Root stack. Enumeration inside the

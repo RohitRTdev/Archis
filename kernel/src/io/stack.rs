@@ -31,36 +31,59 @@ pub enum LevelState {
     Failed
 }
 
+// Immutable template parsed from boot.conf: one per [DeviceStack] block. Tells us
+// which drivers to load (bottom -> top) for a given match id. Shared 
+// across every live instance that matches the same id.
+struct DeviceStackDescriptor {
+    match_id: String,
+    driver_names: Vec<String>
+}
+
 struct LevelInfo {
-    driver_loaded: bool,
-    devices: Vec<usize>,
+    // The single device occupying this level (None until created / after teardown).
+    device: Option<usize>,
     state: LevelState
 }
 
+// A single live instance of a stack, created on demand for exactly one base PDO.
 pub struct DeviceStack {
-    match_id: String,
-    driver_names: Vec<String>,
-    inner: Spinlock<StackInner>
+    descriptor: Arc<DeviceStackDescriptor>,
+    inner: Spinlock<StackInstance>
 }
 
-struct StackInner {
-    base_pdos: Vec<usize>,
+struct StackInstance {
+    // The single base parent device id (a matched PDO, or the ROOT device for Root stacks).
+    base_pdo: usize,
     levels: Vec<LevelInfo>
 }
 
 impl DeviceStack {
-    fn new(match_id: String, driver_names: Vec<String>) -> Self {
-        let levels = driver_names
+    fn new(descriptor: Arc<DeviceStackDescriptor>, base_pdo: usize) -> Self {
+        let levels = descriptor
+            .driver_names
             .iter()
-            .map(|_| LevelInfo { driver_loaded: false, devices: Vec::new(), state: LevelState::NotStarted })
+            .map(|_| LevelInfo { device: None, state: LevelState::NotStarted })
             .collect();
         Self {
-            match_id,
-            driver_names,
-            inner: Spinlock::new(StackInner { base_pdos: Vec::new(), levels })
+            descriptor,
+            inner: Spinlock::new(StackInstance { base_pdo, levels })
         }
     }
 
+    fn match_id(&self) -> &str {
+        &self.descriptor.match_id
+    }
+
+    fn driver_names(&self) -> &[String] {
+        &self.descriptor.driver_names
+    }
+
+    fn base_pdo(&self) -> usize {
+        self.inner.lock().base_pdo
+    }
+
+    // Called from io::driver via the device's stored (stack, level) tuple. A PDO
+    // carries BASE_LEVEL (== usize::MAX), which is out of range and thus a no-op.
     pub fn set_level_state(&self, level: usize, state: LevelState) {
         let mut inner = self.inner.lock();
         if level < inner.levels.len() {
@@ -68,20 +91,41 @@ impl DeviceStack {
         }
     }
 
-    fn mark_loaded(&self, level: usize) {
-        self.inner.lock().levels[level].driver_loaded = true;
+    fn set_level_device(&self, level: usize, id: usize) {
+        let mut inner = self.inner.lock();
+        if level < inner.levels.len() {
+            inner.levels[level].device = Some(id);
+        }
     }
 
-    fn record_device(&self, level: usize, id: usize) {
-        self.inner.lock().levels[level].devices.push(id);
+    fn level_device(&self, level: usize) -> Option<usize> {
+        self.inner.lock().levels.get(level).and_then(|l| l.device)
     }
 
-    fn add_base_pdo(&self, id: usize) {
-        self.inner.lock().base_pdos.push(id);
+    // Reset a level after its device is torn down: drop the device id and mark it
+    // NotStarted so a later refresh re-runs add_device for this level.
+    fn clear_level(&self, level: usize) {
+        let mut inner = self.inner.lock();
+        if level < inner.levels.len() {
+            inner.levels[level].device = None;
+            inner.levels[level].state = LevelState::NotStarted;
+        }
+    }
+
+    // Lowest level needing (re)work: Failed (load/start error) or NotStarted
+    // (cleared by a removal). Started and Stopped levels are intentionally skipped
+    // so a deliberately stopped stack is never auto-restarted.
+    fn first_incomplete_level(&self) -> Option<usize> {
+        self.inner
+            .lock()
+            .levels
+            .iter()
+            .position(|l| matches!(l.state, LevelState::Failed | LevelState::NotStarted))
     }
 }
 
-static STACKS: Once<Spinlock<Vec<Arc<DeviceStack>>>> = Once::new();
+static DESCRIPTORS: Once<Spinlock<Vec<Arc<DeviceStackDescriptor>>>> = Once::new();
+static STACK_INSTANCES: Once<Spinlock<Vec<Arc<DeviceStack>>>> = Once::new();
 
 fn read_file_to_string(path: &str) -> Option<String> {
     let file = open(path).ok()?;
@@ -93,8 +137,15 @@ fn read_file_to_string(path: &str) -> Option<String> {
     core::str::from_utf8(buf.as_slice()).ok().map(|s| s.to_string())
 }
 
-fn parse(text: &str) -> Vec<Arc<DeviceStack>> {
-    let mut stacks = Vec::new();
+fn push_descriptor(out: &mut Vec<Arc<DeviceStackDescriptor>>, match_id: String, driver_names: Vec<String>) {
+    if out.iter().any(|d| d.match_id == match_id) {
+        panic!("boot.conf: duplicate device stack id '{}' (a PDO must belong to at most one stack)", match_id);
+    }
+    out.push(Arc::new(DeviceStackDescriptor { match_id, driver_names }));
+}
+
+fn parse(text: &str) -> Vec<Arc<DeviceStackDescriptor>> {
+    let mut descriptors: Vec<Arc<DeviceStackDescriptor>> = Vec::new();
     let mut cur_id: Option<String> = None;
     let mut cur_drivers: Vec<String> = Vec::new();
     let mut in_block = false;
@@ -107,7 +158,7 @@ fn parse(text: &str) -> Vec<Arc<DeviceStack>> {
 
         if line == "[DeviceStack]" {
             if let Some(id) = cur_id.take() {
-                stacks.push(Arc::new(DeviceStack::new(id, core::mem::take(&mut cur_drivers))));
+                push_descriptor(&mut descriptors, id, core::mem::take(&mut cur_drivers));
             }
             cur_drivers.clear();
             in_block = true;
@@ -126,14 +177,15 @@ fn parse(text: &str) -> Vec<Arc<DeviceStack>> {
     }
 
     if let Some(id) = cur_id.take() {
-        stacks.push(Arc::new(DeviceStack::new(id, cur_drivers)));
+        push_descriptor(&mut descriptors, id, cur_drivers);
     }
 
-    stacks
+    descriptors
 }
 
 pub fn load_boot_config() {
-    STACKS.call_once(|| Spinlock::new(Vec::new()));
+    DESCRIPTORS.call_once(|| Spinlock::new(Vec::new()));
+    STACK_INSTANCES.call_once(|| Spinlock::new(Vec::new()));
 
     let text = match read_file_to_string(BOOT_CONF_PATH) {
         Some(text) => text,
@@ -144,88 +196,133 @@ pub fn load_boot_config() {
     };
 
     let parsed = parse(&text);
-    info!("boot.conf: parsed {} device stack(s)", parsed.len());
-    for stack in parsed.iter() {
-        info!("  stack id='{}' drivers={:?}", stack.match_id, stack.driver_names);
+    info!("boot.conf: parsed {} device stack descriptor(s)", parsed.len());
+    for d in parsed.iter() {
+        info!("  stack id='{}' drivers={:?}", d.match_id, d.driver_names);
     }
-    *STACKS.get().unwrap().lock() = parsed;
+    *DESCRIPTORS.get().unwrap().lock() = parsed;
 }
 
-fn find_stack(id: &str) -> Option<Arc<DeviceStack>> {
-    let stacks = STACKS.get()?.lock();
-    stacks.iter().find(|s| s.match_id == id).cloned()
+fn find_descriptor(id: &str) -> Option<Arc<DeviceStackDescriptor>> {
+    let descriptors = DESCRIPTORS.get()?.lock();
+    descriptors.iter().find(|d| d.match_id == id).cloned()
+}
+
+fn register_instance(stack: &Arc<DeviceStack>) {
+    STACK_INSTANCES.get().expect("STACK_INSTANCES not initialized").lock().push(stack.clone());
+}
+
+fn remove_instance(stack: &Arc<DeviceStack>) {
+    if let Some(list) = STACK_INSTANCES.get() {
+        list.lock().retain(|s| !Arc::ptr_eq(s, stack));
+    }
 }
 
 pub fn load_root_stacks() {
     let root = root_device();
-    let root_stacks: Vec<Arc<DeviceStack>> = match STACKS.get() {
-        Some(stacks) => stacks.lock().iter().filter(|s| s.match_id == ROOT_ID).cloned().collect(),
-        None => panic!("STACKS is uninitialized??")
+    let root_descriptors: Vec<Arc<DeviceStackDescriptor>> = match DESCRIPTORS.get() {
+        Some(d) => d.lock().iter().filter(|d| d.match_id == ROOT_ID).cloned().collect(),
+        None => panic!("DESCRIPTORS is uninitialized??")
     };
 
-    for stack in root_stacks {
+    for descriptor in root_descriptors {
         info!("Loading root stack");
-        load_stack_instance(&stack, root.clone());
+        // The ROOT device is never attached to a stack (it is never removed).
+        start_stack_instance(descriptor, root.clone(), false);
     }
 }
 
-// Load one instance of a stack onto base_parent from level 0.
-fn load_stack_instance(stack: &Arc<DeviceStack>, base_parent: DeviceHandleK) {
-    continue_stack(stack, 0, base_parent);
+// Create a fresh per-base-PDO stack instance, register it, and bring it up from level 0 
+fn start_stack_instance(descriptor: Arc<DeviceStackDescriptor>, base: DeviceHandleK, attach_base: bool) {
+    let stack = Arc::new(DeviceStack::new(descriptor, base.id()));
+    if attach_base {
+        base.set_stack(stack.clone(), BASE_LEVEL);
+    }
+    register_instance(&stack);
+    continue_stack(&stack, 0);
 }
 
-// Resume/load a stack instance from from_level upward on base_parent. Each
-// level: load driver, add_device(parent), start the FDO, enumerate it. add is
-// serialized on the parent's config semaphore.
-fn continue_stack(stack: &Arc<DeviceStack>, from_level: usize, base_parent: DeviceHandleK) {
-    let mut parent = base_parent;
+fn parent_for_level(stack: &Arc<DeviceStack>, level: usize) -> Option<DeviceHandleK> {
+    if level == 0 {
+        get_device(stack.base_pdo())
+    } else {
+        stack.level_device(level - 1).and_then(get_device)
+    }
+}
 
-    for level in from_level..stack.driver_names.len() {
-        let name = &stack.driver_names[level];
+// Bring a single stack instance up from from_level. The parent of from_level is the
+// base PDO (level 0) or the device recorded one level below. Each level: load the
+// driver, add_device on the parent (serialized on the parent's config semaphore),
+// expect exactly one FDO, record + start it, then enumerate it (it may be a bus).
+fn continue_stack(stack: &Arc<DeviceStack>, from_level: usize) {
+    let names_len = stack.driver_names().len();
 
-        let driver = match load_driver_by_name(name) {
+    let mut parent = match parent_for_level(stack, from_level) {
+        Some(parent) => parent,
+        None => {
+            info!("stack '{}': no parent device for level {}", stack.match_id(), from_level);
+            stack.set_level_state(from_level, LevelState::Failed);
+            return;
+        }
+    };
+
+    for level in from_level..names_len {
+        // Drop any device left over from a prior failed attempt at this level so we
+        // don't create a duplicate FDO when retrying.
+        if let Some(stale) = stack.level_device(level) {
+            assert!(false, "Found stale fdo device!");
+            if let Some(dev) = get_device(stale) {
+                remove_device(&dev);
+            }
+            stack.clear_level(level);
+        }
+
+        let name = stack.driver_names()[level].clone();
+
+        let driver = match load_driver_by_name(&name) {
             Ok(driver) => driver,
             Err(e) => {
-                info!("stack '{}': could not load driver '{}': {}", stack.match_id, name, e);
+                info!("stack '{}': could not load driver '{}': {}", stack.match_id(), name, e);
                 stack.set_level_state(level, LevelState::Failed);
                 return;
             }
         };
-        stack.mark_loaded(level);
 
         let before = parent.children_snapshot();
         let added = {
             let _g = parent.config_guard();
             let status = driver_invoke_add(&driver, parent.device_ptr());
-            
+
             if status != Status::Success {
-                info!("stack '{}': add_device failed at level {} ('{}')", stack.match_id, level, name);
+                info!("stack '{}': add_device failed at level {} ('{}')", stack.match_id(), level, name);
                 stack.set_level_state(level, LevelState::Failed);
                 return;
             }
-            
+
             parent.children_added(&before)
         };
 
-        assert!(added.len() == 1);
-        let fdo_id = match added.first().copied() {
-            Some(id) => id,
-            None => {
-                info!("stack '{}': driver '{}' created no device at level {}", stack.match_id, name, level);
-                stack.set_level_state(level, LevelState::Failed);
-                return;
-            }
-        };
+        // A well-behaved add_device creates exactly one FDO under the parent.
+        // Anything else is a driver bug
+        if added.len() != 1 {
+            info!(
+                "stack '{}': add_device for '{}' created {} devices at level {} (expected 1)",
+                stack.match_id(), name, added.len(), level
+            );
+            stack.set_level_state(level, LevelState::Failed);
+            return;
+        }
+        let fdo_id = added[0];
 
         let fdo = match get_device(fdo_id) {
             Some(fdo) => fdo,
             None => return
         };
         fdo.set_stack(stack.clone(), level);
-        stack.record_device(level, fdo_id);
+        stack.set_level_device(level, fdo_id);
 
         if fdo.start() != Ok(Status::Success) {
-            info!("stack '{}': start failed at level {} ('{}')", stack.match_id, level, name);
+            info!("stack '{}': start failed at level {} ('{}')", stack.match_id(), level, name);
             stack.set_level_state(level, LevelState::Failed);
             return;
         }
@@ -236,23 +333,21 @@ fn continue_stack(stack: &Arc<DeviceStack>, from_level: usize, base_parent: Devi
         parent = fdo;
     }
 
-    info!("stack '{}' fully loaded", stack.match_id);
+    info!("stack '{}' fully loaded", stack.match_id());
 }
 
 // Enumerate a started FDO and reconcile its children against the bus-reported
-// current set. Newly appeared PDOs are attached + detected, disappeared ones torn down,
-// unchanged ones left alone.
+// current set. Newly appeared PDOs are attached + detected (each spawns its own
+// stack instance), disappeared ones torn down, unchanged ones left alone.
 pub fn enumerate_and_detect(fdo: DeviceHandleK) {
-    let old = fdo.children_snapshot();
+    let _g = fdo.config_guard();
 
-    let irp = {
-        let _g = fdo.config_guard();
-        match io_request_sync(&fdo, IrpMajor::Configure, IrpMinor::Enumerate, EMPTY_REGION, 0) {
-            Ok(irp) => irp,
-            Err(e) => {
-                info!("enumerate on '{}' failed: {}", fdo.name(), e);
-                return;
-            }
+    let old = fdo.children_snapshot();
+    let irp = match io_request_sync(&fdo, IrpMajor::Configure, IrpMinor::Enumerate, None, EMPTY_REGION, 0) {
+        Ok(irp) => irp,
+        Err(e) => {
+            info!("enumerate on '{}' failed: {}", fdo.name(), e);
+            return;
         }
     };
 
@@ -265,30 +360,24 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
         return;
     }
 
-    // irp.buffer = slice of *mut DeviceObject: base_address = ptr, size = count.
-    let count = irp.buffer.size;
-    let array_ptr = irp.buffer.base_address as *const *mut DeviceObject;
     let mut new_ids: Vec<usize> = Vec::new();
-    if !array_ptr.is_null() {
-        for i in 0..count {
-            let dev_ptr = unsafe { *array_ptr.add(i) };
-            if !dev_ptr.is_null() {
-                new_ids.push(unsafe { (*dev_ptr).id });
-            }
-        }
+    if let Some(req) = irp.req_params {
+        let array = unsafe { req.enumerate };
+        array.iter().for_each(|&dev| {
+            new_ids.push(unsafe{ (*dev).id });
+        });
+
         // Free the driver-allocated array using the matching pool layout.
-        if let (Some(nn), Ok(layout)) =
-            (NonNull::new(array_ptr as *mut u8), Layout::array::<*mut DeviceObject>(count))
-        {
-            unsafe { PoolAllocatorGlobal.deallocate(nn, layout); }
-        }
+        let nn = NonNull::new(array.as_ptr() as *mut u8).unwrap();  
+        let layout = Layout::array::<*mut DeviceObject>(array.len()).unwrap();
+        unsafe { PoolAllocatorGlobal.deallocate(nn, layout); }
     }
 
     let added: Vec<usize> = new_ids.iter().copied().filter(|id| !old.contains(id)).collect();
     let removed: Vec<usize> = old.iter().copied().filter(|id| !new_ids.contains(id)).collect();
     info!("enumerate on '{}': +{} -{}", fdo.name(), added.len(), removed.len());
 
-    // Tear down disappeared children first.
+    // Tear down disappeared children first
     for id in removed {
         if let Some(dev) = get_device(id) {
             remove_device(&dev);
@@ -312,12 +401,11 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
             }
         };
 
-        match find_stack(&match_id) {
-            Some(stack) => {
+        match find_descriptor(&match_id) {
+            Some(descriptor) => {
                 info!("PDO {} matched stack '{}'", id, match_id);
-                pdo.set_stack(stack.clone(), BASE_LEVEL);
-                stack.add_base_pdo(id);
-                load_stack_instance(&stack, pdo.clone());
+                // Each PDO is the base of its own fresh instance.
+                start_stack_instance(descriptor, pdo.clone(), true);
             }
             None => info!("PDO {} id '{}' matched no stack", id, match_id)
         }
@@ -327,7 +415,7 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
 fn query_id(dev: &DeviceHandleK) -> Option<String> {
     let irp = {
         let _g = dev.config_guard();
-        io_request_sync(dev, IrpMajor::Configure, IrpMinor::Query, EMPTY_REGION, 0).ok()?
+        io_request_sync(dev, IrpMajor::Configure, IrpMinor::Query, None, EMPTY_REGION, 0).ok()?
     };
     if irp.status != Status::Success {
         return None;
@@ -340,47 +428,29 @@ fn query_id(dev: &DeviceHandleK) -> Option<String> {
     Some(unsafe { sref.as_str() }.to_string())
 }
 
+// Retry every live stack instance that has an incomplete level (failed to load or
+// cleared by a removal), continuing from its lowest such level.
 pub fn refresh_device_tree() {
-    let stacks: Vec<Arc<DeviceStack>> = match STACKS.get() {
-        Some(stacks) => stacks.lock().clone(),
-        None => panic!("STACKS not initialized??")
+    let instances: Vec<Arc<DeviceStack>> = match STACK_INSTANCES.get() {
+        Some(list) => list.lock().clone(),
+        None => panic!("STACK_INSTANCES not initialized??")
     };
 
-    for stack in stacks {
-        let level = {
-            let inner = stack.inner.lock();
-            inner.levels.iter().position(|l| l.state == LevelState::Failed)
-        };
-        let level = match level {
-            Some(level) => level,
-            None => continue
-        };
-
-        info!("refresh: retrying stack '{}' from level {}", stack.match_id, level);
-
-        let parents: Vec<DeviceHandleK> = if level == 0 {
-            if stack.match_id == ROOT_ID {
-                let mut v = Vec::new();
-                v.push(root_device());
-                v
-            } else {
-                let base = stack.inner.lock().base_pdos.clone();
-                base.iter().filter_map(|&id| get_device(id)).collect()
-            }
-        } else {
-            let devs = stack.inner.lock().levels[level - 1].devices.clone();
-            devs.iter().filter_map(|&id| get_device(id)).collect()
-        };
-
-        stack.set_level_state(level, LevelState::NotStarted);
-        for parent in parents {
-            continue_stack(&stack, level, parent);
+    for stack in instances {
+        if let Some(level) = stack.first_incomplete_level() {
+            info!("refresh: retrying stack '{}' from level {}", stack.match_id(), level);
+            continue_stack(&stack, level);
         }
     }
 }
 
-#[allow(dead_code)]
-pub fn resume_stack(_driver_name: &str) {
-    // TODO: scan STACKS for a level whose driver == driver_name and state ==
-    // Failed/NotStarted, then continue from the recorded parent device(s).
+// Called from io::driver::remove_device when a device that belongs to a stack is
+// torn down. A base PDO leaving means the whole instance is gone; a numbered FDO
+// level leaving just resets that level so a later refresh re-runs add_device.
+pub fn on_device_removed(stack: &Arc<DeviceStack>, level: usize) {
+    if level == BASE_LEVEL {
+        remove_instance(stack);
+    } else {
+        stack.clear_level(level);
+    }
 }

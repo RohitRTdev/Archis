@@ -19,7 +19,7 @@ use crate::mem::{PageDescriptor, allocate_memory, deallocate_memory};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use crate::sched::Handle::ImgHandle;
 use crate::sched::add_new_handle;
-use crate::sync::{Spinlock, KSem, Once};
+use crate::sync::{KSem, Once, Spinlock, semaphore_guard};
 use kernel_intf::list::{List, DynList};
 use super::module;
 
@@ -81,13 +81,11 @@ pub fn load_image(path: &str, is_user: bool) -> Result<LoadedImage, KError> {
     info!("Start load_image for {}", path);
 
     // Serialize the whole recursive load
-    let load_lock = LOAD_LOCK.get().expect("loader::init() not called before load_image()");
-    load_lock.wait()?;
+    let _guard = semaphore_guard(LOAD_LOCK.get().expect("loader::init() not called before load_image()"));
 
     let mut in_progress: Vec<String> = Vec::new();
     let result = load_image_inner(path, is_user, &mut in_progress);
 
-    load_lock.signal();
     result
 }
 

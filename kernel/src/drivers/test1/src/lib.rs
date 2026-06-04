@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use kernel_intf::{info, exported_function};
 use kernel_intf::driver::{
-    DeviceObject, DriverObject, Irp, IrpMinor, Status, create_device, create_device_by_id
+    DeviceObject, DriverObject, Irp, IrpMinor, ReqInfo, Status, create_device, create_device_by_id
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
 use common::MemoryRegion;
@@ -97,17 +97,21 @@ fn enumerate(device: &DeviceObject, request: &mut Irp) -> Status {
     // Later generations report the same set
 
     let count = state.pdo_count;
-    let layout = Layout::array::<*mut DeviceObject>(count).unwrap();
+    let layout = Layout::array::<*const DeviceObject>(count).unwrap();
     let array = match PoolAllocatorGlobal.allocate(layout) {
-        Ok(array) => array.cast::<*mut DeviceObject>().as_ptr(),
+        Ok(array) => unsafe { 
+            let ptr = array.cast::<*const DeviceObject>().as_ptr();
+            core::slice::from_raw_parts_mut(ptr, count)
+        },
         Err(_) => return Status::Failed
     };
+
     for i in 0..count {
-        unsafe { *array.add(i) = state.pdos[i]; }
+        array[i] = state.pdos[i];
     }
 
     info!("test1 enumerate: reporting {} PDO(s)", count);
-    request.buffer = MemoryRegion { base_address: array as usize, size: count };
+    request.req_params = Some(ReqInfo{enumerate: array});
     Status::Success
 }
 

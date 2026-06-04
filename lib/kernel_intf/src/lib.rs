@@ -126,6 +126,7 @@ unsafe extern "C" {
         device: *const driver::DeviceObject,
         major: usize,
         minor: usize,
+        req_params_ptr: *const u8, 
         buf_base: usize,
         buf_size: usize,
         offset: usize,

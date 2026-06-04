@@ -272,3 +272,18 @@ impl Clone for KEvent {
         }
     }
 }
+
+pub struct ConfigGuard<'a> {
+    sem: &'a KSem
+}
+
+impl Drop for ConfigGuard<'_> {
+    fn drop(&mut self) {
+        self.sem.signal();
+    }
+}
+
+pub fn semaphore_guard(sem: &KSem) -> ConfigGuard<'_> {
+    sem.wait().expect("config sem wait failed");
+    ConfigGuard { sem }
+}
