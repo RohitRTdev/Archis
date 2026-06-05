@@ -1,24 +1,23 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-
 use common::{MemoryRegion, StrRef};
 use kernel_intf::driver::{
-    DeviceObject, DriverObject, EMPTY_REGION, Irp, IrpMajor, IrpMinor, ReqInfo, Status
+    DeviceObject, DriverObject, EMPTY_REGION, Irp, IrpMajor, IrpMinor, IrpResult, Status
 };
 use kernel_intf::{acquire_spinlock, release_spinlock};
+use kernel_intf::list::{DynList, List};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::{KError, info};
 
 use crate::loader::{LoadedImage, load_image};
+use crate::sched::{self, cancel_irp, AsyncCtx, allocate_irp, disable_preemption, enable_preemption};
 use crate::sync::{ConfigGuard, KEvent, KSem, Once, Spinlock, semaphore_guard};
-use crate::sched::{AsyncCtx, allocate_irp, disable_preemption, enable_preemption};
 use super::stack::{self, DeviceStack, LevelState};
 pub type DriverHandle = Arc<DriverObjectK, PoolAllocatorGlobal>;
 pub type DeviceHandleK = Arc<DeviceObjectK, PoolAllocatorGlobal>;
@@ -29,6 +28,7 @@ static NEXT_DEVICE_ID: AtomicUsize = AtomicUsize::new(0);
 static DRIVER_REGISTRY: Spinlock<BTreeMap<usize, DriverHandle>> = Spinlock::new(BTreeMap::new());
 static DRIVER_BY_NAME: Spinlock<BTreeMap<String, DriverHandle>> = Spinlock::new(BTreeMap::new());
 static DEVICE_REGISTRY: Spinlock<BTreeMap<usize, DeviceHandleK>> = Spinlock::new(BTreeMap::new());
+static DEVICE_BY_NAME: Spinlock<BTreeMap<String, DeviceHandleK>> = Spinlock::new(BTreeMap::new());
 static ROOT_DEVICE: Once<DeviceHandleK> = Once::new();
 static DRIVER_LOAD_LOCK: Once<KSem> = Once::new();
 
@@ -56,9 +56,12 @@ pub struct DeviceObjectK {
     stack: Spinlock<Option<(Arc<DeviceStack>, usize)>>,
     // Serializes start/stop/query/enumerate/remove/add for this device.
     // Read/write mutual exclusion is left to driver writer.
-    config_sem: KSem
+    config_sem: KSem,
+    pub pending_irps: Spinlock<DynList<IrpPtr>>
 }
 
+unsafe impl Send for DeviceObjectK {}
+unsafe impl Sync for DeviceObjectK {}
 
 impl DeviceObjectK {
     pub fn id(&self) -> usize {
@@ -127,11 +130,11 @@ impl DeviceObjectK {
     }
 
     pub fn read(&self, req: ReadRequest) -> Result<Status, KError> {
-        Ok(io_request_sync(self, IrpMajor::Read, IrpMinor::None, None, req.buffer, req.offset)?.status)
+        Ok(io_request_sync(self, IrpMajor::Read, IrpMinor::None, req.buffer, req.offset)?.status)
     }
 
     pub fn write(&self, req: ReadRequest) -> Result<Status, KError> {
-        Ok(io_request_sync(self, IrpMajor::Write, IrpMinor::None, None, req.buffer, req.offset)?.status)
+        Ok(io_request_sync(self, IrpMajor::Write, IrpMinor::None, req.buffer, req.offset)?.status)
     }
 
     pub fn attach_child(&self, child_id: usize) {
@@ -155,7 +158,7 @@ impl DeviceObjectK {
             }
         }
 
-        let irp = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Start, None, EMPTY_REGION, 0)?;
+        let irp = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Start, EMPTY_REGION, 0)?;
         if irp.status == Status::Success {
             self.state.store(DeviceState::Started as usize, Ordering::Release);
             self.update_stack_state(LevelState::Started);
@@ -171,7 +174,7 @@ impl DeviceObjectK {
             return Status::Success;
         }
         self.state.store(DeviceState::Stopped as usize, Ordering::Release);
-        let status = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Stop, None, EMPTY_REGION, 0)
+        let status = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Stop, EMPTY_REGION, 0)
             .map(|irp| irp.status)
             .unwrap_or(Status::Failed);
         self.update_stack_state(LevelState::Stopped);
@@ -223,27 +226,26 @@ pub fn io_request_sync(
     dev: &DeviceObjectK,
     major: IrpMajor,
     minor: IrpMinor,
-    req_params: Option<ReqInfo>,
     buffer: MemoryRegion,
     offset: usize
-) -> Result<Irp, KError> {
+) -> Result<IrpResult, KError> {
     if !bypasses_started_guard(major, minor) && !dev.is_started() {
         return Err(KError::DeviceStopped);
     }
     let driver = dev.driver.as_ref().ok_or(KError::Unsupported)?;
 
     let event = KEvent::new(false);
-    let mut result = Irp::default();
+    let mut result = IrpResult::default();
 
     let irp = allocate_irp(
-        major, 
-        minor, 
-        req_params, 
-        buffer, 
-        offset, 
-        Some(event.clone()), 
-        &mut result as IrpPtr, 
-        None, 
+        major,
+        minor,
+        buffer,
+        offset,
+        dev.device_ptr(),
+        Some(event.clone()),
+        &mut result as *mut IrpResult,
+        None,
         core::ptr::null_mut()
     );
 
@@ -251,7 +253,10 @@ pub fn io_request_sync(
     if status == Status::Pending {
         event.wait().expect("io_request_sync: completion wait failed with a pending IRP outstanding");
     }
-    
+    else if status == Status::Unsupported {
+        io_complete_irp(irp, status);
+    }
+
     Ok(result)
 }
 
@@ -259,10 +264,9 @@ pub fn io_request_async(
     dev: &DeviceObjectK,
     major: IrpMajor,
     minor: IrpMinor,
-    req_params: Option<ReqInfo>,
     buffer: MemoryRegion,
     offset: usize,
-    routine: extern "C" fn(*mut Irp, *mut c_void),
+    routine: extern "C" fn(*const IrpResult, *mut c_void),
     ctx: *mut c_void
 ) -> Result<Status, KError> {
     if !bypasses_started_guard(major, minor) && !dev.is_started() {
@@ -272,17 +276,20 @@ pub fn io_request_async(
 
     let irp = allocate_irp(
         major,
-        minor, 
-        req_params, 
-        buffer, 
-        offset, 
-        None, 
+        minor,
+        buffer,
+        offset,
+        dev.device_ptr(),
+        None,
         core::ptr::null_mut(),
-        Some(routine), 
+        Some(routine),
         ctx
     );
 
     let status = dispatch(driver, major, dev.device_ptr(), irp);
+    if status == Status::Unsupported {
+        io_complete_irp(irp, status);
+    }
     Ok(status)
 }
 
@@ -310,7 +317,8 @@ fn create_root_device() -> DeviceHandleK {
             parent: Spinlock::new(None),
             children: Spinlock::new(Vec::new()),
             stack: Spinlock::new(None),
-            config_sem: KSem::new(1, 1)
+            config_sem: KSem::new(1, 1),
+            pending_irps: Spinlock::new(List::new())
         },
         PoolAllocatorGlobal
     );
@@ -357,6 +365,8 @@ pub fn load_driver_by_name(name: &str) -> Result<DriverHandle, KError> {
     Ok(driver)
 }
 
+// Returns null on failure. Failure causes: unknown driver id, or the supplied
+// name is already registered for another device 
 #[unsafe(no_mangle)]
 pub extern "C" fn io_create_device(
     driver_id: usize,
@@ -383,6 +393,14 @@ pub extern "C" fn io_create_device(
         Some(name_ref)
     };
 
+    // Reject duplicate names
+    if let Some(n) = name {
+        if DEVICE_BY_NAME.lock().contains_key(n) {
+            info!("io_create_device: duplicate device name '{}'", n);
+            return core::ptr::null_mut();
+        }
+    }
+
     let device = Arc::new_in(
         DeviceObjectK {
             id,
@@ -393,13 +411,17 @@ pub extern "C" fn io_create_device(
             parent: Spinlock::new(parent_id),
             children: Spinlock::new(Vec::new()),
             stack: Spinlock::new(None),
-            config_sem: KSem::new(1, 1)
+            config_sem: KSem::new(1, 1),
+            pending_irps: Spinlock::new(List::new())
         },
         PoolAllocatorGlobal
     );
 
     let device_ptr = device.device_ptr() as *mut DeviceObject;
-    DEVICE_REGISTRY.lock().insert(id, device);
+    DEVICE_REGISTRY.lock().insert(id, device.clone());
+    if let Some(n) = name {
+        DEVICE_BY_NAME.lock().insert(n.to_string(), device);
+    }
 
     // Attach the new device under its parent (if any) so io can discover it.
     if let Some(pid) = parent_id {
@@ -412,11 +434,30 @@ pub extern "C" fn io_create_device(
     device_ptr
 }
 
-fn resolve_device(ptr: *const DeviceObject) -> Option<DeviceHandleK> {
+pub fn resolve_device(ptr: *const DeviceObject) -> Option<DeviceHandleK> {
     if ptr.is_null() {
         return None;
     }
     get_device(unsafe { (*ptr).id })
+}
+
+pub fn open_device_handle(name: &str) -> Result<DeviceHandleK, KError> {
+    DEVICE_BY_NAME.lock().get(name).cloned().ok_or(KError::InvalidArgument)
+}
+
+// Cancel every non-PNP IRP issued by the current thread to this device.
+pub fn cancel_pending_irp(dev: &DeviceHandleK) {
+    let tid = sched::get_current_task_id().expect("cancel_pending_irp called from idle task!");
+    let snapshot: Vec<IrpPtr> = dev.pending_irps
+    .lock()
+    .iter()
+    .filter(|&p| unsafe { (***p).thread_id == tid && (***p).major_code != IrpMajor::Pnp })
+    .map(|p| **p)
+    .collect();
+
+    for irp in snapshot {
+        cancel_irp(irp);
+    } 
 }
 
 // Tear down a device subtree: remove children first, stop self, dispatch Remove
@@ -431,7 +472,7 @@ pub fn remove_device(dev: &DeviceObjectK) {
     {
         let _g = dev.config_guard();
         dev.stop_self();
-        let _ = io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Remove, None, EMPTY_REGION, 0);
+        let _ = io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Remove, EMPTY_REGION, 0);
     }
 
     if let Some(pid) = dev.parent_id() {
@@ -446,6 +487,9 @@ pub fn remove_device(dev: &DeviceObjectK) {
     }
 
     DEVICE_REGISTRY.lock().remove(&dev.id);
+    if let Some(n) = dev.device.get_name() {
+        DEVICE_BY_NAME.lock().remove(n);
+    }
     info!("remove_device: dropped device {}", dev.id);
 }
 
@@ -472,11 +516,10 @@ pub extern "C" fn io_send_request(
     device: *const DeviceObject,
     major: usize,
     minor: usize,
-    req_params_ptr: *const u8,
     buf_base: usize,
     buf_size: usize,
     offset: usize,
-    completion: Option<extern "C" fn(*mut Irp, *mut c_void)>,
+    completion: Option<extern "C" fn(*const IrpResult, *mut c_void)>,
     completion_ctx: *mut c_void
 ) -> Status {
     let dev = match resolve_device(device) {
@@ -489,16 +532,10 @@ pub extern "C" fn io_send_request(
     };
     let minor = IrpMinor::from_usize(minor).unwrap_or(IrpMinor::None);
     let buffer = MemoryRegion { base_address: buf_base, size: buf_size };
-    let req_params = if req_params_ptr.is_null() {
-        None
-    }
-    else {
-        Some(unsafe { (req_params_ptr as *const ReqInfo).read() })
-    };
 
     let result = match completion {
-        None => io_request_sync(&dev, major, minor, req_params, buffer, offset).map(|irp| irp.status),
-        Some(routine) => io_request_async(&dev, major, minor, req_params, buffer, offset, routine, completion_ctx)
+        None => io_request_sync(&dev, major, minor, buffer, offset).map(|r| r.status),
+        Some(routine) => io_request_async(&dev, major, minor, buffer, offset, routine, completion_ctx)
     };
 
     result.unwrap_or(Status::Failed)
@@ -506,7 +543,7 @@ pub extern "C" fn io_send_request(
 
 #[unsafe(no_mangle)]
 extern "C" fn io_complete_irp(irp: *mut Irp, status: Status) {
-    assert!(status == Status::Success || status == Status::Failed || status == Status::Cancelled);
+    assert!(status == Status::Success || status == Status::Failed || status == Status::Cancelled || status == Status::Unsupported);
     unsafe { (*irp).status = status }
     let completion_routine = unsafe { (*irp).completion_routine };
     let completion_ctx = unsafe { (*irp).completion_ctx };
@@ -519,6 +556,7 @@ extern "C" fn io_start_processing(irp: *mut Irp) -> bool {
     let irp = unsafe { &mut *irp };
     unsafe { acquire_spinlock(&mut irp.cancel_lock); }
     if irp.is_cancelled {
+        info!("Cancelled arm in io_start_processing by thread: {} on irp {:#X}", irp.thread_id, irp as *const Irp as usize);
         let ctx = irp.completion_ctx as *mut AsyncCtx;
         unsafe { release_spinlock(&mut irp.cancel_lock); }
         deallocate_irp(irp, ctx);
@@ -541,6 +579,7 @@ extern "C" fn io_set_cancel_routine(
 ) {
     let irp = unsafe { &mut *irp };
     unsafe { acquire_spinlock(&mut irp.cancel_lock); }
+    info!("Setting cancel routine by thread: {} on irp {:#X}", irp.thread_id, irp as *const Irp as usize);
     
     assert!(!irp.is_cancelled);
     assert!(irp.cancel_routine.is_none());
@@ -549,6 +588,7 @@ extern "C" fn io_set_cancel_routine(
 }
 
 pub fn deallocate_irp(irp: *mut Irp, ctx: *mut AsyncCtx) {
+    info!("Deallocating irp {:#X} by thread: {}", irp.addr(), unsafe{(*irp).thread_id});
     disable_preemption();
     drop(unsafe { Box::from_raw_in(irp, PoolAllocatorGlobal) });
     drop(unsafe { Box::from_raw_in(ctx, PoolAllocatorGlobal) });
@@ -582,32 +622,4 @@ pub fn init() {
     stack::load_root_stacks();
 
     super::pnp::start_worker();
-
-    // Try a read and a recursive stop on the first root device.
-    let root = root_device();
-    let dev_m = root.children_snapshot().first().copied().and_then(get_device);
-    let dev_m = match dev_m {
-        Some(dev) => dev,
-        None => {
-            info!("io::init: no root device was created");
-            return;
-        }
-    };
-
-    info!("io::init: issuing read to '{}'", dev_m.name());
-    let status = dev_m.read(ReadRequest { buffer: EMPTY_REGION, offset: 0 });
-    info!("io::init: read returned {:?}", status.map(|s| s as isize));
-
-    // Exercise re-enumeration: the bus reshuffles its PDOs; io reconciles
-    // (one child subtree removed, one added & detected).
-    info!("io::init: invalidating '{}' to re-enumerate", dev_m.name());
-    io_invalidate_device(dev_m.device_ptr());
-
-    // Retry any stacks that failed to load (no-op on the happy path).
-    info!("io::init: Trying refresh");
-    super::pnp::refresh_device_tree();
-
-    info!("io::init: stopping device tree rooted at '{}'", dev_m.name());
-    super::pnp::stop_device(dev_m.id());
-    info!("io::init: stop complete");
 }

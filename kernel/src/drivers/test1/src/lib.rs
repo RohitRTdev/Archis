@@ -1,13 +1,12 @@
 #![cfg_attr(not(test), no_std)]
 #![feature(allocator_api)]
 
-use core::alloc::{Allocator, Layout};
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use kernel_intf::{exported_function, info, io_complete_irp};
+use kernel_intf::{exported_function, info, io_complete_irp, io_set_cancel_routine, io_start_processing};
 use kernel_intf::driver::{
-    DeviceObject, DriverObject, Irp, IrpMinor, ReqInfo, Status, create_device, create_device_by_id
+    DeviceObject, DriverObject, Irp, IrpMinor, Status, create_device, create_device_by_id
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
 use common::MemoryRegion;
@@ -78,7 +77,9 @@ fn dispatch_pnp(device: &DeviceObject, request: &mut Irp) -> Status {
         IrpMinor::Remove => {
             dispatch_remove(device, request)
         },
-        IrpMinor::None => Status::Unsupported
+        IrpMinor::None => {
+            Status::Unsupported
+        }
     }
 }
 
@@ -104,21 +105,22 @@ fn enumerate(device: &DeviceObject, request: &mut Irp) -> Status {
     // Later generations report the same set
 
     let count = state.pdo_count;
-    let layout = Layout::array::<*const DeviceObject>(count).unwrap();
-    let array = match PoolAllocatorGlobal.allocate(layout) {
-        Ok(array) => unsafe { 
-            let ptr = array.cast::<*const DeviceObject>().as_ptr();
-            core::slice::from_raw_parts_mut(ptr, count)
-        },
-        Err(_) => return Status::Failed
-    };
+    let entry_size = core::mem::size_of::<*const DeviceObject>();
+    let needed = count * entry_size;
 
-    for i in 0..count {
-        array[i] = state.pdos[i];
+    if request.buffer.base_address == 0 || request.buffer.size < needed {
+        info!("test1 enumerate: buffer too small ({} < {})", request.buffer.size, needed);
+        request.complete_irp(Status::Failed);
+        return Status::Failed;
     }
 
+    let dst = request.buffer.base_address as *mut *const DeviceObject;
+    for i in 0..count {
+        unsafe { dst.add(i).write(state.pdos[i]); }
+    }
+    request.bytes_completed = needed;
+
     info!("test1 enumerate: reporting {} PDO(s)", count);
-    request.req_params = Some(ReqInfo{enumerate: array});
     request.complete_irp(Status::Success);
     Status::Success
 }
@@ -151,16 +153,38 @@ fn dispatch_remove(device: &DeviceObject, request: &mut Irp) -> Status {
 #[kmod::dispatch_handler]
 fn dispatch_read(_device: &DeviceObject, request: &mut Irp) -> Status {
     info!("test1 read (async pending)");
-    PENDING_IRP.store(request as *mut Irp, Ordering::Release);
+    let irp_ptr = request as *mut Irp;
+    // Register cancellation before storing pending_irp / spawning the worker
+    // so the cancellation window covers the entire pending lifetime.
+    unsafe { io_set_cancel_routine(irp_ptr, test1_cancel); }
+    PENDING_IRP.store(irp_ptr, Ordering::Release);
     unsafe { kernel_intf::create_kernel_thread(read_worker) };
     Status::Pending
 }
 
+extern "C" fn test1_cancel(_dev: *const DeviceObject, irp: *mut Irp) {
+    info!("test1 cancel: aborting pending read IRP");
+    unsafe { io_complete_irp(irp, Status::Cancelled); }
+}
+
 fn read_worker() -> ! {
-    info!("test1 read worker: completing pending IRP");
+    // Sleep long enough that cancellation tests have time to fire before
+    // the worker would otherwise complete the IRP normally.
+    unsafe { kernel_intf::delay_ms_ffi(1500); }
+
     let irp = PENDING_IRP.swap(core::ptr::null_mut(), Ordering::AcqRel);
     if !irp.is_null() {
-        unsafe { io_complete_irp(irp, Status::Success) };
+        // io_start_processing tells us atomically whether the IRP is still
+        // alive (returns true and clears cancel_routine) or has been
+        // cancelled out from under us (returns false; the irp has already
+        // been deallocated by the cancellation path).
+        if unsafe { io_start_processing(irp) } {
+            info!("test1 read worker: completing pending IRP");
+            unsafe { io_complete_irp(irp, Status::Success); }
+        }
+        else {
+            info!("test1 read worker: IRP was cancelled before processing");
+        }
     }
     unsafe { kernel_intf::exit_kernel_thread() }
 }

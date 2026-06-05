@@ -60,25 +60,9 @@ pub enum Status {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ResourceList {
-    irq: usize,
-    ports: &'static [usize]
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub union ReqInfo {
-    pub start: ResourceList,
-    pub enumerate: &'static [*const DeviceObject]
-}
-
-#[derive(Clone)]
-#[repr(C)]
 pub struct Irp {
     pub major_code: IrpMajor,
     pub minor_code: IrpMinor,
-    pub req_params: Option<ReqInfo>,
     pub buffer: MemoryRegion,
     pub offset: usize,
     pub status: Status,
@@ -86,12 +70,36 @@ pub struct Irp {
     pub completion_routine: extern "C" fn(*mut Irp, *mut c_void),
     pub completion_ctx: *mut c_void,
     pub device: *const DeviceObject,
-    
+
     // Kernel accounting; drivers do not read these.
     pub is_cancelled: bool,
     pub cancel_routine: Option<extern "C" fn(*const DeviceObject, *mut Irp)>,
     pub cancel_lock: Lock,
     pub thread_id: usize
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct IrpResult {
+    pub major_code: IrpMajor,
+    pub minor_code: IrpMinor,
+    pub buffer: MemoryRegion,
+    pub offset: usize,
+    pub status: Status,
+    pub bytes_completed: usize,
+}
+
+impl Default for IrpResult {
+    fn default() -> Self {
+        Self {
+            major_code: IrpMajor::Read,
+            minor_code: IrpMinor::None,
+            buffer: EMPTY_REGION,
+            offset: 0,
+            status: Status::Pending,
+            bytes_completed: 0,
+        }
+    }
 }
 
 impl Irp {
@@ -100,44 +108,42 @@ impl Irp {
         buffer: MemoryRegion,
         offset: usize,
         completion_routine: extern "C" fn(*mut Irp, *mut c_void),
-        completion_ctx: *mut c_void
+        completion_ctx: *mut c_void,
+        device: *const DeviceObject,
+        thread_id: usize
     ) -> Self {
         let mut cancel_lock = Lock { lock: 0, int_status: false };
         unsafe { super::create_spinlock(&mut cancel_lock); }
         Self {
             major_code,
             minor_code: IrpMinor::None,
-            req_params: None,
             buffer,
             offset,
             status: Status::Pending,
             bytes_completed: 0,
             completion_routine,
             completion_ctx,
-            device: core::ptr::null(),
+            device,
             is_cancelled: false,
             cancel_routine: None,
             cancel_lock,
-            thread_id: 0
+            thread_id
+        }
+    }
+
+    pub fn to_result(&self) -> IrpResult {
+        IrpResult {
+            major_code: self.major_code,
+            minor_code: self.minor_code,
+            buffer: self.buffer,
+            offset: self.offset,
+            status: self.status,
+            bytes_completed: self.bytes_completed,
         }
     }
 
     pub fn complete_irp(&mut self, status: Status) {
         unsafe { io_complete_irp(self as *mut Irp, status); }
-    }
-}
-
-extern "C" fn _default_comp_routine(_: *mut Irp, _: *mut c_void) {}
-
-impl Default for Irp {
-    fn default() -> Self {
-        Irp::new(
-            IrpMajor::Read, 
-            EMPTY_REGION, 
-            0, 
-            _default_comp_routine, 
-            core::ptr::null_mut()
-        )    
     }
 }
 

@@ -72,3 +72,8 @@ pub fn delay_ms(value: usize) {
     // Let's not panic if wait fails (Since this could happen if process/thread is getting killed)
     let _ = timer.wait();
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn delay_ms_ffi(value: usize) {
+    delay_ms(value);
+}

@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::collections::BTreeMap;
 use common::{MemoryRegion, PAGE_SIZE};
@@ -14,11 +15,12 @@ use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores,
 use crate::hal::{self, IPIRequestType, create_kernel_context, disable_scheduler_timer, enable_scheduler_timer, fetch_context, get_per_cpu_base, get_per_cpu_data, get_per_cpu_kernel_base, set_per_cpu_base, set_per_cpu_data, switch_context};
 use crate::mem::{VCB, get_kernel_addr_space, set_address_space};
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
+use crate::io;
 use crate::io::{IrpPtr, deallocate_irp};
 use crate::sync::{KSem, KSemInnerType, Spinlock};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::list::{List, ListNode, DynList};
-use kernel_intf::driver::{Irp, IrpMajor, IrpMinor, ReqInfo, Status};
+use kernel_intf::driver::{DeviceObject, Irp, IrpMajor, IrpMinor, IrpResult, Status};
 use kernel_intf::{acquire_spinlock, release_spinlock};
 use kernel_intf::{KError, debug, info};
 use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_process_info, KTimerInnerType};
@@ -166,8 +168,8 @@ impl Drop for Task {
 unsafe impl Send for Task {}
 
 enum CompletionCtxType {
-    Async((extern "C" fn(*mut Irp, *mut c_void), *mut c_void)),
-    Sync((KEvent, IrpPtr))
+    Async((extern "C" fn(*const IrpResult, *mut c_void), *mut c_void)),
+    Sync((KEvent, *mut IrpResult))
 }
 
 pub struct AsyncCtx {
@@ -595,24 +597,33 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
 
 extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
     disable_preemption();
-    let status = unsafe { (*irp).status };  
-    info!("io_complete: status_code {}", status as usize);
+    let status = unsafe { (*irp).status };
+    info!("io_complete: status_code {} on irp {} by thread {}", status as isize, irp.addr(), unsafe{(*irp).thread_id});
     let ctx_ptr = ctx as *mut AsyncCtx;
     let ctx = unsafe { &mut *ctx_ptr };
-    
+
     // If task is not killed and irp exists within the task irp list, remove it
     if let Some(dispatch_thread) = get_task_info(unsafe { (*irp).thread_id }) {
         dispatch_thread.lock().find_and_remove_irp(irp);
     }
-    
-    // Run the completion routines
+
+    // Remove the IRP from the device's pending list too
+    let dev_ptr = unsafe { (*irp).device };
+    if !dev_ptr.is_null() {
+        if let Some(dev) = io::resolve_device(dev_ptr) {
+            dev.pending_irps.lock().find_and_remove(|&p| p == irp);
+        }
+    }
+
+    // Run the completion routines.
     match &mut ctx.comp_type {
         CompletionCtxType::Sync((event, result_ptr)) => {
-            unsafe { result_ptr.write((*irp).clone()) }
+            unsafe { result_ptr.write((*irp).to_result()); }
             event.signal();
         },
         CompletionCtxType::Async((user_routine, user_ctx)) => {
-            user_routine(irp, *user_ctx);
+            let result = unsafe { (*irp).to_result() };
+            user_routine(&result as *const IrpResult, *user_ctx);
         }
     }
 
@@ -629,22 +640,23 @@ extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
 }
 
 pub fn allocate_irp(
-    major: IrpMajor, 
+    major: IrpMajor,
     minor: IrpMinor,
-    req_params: Option<ReqInfo>,
     buffer: MemoryRegion,
     offset: usize,
+    device: *const DeviceObject,
     complete_event: Option<KEvent>,
-    completion_result_ptr: IrpPtr,
-    user_completion_routine: Option<extern "C" fn(*mut Irp, *mut c_void)>,
+    completion_result_ptr: *mut IrpResult,
+    user_completion_routine: Option<extern "C" fn(*const IrpResult, *mut c_void)>,
     user_completion_ctx: *mut c_void
 ) -> IrpPtr {
     disable_preemption();
-    
+    let cur_thread = get_current_task().expect("Called allocate_irp() from idle task!");
+
     // Create the context and irp
     let actx = Box::into_raw_with_allocator(Box::new_in(
         if complete_event.is_some() {
-            AsyncCtx { 
+            AsyncCtx {
                 irp: core::ptr::null_mut(),
                 comp_type: CompletionCtxType::Sync((
                     complete_event.unwrap(),
@@ -665,35 +677,46 @@ pub fn allocate_irp(
     )).0;
 
     let mut irp_box = Box::new_in(
-        Irp::new(major, buffer, offset, io_complete, actx as *mut c_void),
+        Irp::new(major, buffer, offset, io_complete, actx as *mut c_void, device, cur_thread.lock().get_id()),
         PoolAllocatorGlobal
     );
     irp_box.minor_code = minor;
-    irp_box.req_params = req_params;
     let irp_raw = Box::into_raw_with_allocator(irp_box).0;
     unsafe { (*actx).irp = irp_raw; }
+
+    if !device.is_null() {
+        if let Some(dev) = io::resolve_device(device) {
+            dev.pending_irps.lock().add_node(irp_raw)
+                .expect("Failed to register IRP with device pending list");
+        }
+    }
+
+    cur_thread.lock().register_irp(irp_raw);
     enable_preemption();
-    
+
     irp_raw
 }
-        
+ 
+pub fn cancel_irp(irp_ptr: IrpPtr) {
+    let irp = unsafe { &mut *irp_ptr };
+    unsafe { acquire_spinlock(&mut irp.cancel_lock); }
+
+    // Either another path cancelled this explicitly, or the driver did
+    // not (a) get a chance yet to register the cancel routine, or
+    // (b) decided that cancellation was not required for this request.
+    if irp.cancel_routine.is_none() || irp.is_cancelled {
+        unsafe { release_spinlock(&mut irp.cancel_lock); }
+        return;
+    }
+
+    (irp.cancel_routine.unwrap())(irp.device, irp_ptr);
+    unsafe { release_spinlock(&mut irp.cancel_lock); }
+}
+
 fn kill_sweep_irps(task: &KThread) {
-    let mut irp_list = task.lock().take_irp_list();
-
-    for cancel_irp_node in irp_list.iter_mut() {
-        let cancel_irp = unsafe { &mut ***cancel_irp_node };
-        unsafe { acquire_spinlock(&mut cancel_irp.cancel_lock); }
-        
-        // Either another process cancelled this explicitly or driver did not
-        // a) get chance yet to register the cancel routine or
-        // b) decided that cancellation was not required for this request
-        if cancel_irp.cancel_routine.is_none() || cancel_irp.is_cancelled {
-            unsafe { release_spinlock(&mut cancel_irp.cancel_lock); }
-            continue;
-        }
-
-        (cancel_irp.cancel_routine.unwrap())(cancel_irp.device, cancel_irp as IrpPtr);
-        unsafe { release_spinlock(&mut cancel_irp.cancel_lock); }
+    let irp_list = task.lock().take_irp_list();
+    for irp in irp_list.iter() {
+        cancel_irp(**irp);
     }
 }
 

@@ -89,7 +89,6 @@ impl fmt::Display for RtcTime {
     }
 }
 
-#[derive(Clone)]
 #[repr(C)]
 pub struct Lock {
     pub lock: u64,
@@ -127,11 +126,10 @@ unsafe extern "C" {
         device: *const driver::DeviceObject,
         major: usize,
         minor: usize,
-        req_params_ptr: *const u8, 
         buf_base: usize,
         buf_size: usize,
         offset: usize,
-        completion: Option<extern "C" fn(*mut driver::Irp, *mut core::ffi::c_void)>,
+        completion: Option<extern "C" fn(*const driver::IrpResult, *mut core::ffi::c_void)>,
         completion_ctx: *mut core::ffi::c_void
     ) -> driver::Status;
     
@@ -147,5 +145,6 @@ unsafe extern "C" {
     #[allow(improper_ctypes)]
     pub fn create_kernel_thread(handler: fn() -> !) -> KError;
     pub fn exit_kernel_thread() -> !;
+    pub fn delay_ms_ffi(value: usize);
 }
 

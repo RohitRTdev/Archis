@@ -5,8 +5,13 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use common::StrRef;
+use common::{MemoryRegion, StrRef};
 use kernel_intf::driver::{DeviceObject, EMPTY_REGION, IrpMajor, IrpMinor, Status};
+
+// Max devices a bus can report from a single Enumerate IRP. The caller
+// pre-allocates a buffer this big; the driver writes pointers and sets
+// bytes_completed. Bumped here if buses grow chattier.
+const MAX_ENUMERATE_DEVICES: usize = 16;
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::info;
 
@@ -331,6 +336,21 @@ fn continue_stack(stack: &Arc<DeviceStack>, from_level: usize) {
     info!("stack '{}' fully loaded", stack.match_id());
 }
 
+// Parse the bus-written enumerate buffer back into a slice of device pointers.
+// Layout: a tightly-packed array of *const DeviceObject starting at
+// buf.base_address, with bytes_completed set to count * size_of by the driver.
+fn parse_enumerate_buffer(buf: MemoryRegion, bytes_completed: usize)
+-> &'static [*const DeviceObject] {
+    let entry_size = core::mem::size_of::<*const DeviceObject>();
+    if bytes_completed == 0 || buf.base_address == 0 || entry_size == 0 {
+        return &[];
+    }
+    let count = bytes_completed / entry_size;
+    unsafe {
+        core::slice::from_raw_parts(buf.base_address as *const *const DeviceObject, count)
+    }
+}
+
 // Enumerate a started FDO and reconcile its children against the bus-reported
 // current set. Newly appeared PDOs are attached + detected (each spawns its own
 // stack instance), disappeared ones torn down, unchanged ones left alone.
@@ -338,35 +358,45 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
     let _g = fdo.config_guard();
 
     let old = fdo.children_snapshot();
-    let irp = match io_request_sync(&fdo, IrpMajor::Pnp, IrpMinor::Enumerate, None, EMPTY_REGION, 0) {
+
+    // Allocate the buffer required for driver to fill in the new device list
+    let entry_size = core::mem::size_of::<*const DeviceObject>();
+    let buf_size = MAX_ENUMERATE_DEVICES * entry_size;
+    let layout = Layout::from_size_align(buf_size, entry_size).unwrap();
+    let buf_ptr = match PoolAllocatorGlobal.allocate(layout) {
+        Ok(p) => p.cast::<u8>(),
+        Err(_) => {
+            info!("enumerate on '{}': failed to allocate result buffer", fdo.name());
+            return;
+        }
+    };
+    let buffer = MemoryRegion { base_address: buf_ptr.as_ptr() as usize, size: buf_size };
+
+    let irp = match io_request_sync(&fdo, IrpMajor::Pnp, IrpMinor::Enumerate, buffer, 0) {
         Ok(irp) => irp,
         Err(e) => {
             info!("enumerate on '{}' failed: {}", fdo.name(), e);
+            unsafe { PoolAllocatorGlobal.deallocate(buf_ptr, layout); }
             return;
         }
     };
 
     if irp.status == Status::Unsupported {
         // Not a bus — nothing to enumerate.
+        unsafe { PoolAllocatorGlobal.deallocate(buf_ptr, layout); }
         return;
     }
     if irp.status != Status::Success {
         info!("enumerate on '{}' returned status {}", fdo.name(), irp.status as isize);
+        unsafe { PoolAllocatorGlobal.deallocate(buf_ptr, layout); }
         return;
     }
 
-    let mut new_ids: Vec<usize> = Vec::new();
-    if let Some(req) = irp.req_params {
-        let array = unsafe { req.enumerate };
-        array.iter().for_each(|&dev| {
-            new_ids.push(unsafe{ (*dev).id });
-        });
-
-        // Free the driver-allocated array using the matching pool layout.
-        let nn = NonNull::new(array.as_ptr() as *mut u8).unwrap();  
-        let layout = Layout::array::<*mut DeviceObject>(array.len()).unwrap();
-        unsafe { PoolAllocatorGlobal.deallocate(nn, layout); }
-    }
+    let new_ids: Vec<usize> = parse_enumerate_buffer(irp.buffer, irp.bytes_completed)
+        .iter()
+        .map(|&dev| unsafe { (*dev).id })
+        .collect();
+    unsafe { PoolAllocatorGlobal.deallocate(buf_ptr, layout); }
 
     let added: Vec<usize> = new_ids.iter().copied().filter(|id| !old.contains(id)).collect();
     let removed: Vec<usize> = old.iter().copied().filter(|id| !new_ids.contains(id)).collect();
@@ -410,7 +440,7 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
 fn query_id(dev: &DeviceHandleK) -> Option<String> {
     let irp = {
         let _g = dev.config_guard();
-        io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Query, None, EMPTY_REGION, 0).ok()?
+        io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Query, EMPTY_REGION, 0).ok()?
     };
     if irp.status != Status::Success {
         return None;

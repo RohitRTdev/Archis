@@ -38,6 +38,7 @@ use cpu::install_interrupt_handler;
 use hal::read_port_u8;
 use mem::Regions::*;
 use mem::FixedList;
+use kernel_intf::driver::{IrpMajor, IrpMinor, IrpResult, create_device_by_id};
 use kernel_intf::list::{List, DynList};
 use sched::KThread;
 use sync::KSem;
@@ -167,9 +168,111 @@ extern "C" fn thread_creator() -> ! {
     }
 }
 
-fn kern_main() -> ! {
-    info!("Starting main kernel init");
-    
+// === IRP cancellation tests ===
+//   (a) task-kill cancellation — kill_thread → kill_sweep_irps walks the
+//       dying thread's IRP list and invokes the driver's cancel routine.
+//   (b) per-handle cancellation — issuing thread itself calls
+//       cancel_pending_irp on the device handle. Same cancel chain, just
+//       not driven by task death.
+//   (c) duplicate device name guard — io_create_device must return null
+//       when the name is already in DEVICE_BY_NAME.
+
+extern "C" fn cancel_test_completion(result: *const IrpResult, _ctx: *mut core::ffi::c_void) {
+    let status = unsafe { (*result).status };
+    info!("cancel_test_completion: IRP delivered with status {}", status as isize);
+}
+
+fn task_kill_cancel_runner() -> ! {
+    let handle = match io::open_device_handle("test1") {
+        Ok(h) => h,
+        Err(_) => {
+            info!("task_kill_cancel_runner: test1 device not found");
+            sched::exit_thread();
+        }
+    };
+
+    info!("task_kill_cancel_runner: issuing sync read");
+    let _ = handle.read(io::ReadRequest {
+        buffer: MemoryRegion { base_address: 0, size: 0 },
+        offset: 0,
+    });
+
+    // If kill_thread fired during the wait, kill_sweep_irps cancelled the
+    // IRP, the driver's cancel routine completed it, and the event was
+    // signalled with status=Cancelled. The thread won't make it here in
+    // practice (it's already TERMINATED).
+    info!("task_kill_cancel_runner: read returned (post-cancel)");
+    loop { sched::delay_ms(1000); }
+}
+
+fn self_cancel_runner() -> ! {
+    let handle = match io::open_device_handle("test1") {
+        Ok(h) => h,
+        Err(_) => {
+            info!("self_cancel_runner: test1 device not found");
+            sched::exit_thread();
+        }
+    };
+
+    info!("self_cancel_runner: dispatching async read");
+    let _ = io::io_request_async(
+        &handle,
+        IrpMajor::Read,
+        IrpMinor::None,
+        MemoryRegion { base_address: 0, size: 0 },
+        0,
+        cancel_test_completion,
+        core::ptr::null_mut(),
+    );
+
+    // Give the driver a moment to register its cancel routine and start
+    // waiting in the worker, then cancel.
+    sched::delay_ms(200);
+    info!("self_cancel_runner: calling cancel_pending_irp");
+    io::cancel_pending_irp(&handle);
+
+    // Let cancellation settle (driver worker wakes after 1500ms in test1).
+    sched::delay_ms(2000);
+    info!(
+        "self_cancel_runner: pending_irps on test1 = {}",
+        handle.pending_irps.lock().get_nodes()
+    );
+    sched::exit_thread();
+}
+
+fn run_cancel_tests() {
+    // (a) task-kill cancellation
+    let killer_target = sched::create_thread(task_kill_cancel_runner)
+        .expect("Failed to spawn task_kill_cancel_runner");
+    sched::delay_ms(300);
+    let tid = killer_target.lock().get_id();
+    info!("cancel test (a): killing thread {}", tid);
+    sched::kill_thread(tid);
+    // Wait long enough that the driver worker hits io_start_processing and
+    // exits cleanly (1500ms sleep in test1::read_worker + slack).
+    sched::delay_ms(2500);
+
+    // (b) per-handle self-cancellation
+    let _ = sched::create_thread(self_cancel_runner)
+        .expect("Failed to spawn self_cancel_runner");
+    sched::delay_ms(3000);
+
+    // (c) duplicate device name guard. test1 was named "test1" at add time.
+    let probe = match io::open_device_handle("test1") {
+        Ok(h) => h,
+        Err(_) => {
+            info!("cancel test (c): SKIP — test1 device missing");
+            return;
+        }
+    };
+    let driver_id = unsafe { (*probe.device_ptr()).get_driver_id() };
+    let dup = create_device_by_id(driver_id, Some("test1"), core::ptr::null_mut(), None);
+    info!("cancel test (c): duplicate create returned {:#X}", dup.addr());
+    assert!(dup.is_null(), "duplicate device name 'test1' must be rejected");
+    info!("cancel test (c): PASSED");
+}
+
+fn interative_thread_spawn_tests() {
     KEYBOARD_EVENT.call_once(|| {
         KEvent::new(true)
     });
@@ -177,59 +280,62 @@ fn kern_main() -> ! {
     // Sample invocation to test out interrupt subsystem
     clear_keyboard_output_buffer();
     install_interrupt_handler(1, key_notifier, true, true);
+    
+    sched::create_thread(watchdog).unwrap();
+    let spawn_proc = sched::create_process(process_spawn, false).expect("Failed to create second process");
+    info!("Main task waiting for process id 1 to complete");
+    spawn_proc.wait().expect("Unable to wait on process id 1");
+    
+    let spawn_task = sched::create_thread(task_spawn).unwrap();
+
+    info!("Main task waiting for task id 1 to complete");
+    spawn_task.wait().expect("Unable to wait on task id 1");
+}
+
+fn spam_threads_test() {
+    let user_proc0 = sched::create_process(|| -> ! {loop{}}, true)
+    .expect("Failed to create user process 0");
+    
+    sched::create_thread(thread_creator).expect("Failed to create kernel thread!");
+}
+
+fn producer_consumer_test() {
+    sched::create_thread(|| {
+        loop {
+            {
+                let mut queue = QUEUE.lock();
+                queue.add_node([0; 64]).expect("Failed to add node from producer!");
+                let addr = queue.last().unwrap().as_ptr().addr();
+                debug!("Added new node at address {:#X}", addr);
+            }
+            sched::delay_ms(1000);
+        }
+    }).expect("Failed to create producer thread!");
+
+    sched::create_process(|| {
+       loop {
+            {
+                let mut queue = QUEUE.lock();
+                let node = queue.first();
+                if node.is_some() {
+                    let node = node.unwrap();
+                    debug!("[Consumer]: Found node at address: {:#X}", node.as_ptr().addr());
+                }
+                queue.pop_node();
+            }
+            sched::delay_ms(1000);
+       } 
+    }, false).expect("Failed to create consumer process!");
+}
+
+fn kern_main() -> ! {
+    info!("Starting main kernel init");
 
     sched::init();
     loader::init();
     io::init();
 
-    // Some tests just to test out process and thread subsystem
-    //{
-    //    let spawn_proc = sched::create_process(process_spawn, false).expect("Failed to create second process");
-    //    info!("Main task waiting for process id 1 to complete");
-    //    spawn_proc.wait().expect("Unable to wait on process id 1");
-    //    
-    //    let spawn_task = sched::create_thread(task_spawn).unwrap();
-
-    //    info!("Main task waiting for task id 1 to complete");
-    //    spawn_task.wait().expect("Unable to wait on task id 1");
-    //}
-
-    //{
-    //    let user_proc0 = sched::create_process(|| -> ! {loop{}}, true)
-    //    .expect("Failed to create user process 0");
-    //    
-    //    sched::create_thread(watchdog).unwrap();
-    //}
-
-    //sched::create_thread(thread_creator).expect("Failed to create kernel thread!");
-
-    //sched::create_thread(|| {
-    //    loop {
-    //        {
-    //            let mut queue = QUEUE.lock();
-    //            queue.add_node([0; 64]).expect("Failed to add node from producer!");
-    //            let addr = queue.last().unwrap().as_ptr().addr();
-    //            debug!("Added new node at address {:#X}", addr);
-    //        }
-    //        sched::delay_ms(1000);
-    //    }
-    //}).expect("Failed to create producer thread!");
-
-    //sched::create_process(|| {
-    //   loop {
-    //        {
-    //            let mut queue = QUEUE.lock();
-    //            let node = queue.first();
-    //            if node.is_some() {
-    //                let node = node.unwrap();
-    //                debug!("[Consumer]: Found node at address: {:#X}", node.as_ptr().addr());
-    //            }
-    //            queue.pop_node();
-    //        }
-    //        sched::delay_ms(1000);
-    //   } 
-    //}, false).expect("Failed to create consumer process!");
-
+    run_cancel_tests();
 
     loop {
         sched::delay_ms(1000);
