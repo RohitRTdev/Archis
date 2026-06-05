@@ -1,18 +1,16 @@
 use core::ffi::c_void;
-
 use common::MemoryRegion;
+use crate::io_complete_irp;
+use super::{Lock, StrRef};
 
-use super::StrRef;
+pub const EMPTY_REGION: MemoryRegion = MemoryRegion { base_address: 0, size: 0 };
 
 #[repr(usize)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IrpMajor {
     Read = 0,
     Write = 1,
-    Start = 2,
-    Stop = 3,
-    Configure = 4,
-    Remove = 5
+    Pnp = 2
 }
 
 impl IrpMajor {
@@ -20,10 +18,7 @@ impl IrpMajor {
         match v {
             0 => Some(Self::Read),
             1 => Some(Self::Write),
-            2 => Some(Self::Start),
-            3 => Some(Self::Stop),
-            4 => Some(Self::Configure),
-            5 => Some(Self::Remove),
+            2 => Some(Self::Pnp),
             _ => None
         }
     }
@@ -34,7 +29,10 @@ impl IrpMajor {
 pub enum IrpMinor {
     None = 0,
     Enumerate = 1,
-    Query = 2
+    Query = 2,
+    Start = 3,
+    Stop = 4,
+    Remove = 5
 }
 
 impl IrpMinor {
@@ -43,6 +41,9 @@ impl IrpMinor {
             0 => Some(Self::None),
             1 => Some(Self::Enumerate),
             2 => Some(Self::Query),
+            3 => Some(Self::Start),
+            4 => Some(Self::Stop),
+            5 => Some(Self::Remove),
             _ => None
         }
     }
@@ -54,7 +55,8 @@ pub enum Status {
     Success = 0,
     Pending = 1,
     Failed = -1,
-    Unsupported = -2
+    Unsupported = -2,
+    Cancelled = -3
 }
 
 #[repr(C)]
@@ -64,12 +66,14 @@ pub struct ResourceList {
     ports: &'static [usize]
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub union ReqInfo {
     pub start: ResourceList,
     pub enumerate: &'static [*const DeviceObject]
 }
 
+#[derive(Clone)]
 #[repr(C)]
 pub struct Irp {
     pub major_code: IrpMajor,
@@ -79,8 +83,15 @@ pub struct Irp {
     pub offset: usize,
     pub status: Status,
     pub bytes_completed: usize,
-    pub completion_routine: Option<extern "C" fn(*mut Irp, *mut c_void)>,
-    pub completion_ctx: *mut c_void
+    pub completion_routine: extern "C" fn(*mut Irp, *mut c_void),
+    pub completion_ctx: *mut c_void,
+    pub device: *const DeviceObject,
+    
+    // Kernel accounting; drivers do not read these.
+    pub is_cancelled: bool,
+    pub cancel_routine: Option<extern "C" fn(*const DeviceObject, *mut Irp)>,
+    pub cancel_lock: Lock,
+    pub thread_id: usize
 }
 
 impl Irp {
@@ -88,28 +99,45 @@ impl Irp {
         major_code: IrpMajor,
         buffer: MemoryRegion,
         offset: usize,
-        completion_routine: Option<extern "C" fn(*mut Irp, *mut c_void)>,
+        completion_routine: extern "C" fn(*mut Irp, *mut c_void),
         completion_ctx: *mut c_void
     ) -> Self {
+        let mut cancel_lock = Lock { lock: 0, int_status: false };
+        unsafe { super::create_spinlock(&mut cancel_lock); }
         Self {
             major_code,
             minor_code: IrpMinor::None,
-            req_params: None, 
+            req_params: None,
             buffer,
             offset,
             status: Status::Pending,
             bytes_completed: 0,
             completion_routine,
-            completion_ctx
+            completion_ctx,
+            device: core::ptr::null(),
+            is_cancelled: false,
+            cancel_routine: None,
+            cancel_lock,
+            thread_id: 0
         }
     }
 
     pub fn complete_irp(&mut self, status: Status) {
-        if let Some(routine) = self.completion_routine {
-            assert!(status == Status::Success || status == Status::Failed);
-            self.status = status;
-            routine(self as *mut _, self.completion_ctx);
-        }
+        unsafe { io_complete_irp(self as *mut Irp, status); }
+    }
+}
+
+extern "C" fn _default_comp_routine(_: *mut Irp, _: *mut c_void) {}
+
+impl Default for Irp {
+    fn default() -> Self {
+        Irp::new(
+            IrpMajor::Read, 
+            EMPTY_REGION, 
+            0, 
+            _default_comp_routine, 
+            core::ptr::null_mut()
+        )    
     }
 }
 
@@ -121,10 +149,7 @@ pub struct DispatchTable {
     pub dispatch_add: Option<AddDispatch>,
     pub dispatch_read: Option<DeviceDispatch>,
     pub dispatch_write: Option<DeviceDispatch>,
-    pub dispatch_start: Option<DeviceDispatch>,
-    pub dispatch_stop: Option<DeviceDispatch>,
-    pub dispatch_configure: Option<DeviceDispatch>,
-    pub dispatch_remove: Option<DeviceDispatch>
+    pub dispatch_pnp: Option<DeviceDispatch>
 }
 
 impl DispatchTable {
@@ -133,10 +158,7 @@ impl DispatchTable {
             dispatch_add: None,
             dispatch_read: None,
             dispatch_write: None,
-            dispatch_start: None,
-            dispatch_stop: None,
-            dispatch_configure: None,
-            dispatch_remove: None
+            dispatch_pnp: None
         }
     }
 
@@ -159,20 +181,8 @@ impl DispatchTable {
         Self::invoke_device(self.dispatch_write, device, irp)
     }
 
-    pub fn invoke_start(&self, device: *const DeviceObject, irp: *mut Irp) -> Status {
-        Self::invoke_device(self.dispatch_start, device, irp)
-    }
-
-    pub fn invoke_stop(&self, device: *const DeviceObject, irp: *mut Irp) -> Status {
-        Self::invoke_device(self.dispatch_stop, device, irp)
-    }
-
-    pub fn invoke_configure(&self, device: *const DeviceObject, irp: *mut Irp) -> Status {
-        Self::invoke_device(self.dispatch_configure, device, irp)
-    }
-
-    pub fn invoke_remove(&self, device: *const DeviceObject, irp: *mut Irp) -> Status {
-        Self::invoke_device(self.dispatch_remove, device, irp)
+    pub fn invoke_pnp(&self, device: *const DeviceObject, irp: *mut Irp) -> Status {
+        Self::invoke_device(self.dispatch_pnp, device, irp)
     }
 
     pub fn invoke_add(&self, driver: *const DriverObject, pdo: *const DeviceObject) -> Status {

@@ -5,8 +5,8 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use common::{MemoryRegion, StrRef};
-use kernel_intf::driver::{DeviceObject, IrpMajor, IrpMinor, Status};
+use common::StrRef;
+use kernel_intf::driver::{DeviceObject, EMPTY_REGION, IrpMajor, IrpMinor, Status};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::info;
 
@@ -21,7 +21,6 @@ use super::driver::{
 const BOOT_CONF_PATH: &str = "/sys/drivers/boot.conf";
 const ROOT_ID: &str = "Root";
 const BASE_LEVEL: usize = usize::MAX;
-const EMPTY_REGION: MemoryRegion = MemoryRegion { base_address: 0, size: 0 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LevelState {
@@ -250,10 +249,6 @@ fn parent_for_level(stack: &Arc<DeviceStack>, level: usize) -> Option<DeviceHand
     }
 }
 
-// Bring a single stack instance up from from_level. The parent of from_level is the
-// base PDO (level 0) or the device recorded one level below. Each level: load the
-// driver, add_device on the parent (serialized on the parent's config semaphore),
-// expect exactly one FDO, record + start it, then enumerate it (it may be a bus).
 fn continue_stack(stack: &Arc<DeviceStack>, from_level: usize) {
     let names_len = stack.driver_names().len();
 
@@ -343,7 +338,7 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
     let _g = fdo.config_guard();
 
     let old = fdo.children_snapshot();
-    let irp = match io_request_sync(&fdo, IrpMajor::Configure, IrpMinor::Enumerate, None, EMPTY_REGION, 0) {
+    let irp = match io_request_sync(&fdo, IrpMajor::Pnp, IrpMinor::Enumerate, None, EMPTY_REGION, 0) {
         Ok(irp) => irp,
         Err(e) => {
             info!("enumerate on '{}' failed: {}", fdo.name(), e);
@@ -415,7 +410,7 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
 fn query_id(dev: &DeviceHandleK) -> Option<String> {
     let irp = {
         let _g = dev.config_guard();
-        io_request_sync(dev, IrpMajor::Configure, IrpMinor::Query, None, EMPTY_REGION, 0).ok()?
+        io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Query, None, EMPTY_REGION, 0).ok()?
     };
     if irp.status != Status::Success {
         return None;
@@ -428,9 +423,7 @@ fn query_id(dev: &DeviceHandleK) -> Option<String> {
     Some(unsafe { sref.as_str() }.to_string())
 }
 
-// Retry every live stack instance that has an incomplete level (failed to load or
-// cleared by a removal), continuing from its lowest such level.
-pub fn refresh_device_tree() {
+pub fn do_refresh_device_tree() {
     let instances: Vec<Arc<DeviceStack>> = match STACK_INSTANCES.get() {
         Some(list) => list.lock().clone(),
         None => panic!("STACK_INSTANCES not initialized??")

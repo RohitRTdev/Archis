@@ -6,7 +6,7 @@ use crate::{sched::{self, KTimerInnerType}};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::list::{List, DynList};
 use kernel_intf::KError;
-use crate::sched::KThread;
+use crate::sched::{KThread, is_preemption_enabled};
 
 pub type KSemInnerType = Arc<Spinlock<KSemInner>, PoolAllocatorGlobal>;
 
@@ -27,8 +27,9 @@ enum Wake {
 }
 
 fn do_wait(inner_arc: &KSemInnerType) -> Result<(), KError> {
-#[cfg(feature = "deadlock_detection")]
     let int_enabled = hal::are_interrupts_enabled();
+    let preemption_enabled = is_preemption_enabled();
+
     let mut yield_flag = false;
     {
         let mut inner = inner_arc.lock();
@@ -41,12 +42,23 @@ fn do_wait(inner_arc: &KSemInnerType) -> Result<(), KError> {
                 *counter -= 1;
                 *counter < 0
             },
-            SemState::Event { signalled, .. } => !*signalled
+            SemState::Event { signalled, is_auto_reset } => {
+                if *signalled {
+                    // Auto-reset events consume the signal here; manual-reset
+                    // events leave it raised for all subsequent waiters.
+                    if *is_auto_reset {
+                        *signalled = false;
+                    }
+                    false
+                } else {
+                    true
+                }
+            }
         };
 
         if should_block {
-        #[cfg(feature = "deadlock_detection")]
             assert!(int_enabled, "wait() would block with interrupts disabled — deadlock risk");
+            assert!(preemption_enabled, "wait() would block with preemption disabled — deadlock risk");
 
             let inner_wrap = Arc::clone(inner_arc);
 
@@ -89,12 +101,9 @@ fn do_signal(inner_arc: &KSemInnerType) {
             *counter = (*max_count).min(*counter + 1);
             if *counter <= 0 { Wake::One } else { Wake::None }
         },
-        SemState::Event { signalled, is_auto_reset } => {
+        SemState::Event { signalled, .. } => {
             *signalled = true;
-            if *is_auto_reset {
-                *signalled = false;
-            }
-            Wake::All
+            Wake::All 
         }
     };
 
@@ -145,8 +154,8 @@ impl KSem {
     }
 
     pub fn wait_with_timer(&self, timer: KTimerInnerType) -> Result<(), KError> {
-    #[cfg(feature = "deadlock_detection")]
         let int_enabled = hal::are_interrupts_enabled();
+        let preemption_enabled = is_preemption_enabled();
         let mut yield_flag = false;
         {
             let mut inner = self.inner.lock();
@@ -165,8 +174,8 @@ impl KSem {
             };
 
             if should_block {
-            #[cfg(feature = "deadlock_detection")]
                 assert!(int_enabled, "wait_with_timer() would block with interrupts disabled — deadlock risk");
+                assert!(preemption_enabled, "wait() would block with preemption disabled — deadlock risk");
 
                 let inner_wrap = Arc::clone(&self.inner);
 

@@ -5,7 +5,7 @@ use core::alloc::{Allocator, Layout};
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use kernel_intf::{info, exported_function};
+use kernel_intf::{exported_function, info, io_complete_irp};
 use kernel_intf::driver::{
     DeviceObject, DriverObject, Irp, IrpMinor, ReqInfo, Status, create_device, create_device_by_id
 };
@@ -30,10 +30,7 @@ fn driver_init(driver: &mut DriverObject) -> Status {
     kmod::dispatch_init!(
         driver,
         dispatch_add,
-        dispatch_start,
-        dispatch_stop,
-        dispatch_configure,
-        dispatch_remove,
+        dispatch_pnp,
         dispatch_read,
         dispatch_write
     );
@@ -61,7 +58,7 @@ fn dispatch_add(driver: &DriverObject, pdo: Option<&DeviceObject>) -> Status {
 }
 
 #[kmod::dispatch_handler]
-fn dispatch_configure(device: &DeviceObject, request: &mut Irp) -> Status {
+fn dispatch_pnp(device: &DeviceObject, request: &mut Irp) -> Status {
     match request.minor_code {
         IrpMinor::Enumerate => enumerate(device, request),
         IrpMinor::Query => {
@@ -69,8 +66,18 @@ fn dispatch_configure(device: &DeviceObject, request: &mut Irp) -> Status {
                 base_address: CHILD_ID.as_ptr() as usize,
                 size: CHILD_ID.len()
             };
+            request.complete_irp(Status::Success);
             Status::Success
-        }
+        },
+        IrpMinor::Start => {
+            dispatch_start(device, request)
+        },
+        IrpMinor::Stop => {
+            dispatch_stop(device, request)
+        },
+        IrpMinor::Remove => {
+            dispatch_remove(device, request)
+        },
         IrpMinor::None => Status::Unsupported
     }
 }
@@ -112,23 +119,24 @@ fn enumerate(device: &DeviceObject, request: &mut Irp) -> Status {
 
     info!("test1 enumerate: reporting {} PDO(s)", count);
     request.req_params = Some(ReqInfo{enumerate: array});
+    request.complete_irp(Status::Success);
     Status::Success
 }
 
-#[kmod::dispatch_handler]
-fn dispatch_start(device: &DeviceObject, _request: &mut Irp) -> Status {
+fn dispatch_start(device: &DeviceObject, request: &mut Irp) -> Status {
     info!("test1 start_device {}", device.id);
+
+    request.complete_irp(Status::Success);
     Status::Success
 }
 
-#[kmod::dispatch_handler]
-fn dispatch_stop(device: &DeviceObject, _request: &mut Irp) -> Status {
+fn dispatch_stop(device: &DeviceObject, request: &mut Irp) -> Status {
     info!("test1 stop_device {}", device.id);
+    request.complete_irp(Status::Success);
     Status::Success
 }
 
-#[kmod::dispatch_handler]
-fn dispatch_remove(device: &DeviceObject, _request: &mut Irp) -> Status {
+fn dispatch_remove(device: &DeviceObject, request: &mut Irp) -> Status {
     info!("test1 remove_device {}", device.id);
     // Free the per-FDO ctx if any (PDOs carry none).
     if !device.ctx.is_null() {
@@ -136,6 +144,7 @@ fn dispatch_remove(device: &DeviceObject, _request: &mut Irp) -> Status {
             drop(alloc::boxed::Box::from_raw_in(device.ctx as *mut Test1Device, PoolAllocatorGlobal));
         }
     }
+    request.complete_irp(Status::Success);
     Status::Success
 }
 
@@ -151,13 +160,14 @@ fn read_worker() -> ! {
     info!("test1 read worker: completing pending IRP");
     let irp = PENDING_IRP.swap(core::ptr::null_mut(), Ordering::AcqRel);
     if !irp.is_null() {
-        unsafe { (*irp).complete_irp(Status::Success) };
+        unsafe { io_complete_irp(irp, Status::Success) };
     }
     unsafe { kernel_intf::exit_kernel_thread() }
 }
 
 #[kmod::dispatch_handler]
-fn dispatch_write(_device: &DeviceObject, _request: &mut Irp) -> Status {
+fn dispatch_write(_device: &DeviceObject, request: &mut Irp) -> Status {
     info!("test1 write");
+    request.complete_irp(Status::Success);
     Status::Success
 }

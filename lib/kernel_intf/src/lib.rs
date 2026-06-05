@@ -89,6 +89,7 @@ impl fmt::Display for RtcTime {
     }
 }
 
+#[derive(Clone)]
 #[repr(C)]
 pub struct Lock {
     pub lock: u64,
@@ -134,9 +135,14 @@ unsafe extern "C" {
         completion_ctx: *mut core::ffi::c_void
     ) -> driver::Status;
     
+    pub fn io_complete_irp(irp: *mut driver::Irp, status: driver::Status);
     pub fn io_get_driver_id(device: *const driver::DeviceObject) -> usize;
     pub fn io_invalidate_device(device: *const driver::DeviceObject) -> driver::Status;
-
+    pub fn io_set_cancel_routine(
+        irp: *mut driver::Irp,
+        routine: extern "C" fn(*const driver::DeviceObject, *mut driver::Irp)
+    ); 
+    pub fn io_start_processing(irp: *mut driver::Irp) -> bool;
 
     #[allow(improper_ctypes)]
     pub fn create_kernel_thread(handler: fn() -> !) -> KError;

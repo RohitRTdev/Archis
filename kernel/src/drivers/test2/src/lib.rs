@@ -4,7 +4,7 @@
 use core::ffi::c_void;
 
 use kernel_intf::info;
-use kernel_intf::driver::{DeviceObject, DriverObject, Irp, Status, create_device};
+use kernel_intf::driver::{DeviceObject, DriverObject, Irp, IrpMinor, Status, create_device};
 use kernel_intf::mem::PoolAllocatorGlobal;
 
 struct Test2Device {
@@ -18,9 +18,7 @@ fn driver_init(driver: &mut DriverObject) -> Status {
     kmod::dispatch_init!(
         driver,
         dispatch_add,
-        dispatch_start,
-        dispatch_stop,
-        dispatch_remove,
+        dispatch_pnp,
         dispatch_read
     );
 
@@ -43,31 +41,51 @@ fn dispatch_add(driver: &DriverObject, pdo: Option<&DeviceObject>) -> Status {
 }
 
 #[kmod::dispatch_handler]
-fn dispatch_start(device: &DeviceObject, _request: &mut Irp) -> Status {
+fn dispatch_pnp(device: &DeviceObject, request: &mut Irp) -> Status {
+    match request.minor_code {
+        IrpMinor::Start => {
+            dispatch_start(device, request)
+        },
+        IrpMinor::Stop => {
+            dispatch_stop(device, request)
+        },
+        IrpMinor::Remove => {
+            dispatch_remove(device, request)
+        },
+        _ => {
+            Status::Unsupported
+        }
+    }
+}
+
+
+fn dispatch_start(device: &DeviceObject, request: &mut Irp) -> Status {
     info!("test2 start_device {}", device.id);
+    request.complete_irp(Status::Success);
     Status::Success
 }
 
-#[kmod::dispatch_handler]
-fn dispatch_stop(device: &DeviceObject, _request: &mut Irp) -> Status {
+fn dispatch_stop(device: &DeviceObject, request: &mut Irp) -> Status {
     info!("test2 stop_device {}", device.id);
+    request.complete_irp(Status::Success);
     Status::Success
 }
 
-#[kmod::dispatch_handler]
-fn dispatch_remove(device: &DeviceObject, _request: &mut Irp) -> Status {
+fn dispatch_remove(device: &DeviceObject, request: &mut Irp) -> Status {
     info!("test2 remove_device {}", device.id);
     if !device.ctx.is_null() {
         unsafe {
             drop(alloc::boxed::Box::from_raw_in(device.ctx as *mut Test2Device, PoolAllocatorGlobal));
         }
     }
+    request.complete_irp(Status::Success);
     Status::Success
 }
 
 #[kmod::dispatch_handler]
-fn dispatch_read(_device: &DeviceObject, _request: &mut Irp) -> Status {
+fn dispatch_read(_device: &DeviceObject, request: &mut Irp) -> Status {
     info!("test2 read");
+    request.complete_irp(Status::Success);
     Status::Success
 }
 

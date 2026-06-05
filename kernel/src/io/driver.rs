@@ -1,5 +1,5 @@
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -9,18 +9,20 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use common::{MemoryRegion, StrRef};
-use kernel_intf::driver::{DeviceObject, DriverObject, Irp, IrpMajor, IrpMinor, ReqInfo, Status};
+use kernel_intf::driver::{
+    DeviceObject, DriverObject, EMPTY_REGION, Irp, IrpMajor, IrpMinor, ReqInfo, Status
+};
+use kernel_intf::{acquire_spinlock, release_spinlock};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::{KError, info};
 
 use crate::loader::{LoadedImage, load_image};
 use crate::sync::{ConfigGuard, KEvent, KSem, Once, Spinlock, semaphore_guard};
+use crate::sched::{AsyncCtx, allocate_irp, disable_preemption, enable_preemption};
 use super::stack::{self, DeviceStack, LevelState};
-
 pub type DriverHandle = Arc<DriverObjectK, PoolAllocatorGlobal>;
 pub type DeviceHandleK = Arc<DeviceObjectK, PoolAllocatorGlobal>;
-
-const EMPTY_REGION: MemoryRegion = MemoryRegion { base_address: 0, size: 0 };
+pub type IrpPtr = *mut Irp;
 
 static NEXT_DRIVER_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_DEVICE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -111,7 +113,7 @@ impl DeviceObjectK {
         *slot = Some((stack, level));
     }
 
-    // PDOs are created by a bus during enumerate and are always "started" — they
+    // PDOs are created by a bus during enumerate and are always started — they
     // only carry bus resource info and never receive start/stop dispatches.
     pub fn mark_started_pdo(&self) {
         self.is_pdo.store(true, Ordering::Release);
@@ -153,7 +155,7 @@ impl DeviceObjectK {
             }
         }
 
-        let irp = io_request_sync(self, IrpMajor::Start, IrpMinor::None, None, EMPTY_REGION, 0)?;
+        let irp = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Start, None, EMPTY_REGION, 0)?;
         if irp.status == Status::Success {
             self.state.store(DeviceState::Started as usize, Ordering::Release);
             self.update_stack_state(LevelState::Started);
@@ -169,7 +171,7 @@ impl DeviceObjectK {
             return Status::Success;
         }
         self.state.store(DeviceState::Stopped as usize, Ordering::Release);
-        let status = io_request_sync(self, IrpMajor::Stop, IrpMinor::None, None, EMPTY_REGION, 0)
+        let status = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Stop, None, EMPTY_REGION, 0)
             .map(|irp| irp.status)
             .unwrap_or(Status::Failed);
         self.update_stack_state(LevelState::Stopped);
@@ -208,15 +210,13 @@ fn dispatch(driver: &DriverObjectK, major: IrpMajor, dev: *const DeviceObject, i
     match major {
         IrpMajor::Read => table.invoke_read(dev, irp),
         IrpMajor::Write => table.invoke_write(dev, irp),
-        IrpMajor::Start => table.invoke_start(dev, irp),
-        IrpMajor::Stop => table.invoke_stop(dev, irp),
-        IrpMajor::Configure => table.invoke_configure(dev, irp),
-        IrpMajor::Remove => table.invoke_remove(dev, irp)
+        IrpMajor::Pnp => table.invoke_pnp(dev, irp)
     }
 }
 
-fn bypasses_started_guard(major: IrpMajor) -> bool {
-    matches!(major, IrpMajor::Start | IrpMajor::Stop | IrpMajor::Remove)
+fn bypasses_started_guard(major: IrpMajor, minor: IrpMinor) -> bool {
+    matches!(major, IrpMajor::Pnp) &&
+    matches!(minor, IrpMinor::Start | IrpMinor::Stop | IrpMinor::Remove)
 }
 
 pub fn io_request_sync(
@@ -227,72 +227,32 @@ pub fn io_request_sync(
     buffer: MemoryRegion,
     offset: usize
 ) -> Result<Irp, KError> {
-    if !bypasses_started_guard(major) && !dev.is_started() {
+    if !bypasses_started_guard(major, minor) && !dev.is_started() {
         return Err(KError::DeviceStopped);
     }
     let driver = dev.driver.as_ref().ok_or(KError::Unsupported)?;
 
     let event = KEvent::new(false);
-    let mut irp = Irp::new(major, buffer, offset, Some(io_complete), &event as *const KEvent as *mut c_void);
-    irp.minor_code = minor;
-    irp.req_params = req_params;
+    let mut result = Irp::default();
 
-    let status = dispatch(driver, major, dev.device_ptr(), &mut irp);
+    let irp = allocate_irp(
+        major, 
+        minor, 
+        req_params, 
+        buffer, 
+        offset, 
+        Some(event.clone()), 
+        &mut result as IrpPtr, 
+        None, 
+        core::ptr::null_mut()
+    );
+
+    let status = dispatch(driver, major, dev.device_ptr(), irp);
     if status == Status::Pending {
         event.wait().expect("io_request_sync: completion wait failed with a pending IRP outstanding");
-    } else {
-        irp.status = status;
     }
-
-    // Detach the completion hooks before handing the value back (the event is
-    // about to go out of scope; the request is already complete).
-    irp.completion_routine = None;
-    irp.completion_ctx = core::ptr::null_mut();
-    Ok(irp)
-}
-
-extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
-    info!("io_complete: status_code {}", unsafe { (*irp).status as usize });
-    let event = unsafe { &*(ctx as *const KEvent) };
-    event.signal();
-}
-
-struct AsyncCtx {
-    routine: extern "C" fn(*mut Irp, *mut c_void),
-    ctx: *mut c_void,
-    irp: AtomicPtr<Irp>,
-    refs: AtomicUsize
-}
-
-// Run the caller routine + free the IRP exactly once. Returns true iff this call
-// performed the finalize (i.e. won the swap).
-unsafe fn finalize_async(actx: *mut AsyncCtx) -> bool {
-    let irp = unsafe { (*actx).irp.swap(core::ptr::null_mut(), Ordering::AcqRel) };
-    if irp.is_null() {
-        // If this is true then that means that this caller is late.
-        // Either driver or the caller frame came here first
-        return false;
-    }
-    let routine = unsafe { (*actx).routine };
-    let ctx = unsafe { (*actx).ctx };
-    routine(irp, ctx);
-    drop(unsafe { Box::from_raw_in(irp, PoolAllocatorGlobal) });
-    true
-}
-
-// Drop one reference to the shared ctx; the last owner frees it.
-unsafe fn release_async(actx: *mut AsyncCtx) {
-    if unsafe { (*actx).refs.fetch_sub(1, Ordering::AcqRel) } == 1 {
-        drop(unsafe { Box::from_raw_in(actx, PoolAllocatorGlobal) });
-    }
-}
-
-extern "C" fn io_complete_async(_irp: *mut Irp, ctx: *mut c_void) {
-    let actx = ctx as *mut AsyncCtx;
-    unsafe {
-        finalize_async(actx);
-        release_async(actx);
-    }
+    
+    Ok(result)
 }
 
 pub fn io_request_async(
@@ -305,57 +265,25 @@ pub fn io_request_async(
     routine: extern "C" fn(*mut Irp, *mut c_void),
     ctx: *mut c_void
 ) -> Result<Status, KError> {
-    if !bypasses_started_guard(major) && !dev.is_started() {
+    if !bypasses_started_guard(major, minor) && !dev.is_started() {
         return Err(KError::DeviceStopped);
     }
     let driver = dev.driver.as_ref().ok_or(KError::Unsupported)?;
 
-    let actx = Box::into_raw_with_allocator(Box::new_in(
-        AsyncCtx {
-            routine,
-            ctx,
-            irp: AtomicPtr::new(core::ptr::null_mut()),
-            // Two refs: this frame + the IRP/completion routine.
-            refs: AtomicUsize::new(2)
-        },
-        PoolAllocatorGlobal
-    )).0;
-
-    let mut irp_box = Box::new_in(
-        Irp::new(major, buffer, offset, Some(io_complete_async), actx as *mut c_void),
-        PoolAllocatorGlobal
+    let irp = allocate_irp(
+        major,
+        minor, 
+        req_params, 
+        buffer, 
+        offset, 
+        None, 
+        core::ptr::null_mut(),
+        Some(routine), 
+        ctx
     );
-    irp_box.minor_code = minor;
-    irp_box.req_params = req_params;
-    let irp_raw = Box::into_raw_with_allocator(irp_box).0;
-    unsafe { (*actx).irp.store(irp_raw, Ordering::Release); }
 
-    let status = dispatch(driver, major, dev.device_ptr(), irp_raw);
-    if status == Status::Pending {
-        // The completion will run later (possibly on another thread) and owns the
-        // IRP plus the other ref; just release this frame's ref.
-        unsafe { release_async(actx); }
-        Ok(Status::Pending)
-    } else {
-        unsafe {
-            // This code here is to ensure that kernel continues to run 
-            // smoothly in case the driver decided to call io_complete_irp()
-            // even when it returned SUCCESS.
-
-            // Only stamp status if the driver hasn't already completed the IRP.
-            if (*actx).irp.load(Ordering::Acquire) == irp_raw {
-                (*irp_raw).status = status;
-            }
-            let finalized_here = finalize_async(actx);
-            release_async(actx);
-            // If we performed the finalize, no io_complete_async will ever run to
-            // release the completion's ref — release it here too.
-            if finalized_here {
-                release_async(actx);
-            }
-        }
-        Ok(status)
-    }
+    let status = dispatch(driver, major, dev.device_ptr(), irp);
+    Ok(status)
 }
 
 pub fn driver_invoke_add(driver: &DriverHandle, pdo: *const DeviceObject) -> Status {
@@ -503,7 +431,7 @@ pub fn remove_device(dev: &DeviceObjectK) {
     {
         let _g = dev.config_guard();
         dev.stop_self();
-        let _ = io_request_sync(dev, IrpMajor::Remove, IrpMinor::None, None, EMPTY_REGION, 0);
+        let _ = io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Remove, None, EMPTY_REGION, 0);
     }
 
     if let Some(pid) = dev.parent_id() {
@@ -532,7 +460,7 @@ pub extern "C" fn io_get_driver_id(device: *const DeviceObject) -> usize {
 pub extern "C" fn io_invalidate_device(device: *const DeviceObject) -> Status {
     match resolve_device(device) {
         Some(dev) => {
-            stack::enumerate_and_detect(dev);
+            super::pnp::pnp_post(super::pnp::PnpRequest::InvalidateDevice { device_id: dev.id() });
             Status::Success
         }
         None => Status::Failed
@@ -576,6 +504,74 @@ pub extern "C" fn io_send_request(
     result.unwrap_or(Status::Failed)
 }
 
+#[unsafe(no_mangle)]
+extern "C" fn io_complete_irp(irp: *mut Irp, status: Status) {
+    assert!(status == Status::Success || status == Status::Failed || status == Status::Cancelled);
+    unsafe { (*irp).status = status }
+    let completion_routine = unsafe { (*irp).completion_routine };
+    let completion_ctx = unsafe { (*irp).completion_ctx };
+    (completion_routine)(irp, completion_ctx);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn io_start_processing(irp: *mut Irp) -> bool {
+    disable_preemption();
+    let irp = unsafe { &mut *irp };
+    unsafe { acquire_spinlock(&mut irp.cancel_lock); }
+    if irp.is_cancelled {
+        let ctx = irp.completion_ctx as *mut AsyncCtx;
+        unsafe { release_spinlock(&mut irp.cancel_lock); }
+        deallocate_irp(irp, ctx);
+        enable_preemption();
+
+        false
+    }
+    else {
+        irp.cancel_routine = None;
+        unsafe { release_spinlock(&mut irp.cancel_lock); }
+        enable_preemption();
+        true
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn io_set_cancel_routine(
+    irp: *mut Irp, 
+    routine: extern "C" fn(*const DeviceObject, *mut Irp)
+) {
+    let irp = unsafe { &mut *irp };
+    unsafe { acquire_spinlock(&mut irp.cancel_lock); }
+    
+    assert!(!irp.is_cancelled);
+    assert!(irp.cancel_routine.is_none());
+    irp.cancel_routine = Some(routine);
+    unsafe { release_spinlock(&mut irp.cancel_lock); }
+}
+
+pub fn deallocate_irp(irp: *mut Irp, ctx: *mut AsyncCtx) {
+    disable_preemption();
+    drop(unsafe { Box::from_raw_in(irp, PoolAllocatorGlobal) });
+    drop(unsafe { Box::from_raw_in(ctx, PoolAllocatorGlobal) });
+    enable_preemption();
+}
+
+// Exported to drivers: spawn a kernel worker thread. The handler must never
+// return; it should finish by calling exit_kernel_thread. Stopgap until a
+// proper DPC/bottom-half mechanism exists.
+#[unsafe(no_mangle)]
+#[allow(improper_ctypes_definitions)]
+pub extern "C" fn create_kernel_thread(handler: fn() -> !) -> KError {
+    match crate::sched::create_thread(handler) {
+        Ok(_) => KError::Success,
+        Err(e) => e
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn exit_kernel_thread() -> ! {
+    crate::sched::exit_thread()
+}
+
 pub fn init() {
     DRIVER_LOAD_LOCK.call_once(|| KSem::new(1, 1));
     ROOT_DEVICE.call_once(create_root_device);
@@ -584,6 +580,8 @@ pub fn init() {
     // root bus drivers recursively detects and loads child stacks.
     stack::load_boot_config();
     stack::load_root_stacks();
+
+    super::pnp::start_worker();
 
     // Try a read and a recursive stop on the first root device.
     let root = root_device();
@@ -607,9 +605,9 @@ pub fn init() {
 
     // Retry any stacks that failed to load (no-op on the happy path).
     info!("io::init: Trying refresh");
-    stack::refresh_device_tree();
+    super::pnp::refresh_device_tree();
 
     info!("io::init: stopping device tree rooted at '{}'", dev_m.name());
-    let _ = dev_m.stop();
+    super::pnp::stop_device(dev_m.id());
     info!("io::init: stop complete");
 }

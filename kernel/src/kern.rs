@@ -2,6 +2,7 @@
 #![feature(generic_const_exprs)]
 #![feature(likely_unlikely)]
 #![feature(allocator_api)]
+#![feature(box_as_ptr)]
 
 mod infra;
 mod hal;

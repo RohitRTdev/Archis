@@ -1,19 +1,27 @@
+use alloc::boxed::Box;
 use alloc::sync::Arc;
-use common::PAGE_SIZE;
+use alloc::collections::BTreeMap;
+use alloc::collections::BTreeMap;
+use common::{MemoryRegion, PAGE_SIZE};
+use core::ptr::NonNull;
+use core::mem::take;
+use core::sync::atomic::{AtomicU8, AtomicIsize, AtomicUsize, Ordering};
+use core::ffi::c_void;
+use core::ptr::null_mut;
+use core::mem::take;
+use super::{KProcess, ProcessStatus, get_current_process, get_process_info, KTimerInnerType};
 use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores, get_worker_stack, set_panic_base};
 use crate::hal::{self, IPIRequestType, create_kernel_context, disable_scheduler_timer, enable_scheduler_timer, fetch_context, get_per_cpu_base, get_per_cpu_data, get_per_cpu_kernel_base, set_per_cpu_base, set_per_cpu_data, switch_context};
 use crate::mem::{VCB, get_kernel_addr_space, set_address_space};
+use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
+use crate::io::{IrpPtr, deallocate_irp};
+use crate::sync::{KSem, KSemInnerType, Spinlock};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::list::{List, ListNode, DynList};
-use crate::sync::{KSem, KSemInnerType, Spinlock};
-use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_process_info, KTimerInnerType};
-use core::ffi::c_void;
-use core::ptr::null_mut;
-use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
-use core::ptr::NonNull;
-use core::mem::take;
-use alloc::collections::BTreeMap;
+use kernel_intf::driver::{Irp, IrpMajor, IrpMinor, ReqInfo, Status};
+use kernel_intf::{acquire_spinlock, release_spinlock};
 use kernel_intf::{KError, debug, info};
+use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_process_info, KTimerInnerType};
 
 #[cfg(target_arch = "x86_64")]
 use crate::hal::{get_per_cpu_kernel_base_for_core, set_tss_stack};
@@ -51,6 +59,7 @@ pub struct Task {
     panic_base: usize,
     user_fn: Option<DispatchRoutine>,
     wait_semaphores: DynList<KSemInnerType>,
+    issued_irps: DynList<IrpPtr>,
     term_notify: KSem,
     process: Option<KProcess>,
     vcb: Option<VCB>,
@@ -87,6 +96,7 @@ impl Task {
             panic_base: 0,
             user_fn,
             wait_semaphores: List::new(),
+            issued_irps: List::new(),
             term_notify: KSem::new(0, 1),
             process: None,
             vcb: None,
@@ -131,16 +141,44 @@ impl Task {
     pub fn get_exit_code(&self) -> isize {
         self.exit_code.load(Ordering::Relaxed)
     }
+
+    pub fn register_irp(&mut self, irp: IrpPtr) {
+        self.issued_irps.add_node(irp).expect("Failed to register IRP with task");
+    }
+
+    pub fn find_and_remove_irp(&mut self, irp: *mut Irp) {
+        self.issued_irps.find_and_remove(|&p| p == irp);
+    }
+
+    pub fn take_irp_list(&mut self) -> DynList<IrpPtr> {
+        take(&mut self.issued_irps)
+    }
 }
 
 impl Drop for Task {
     fn drop(&mut self) {
         info!("Dropping task:{}", self.id);
         assert!(self.wait_semaphores.get_nodes() == 0);
+        assert!(self.issued_irps.get_nodes() == 0, "task {} dropped with outstanding IRPs", self.id);
     }
 }
 
 unsafe impl Send for Task {}
+
+enum CompletionCtxType {
+    Async((extern "C" fn(*mut Irp, *mut c_void), *mut c_void)),
+    Sync((KEvent, IrpPtr))
+}
+
+pub struct AsyncCtx {
+    irp: IrpPtr,
+    comp_type: CompletionCtxType
+}
+
+struct SchedulerCB {
+    preemption_count: AtomicUsize,
+    task_queue: Spinlock<TaskQueue>
+} 
 
 pub struct TaskQueue {
     active_tasks: DynList<KThread>,
@@ -151,8 +189,7 @@ pub struct TaskQueue {
     running_task: Option<NonNull<ListNode<KThread>>>,
     idle_task_stack: NonNull<u8>,
     leftover_stack: DynList<Stack>,
-    flip_flop: bool,
-    preemption_count: usize
+    flip_flop: bool
 }
 
 unsafe impl Send for TaskQueue{}
@@ -168,14 +205,13 @@ impl TaskQueue {
             running_task: None,
             idle_task_stack: NonNull::dangling(),
             leftover_stack: List::new(),
-            flip_flop: false,
-            preemption_count: 0
+            flip_flop: false
         }
     }
 }
 
-static SCHEDULER_CON_BLK: PerCpu<Spinlock<TaskQueue>> = PerCpu::new_with(
-    [const {Spinlock::new(TaskQueue::new())}; MAX_CPUS]
+static SCHEDULER_CON_BLK: PerCpu<SchedulerCB> = PerCpu::new_with(
+    [const {SchedulerCB{preemption_count: AtomicUsize::new(0), task_queue: Spinlock::new(TaskQueue::new())}}; MAX_CPUS]
 );
 
 pub fn get_task_info(task_id: usize) -> Option<KThread> {
@@ -201,11 +237,6 @@ pub fn get_current_task() -> Option<KThread> {
     Some(Arc::clone(unsafe { &*(cur_task_ptr as *const KThread) }))
 }
 
-//pub fn get_current_task() -> Option<KThread> {
-//    let con = SCHEDULER_CON_BLK.local().lock();
-//    Some(Arc::clone(unsafe {&**con.running_task.as_ref()?.as_ptr()}))
-//}
-
 // Use this, if you just want the id
 pub fn get_current_task_id() -> Option<usize> {
     Some(get_current_task()?.lock().get_id())
@@ -220,7 +251,7 @@ pub fn yield_cpu() {
 }
 
 pub fn is_preemption_enabled() -> bool {
-    SCHEDULER_CON_BLK.local().lock().preemption_count == 0
+    SCHEDULER_CON_BLK.local().preemption_count.load(Ordering::Acquire) == 0
 }
 
 pub fn init() {
@@ -237,7 +268,7 @@ pub fn init() {
     init_task.lock().vcb = Some(get_kernel_addr_space());
 
     {
-        let mut sched_cb = SCHEDULER_CON_BLK.local().lock();
+        let mut sched_cb = SCHEDULER_CON_BLK.local().task_queue.lock();
         sched_cb.active_tasks.add_node(init_task).expect("Init task creation failed!");
 
         let task = NonNull::from(sched_cb.active_tasks.first().unwrap());
@@ -254,7 +285,7 @@ pub fn init() {
     for core in 0..get_total_cores() {
         let stack_base = get_worker_stack(core);
         let mut sched_cb = unsafe {
-            SCHEDULER_CON_BLK.get(core).lock()
+            SCHEDULER_CON_BLK.get(core).task_queue.lock()
         };
 
         // We need to create separate stack for idle task on cpu 0, since the current stack is used by init task
@@ -276,7 +307,7 @@ pub fn init() {
 
 // Set task to waiting and add the timer atomically
 pub fn add_cur_task_to_wait_queue_with_timer(wait_semaphore: KSemInnerType, timer: KTimerInnerType) -> bool {
-    let mut sched_cb = SCHEDULER_CON_BLK.local().lock();
+    let mut sched_cb = SCHEDULER_CON_BLK.local().task_queue.lock();
     let cb = sched_cb.running_task;
     if cb.is_none() {
         panic!("add_cur_task_to_wait_queue_with_timer() called from idle task!!");
@@ -307,7 +338,7 @@ pub fn add_cur_task_to_wait_queue_with_timer(wait_semaphore: KSemInnerType, time
 }
 
 pub fn add_cur_task_to_wait_queue(wait_semaphore: KSemInnerType) -> bool {
-    let sched_cb = SCHEDULER_CON_BLK.local().lock();
+    let sched_cb = SCHEDULER_CON_BLK.local().task_queue.lock();
     let cb = sched_cb.running_task;
     if cb.is_none() {
         panic!("add_cur_task_to_wait_queue() called from idle task!!");
@@ -370,7 +401,7 @@ pub fn signal_waiting_task(task_id: usize, wait_semaphore: KSemInnerType) {
     disable_preemption();
     {
         let mut sched_cb = unsafe {
-            SCHEDULER_CON_BLK.get(core).lock() 
+            SCHEDULER_CON_BLK.get(core).task_queue.lock() 
         };
 
         let status = this_task.lock().status;
@@ -446,9 +477,10 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
     disable_preemption();
 
     assert!(task_id != 0, "Attempted to kill init task!!!");
+    let sweep_irps;
     {
         let mut sched_cb = unsafe {
-            SCHEDULER_CON_BLK.get(core).lock()
+            SCHEDULER_CON_BLK.get(core).task_queue.lock()
         };
 
         let status = {
@@ -458,6 +490,7 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
             task_locked.exit_code.store(exit_code, Ordering::Relaxed);
             status
         };
+        sweep_irps = status != TaskStatus::TERMINATED;
 
         // Remove task from active list and add to terminated list
         match status {
@@ -534,26 +567,17 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
 
     // Inform semaphore that this task is about to be killed, remove it from the blocked list
     if drop_task {
-        while this_task.lock().wait_semaphores.get_nodes() != 0 {
-            // Right now, there is no option for a task to be in multiple wait lists
-            // So this should be valid
-            assert!(this_task.lock().wait_semaphores.get_nodes() == 1);
-            // We do it in this weird fashion since we don't want the task to be locked during call to drop_task
-            let (sem_wrap, sem_inner) = {
-                let task = this_task.lock();
-                let sem = task.wait_semaphores.first();
-                (Arc::clone(&**sem.unwrap()), NonNull::from(sem.unwrap()))
-            };
-
-            KSem::drop_task(sem_wrap, task_id);
-
-            unsafe {
-                this_task.lock().wait_semaphores.remove_node(sem_inner);
-            }
-        } 
+        let wait_semaphores = take(&mut this_task.lock().wait_semaphores);
+        for sem in wait_semaphores.iter() {
+            KSem::drop_task((**sem).clone(), task_id);
+        }
     }
 
-    // Drop it explicitly since we won't return from here and rust thinks that 
+    if sweep_irps {
+        kill_sweep_irps(&this_task);
+    }
+
+    // Drop it explicitly since we won't return from here and rust thinks that
     // this stack frame here is preserved, which means that this reference gets leaked
     drop(this_task);
 
@@ -566,6 +590,110 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
         // to ensure that preemption is not disabled (only in this case). Otherwise this thread would just keep running
         // If it is called from exit_thread, then this will result in panic
         yield_cpu();
+    }
+}
+
+extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
+    disable_preemption();
+    let status = unsafe { (*irp).status };  
+    info!("io_complete: status_code {}", status as usize);
+    let ctx_ptr = ctx as *mut AsyncCtx;
+    let ctx = unsafe { &mut *ctx_ptr };
+    
+    // If task is not killed and irp exists within the task irp list, remove it
+    if let Some(dispatch_thread) = get_task_info(unsafe { (*irp).thread_id }) {
+        dispatch_thread.lock().find_and_remove_irp(irp);
+    }
+    
+    // Run the completion routines
+    match &mut ctx.comp_type {
+        CompletionCtxType::Sync((event, result_ptr)) => {
+            unsafe { result_ptr.write((*irp).clone()) }
+            event.signal();
+        },
+        CompletionCtxType::Async((user_routine, user_ctx)) => {
+            user_routine(irp, *user_ctx);
+        }
+    }
+
+    if status != Status::Cancelled {
+        deallocate_irp(irp, ctx_ptr);
+    }
+    else {
+        // For cancellation path, the deallocation is done once driver calls io_start_processing
+        unsafe {
+            (*irp).is_cancelled = true;
+        }
+    }
+    enable_preemption();
+}
+
+pub fn allocate_irp(
+    major: IrpMajor, 
+    minor: IrpMinor,
+    req_params: Option<ReqInfo>,
+    buffer: MemoryRegion,
+    offset: usize,
+    complete_event: Option<KEvent>,
+    completion_result_ptr: IrpPtr,
+    user_completion_routine: Option<extern "C" fn(*mut Irp, *mut c_void)>,
+    user_completion_ctx: *mut c_void
+) -> IrpPtr {
+    disable_preemption();
+    
+    // Create the context and irp
+    let actx = Box::into_raw_with_allocator(Box::new_in(
+        if complete_event.is_some() {
+            AsyncCtx { 
+                irp: core::ptr::null_mut(),
+                comp_type: CompletionCtxType::Sync((
+                    complete_event.unwrap(),
+                    completion_result_ptr
+                ))
+            }
+        }
+        else {
+            AsyncCtx {
+                irp: core::ptr::null_mut(),
+                comp_type: CompletionCtxType::Async((
+                    user_completion_routine.unwrap(),
+                    user_completion_ctx
+                )),
+            }
+        },
+        PoolAllocatorGlobal
+    )).0;
+
+    let mut irp_box = Box::new_in(
+        Irp::new(major, buffer, offset, io_complete, actx as *mut c_void),
+        PoolAllocatorGlobal
+    );
+    irp_box.minor_code = minor;
+    irp_box.req_params = req_params;
+    let irp_raw = Box::into_raw_with_allocator(irp_box).0;
+    unsafe { (*actx).irp = irp_raw; }
+    enable_preemption();
+    
+    irp_raw
+}
+        
+fn kill_sweep_irps(task: &KThread) {
+    let mut irp_list = task.lock().take_irp_list();
+
+    for cancel_irp_node in irp_list.iter_mut() {
+        let cancel_irp = unsafe { &mut ***cancel_irp_node };
+        unsafe { acquire_spinlock(&mut cancel_irp.cancel_lock); }
+        
+        // Either another process cancelled this explicitly or driver did not
+        // a) get chance yet to register the cancel routine or
+        // b) decided that cancellation was not required for this request
+        if cancel_irp.cancel_routine.is_none() || cancel_irp.is_cancelled {
+            unsafe { release_spinlock(&mut cancel_irp.cancel_lock); }
+            continue;
+        }
+
+        (cancel_irp.cancel_routine.unwrap())(cancel_irp.device, cancel_irp as IrpPtr);
+        unsafe { release_spinlock(&mut cancel_irp.cancel_lock); }
     }
 }
 
@@ -654,14 +782,12 @@ fn notify_watchers(notifier_list: &DynList<KSem>) {
 }
 
 pub fn disable_preemption() {
-    let mut sched_cb = SCHEDULER_CON_BLK.local().lock();
-    sched_cb.preemption_count += 1;
+    SCHEDULER_CON_BLK.local().preemption_count.fetch_add(1, Ordering::AcqRel);
 }
 
 pub fn enable_preemption() {
-    let mut sched_cb = SCHEDULER_CON_BLK.local().lock();
-    assert!(sched_cb.preemption_count >= 1);
-    sched_cb.preemption_count = sched_cb.preemption_count.saturating_sub(1);
+    let old = SCHEDULER_CON_BLK.local().preemption_count.fetch_sub(1, Ordering::AcqRel);
+    assert!(old != 0);
 }
 
 fn can_sleep(sched_cb: &mut TaskQueue) -> bool {
@@ -737,10 +863,11 @@ fn setup_current_task_ptr(sched_cb: &mut TaskQueue) {
 // Main scheduler loop
 pub fn schedule() {
     let notifier_list = {
-        let mut sched_cb = SCHEDULER_CON_BLK.local().lock();
+        let sched_cb_cpu = SCHEDULER_CON_BLK.local();
+        let mut sched_cb = sched_cb_cpu.task_queue.lock();
         update_timers(&mut sched_cb);
         
-        if sched_cb.preemption_count > 0 {
+        if sched_cb_cpu.preemption_count.load(Ordering::Acquire) > 0 {
             take(&mut sched_cb.notifier_list)
         }
         else {
@@ -968,7 +1095,7 @@ pub fn create_init_thread(handler: DispatchRoutine, process: KProcess, context_p
 pub fn start_task(thread: &KThread, core: usize, process: &KProcess, registry: &Spinlock<BTreeMap<usize, KProcess>>) -> Result<(), KError> {
     {
         let mut sched_cb = unsafe {
-            SCHEDULER_CON_BLK.get(core).lock()
+            SCHEDULER_CON_BLK.get(core).task_queue.lock()
         };
         
         let thread_id = thread.lock().get_id();
@@ -1007,7 +1134,7 @@ pub fn create_thread_do_work(handler: DispatchRoutine, user_fn: Option<DispatchR
     // which itself acquires the local scheduler lock.
     let setup_result: Result<(), KError> = {
         let mut sched_cb = unsafe {
-            SCHEDULER_CON_BLK.get(core).lock()
+            SCHEDULER_CON_BLK.get(core).task_queue.lock()
         };
 
         if let Some(process) = cur_process {
