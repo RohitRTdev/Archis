@@ -126,6 +126,8 @@ impl Process {
             }
         }
 
+        crate::sched_log!("Remove thread called with id {}", thread_id);
+
         unsafe {
             if let Some(killed_thread) = killed_thread {
                 self.threads.remove_node(killed_thread);
@@ -163,7 +165,7 @@ impl Process {
     fn destroy_process(&mut self) {
         self.status = ProcessStatus::Terminated;
         PROCESSES.lock().remove(&self.id);
-        kernel_intf::debug!("Called destroy process {}", self.id);
+        crate::sched_log!("Called destroy process {}", self.id);
     }
 
     pub fn get_num_handles(&self) -> usize {
@@ -200,12 +202,12 @@ impl Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        info!("Dropping process {}", self.id);
+        crate::sched_log!("Dropping process {}", self.id);
         unsafe {
             VirtMemConBlk::destroy_address_space(self.addr_space);
         }
 
-        debug!("Deallocating regions from process {} memory list", self.id);
+        crate::sched_log!("Deallocating regions from process {} memory list", self.id);
         for range in self.memory_list.iter() {
             debug!("Deallocating memory region base={:#X} of size={}", range.base_address, range.size);
             deallocate_memory(range.base_address as *mut u8, Layout::from_size_align(range.size, PAGE_SIZE).unwrap(), 0)
@@ -356,7 +358,7 @@ pub fn kill_process(proc_id: usize, exit_code: isize) {
         guard.threads.clone()
     };
 
-    kernel_intf::debug!("Killing process {}", proc_id);
+    crate::sched_log!("Killing process {}", proc_id);
 
     let is_idle_task = cur_task_id.is_none();
     let cur_task_id = if cur_task_id.is_some() {cur_task_id.unwrap()} else {0};
@@ -368,8 +370,8 @@ pub fn kill_process(proc_id: usize, exit_code: isize) {
         // We don't want the current task to kill itself right away
         // This happens if the current process is killing itself (exit)
         if is_idle_task || **thread_id != cur_task_id {
-            kernel_intf::debug!("Issuing kill to thread {}", **thread_id);
-            sched::kill_thread(**thread_id, exit_code);
+            crate::sched_log!("Issuing kill to thread {}", **thread_id);
+            sched::kill_thread(**thread_id);
         }
         else {
             is_exit = true;
@@ -413,7 +415,7 @@ pub fn add_memory_range_to_cur_process(virtual_base: usize, size: usize, is_user
     let process = get_current_process()
     .expect("Called add_memory_range_to_cur_process() from idle task!");
 
-    debug!("Adding memory range with virtual_base:{:#X}, phy_base:{:#X} and size {}", virtual_base,
+    crate::sched_log!("Adding memory range with virtual_base:{:#X}, phy_base:{:#X} and size {}", virtual_base,
     base_address, size);
 
     process.lock().memory_list.add_node(range)

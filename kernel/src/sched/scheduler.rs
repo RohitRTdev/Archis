@@ -159,6 +159,7 @@ impl Task {
 
 impl Drop for Task {
     fn drop(&mut self) {
+        crate::sched_log!("Dropping task:{}", self.id);
         assert!(self.wait_semaphores.get_nodes() == 0);
         assert!(self.issued_irps.get_nodes() == 0, "task {} dropped with outstanding IRPs", self.id);
     }
@@ -586,6 +587,7 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
 
     // The current running task is killed, yield remaining context
     if yield_flag {
+        crate::sched_log!("Yielding task {}", task_id);
         // This is case where task/thread is killing itself. It is important for caller
         // to ensure that preemption is not disabled (only in this case). Otherwise this thread would just keep running
         // If it is called from exit_thread, then this will result in panic
@@ -751,11 +753,13 @@ fn reap_tasks(sched_cb: &mut TaskQueue) {
             let is_last_thread_in_proc = process_guard.remove_thread(id, thread_exit_code);
 
             if is_last_thread_in_proc {
+                crate::sched_log!("Adding process {} notifier to notifier list as task {} is terminating", process_guard.get_id(), id);
                 sched_cb.notifier_list.add_node(process_guard.get_notify_sem()).expect("Failed to add process notify semaphore to notifier list!");
                 sched_cb.notifier_list.add_node(process_guard.get_init_sem()).expect("Failed to add process init semaphore to notifier list!");
             }
         }
 
+        crate::sched_log!("Removing task {} on core {}", id, hal::get_core());
         unsafe {
             sched_cb.terminated_tasks.remove_node(task);
         }
@@ -970,6 +974,7 @@ pub fn schedule() {
                                 sched_cb.waiting_tasks.insert_node_at_tail(current_task);
                             }
                             else if task_info.status == TaskStatus::TERMINATED {
+                                crate::sched_log!("Adding task {} to terminated list", task_info.id);
                                 sched_cb.terminated_tasks.insert_node_at_tail(current_task);
                             }
 
@@ -1066,6 +1071,7 @@ fn notify_other_cpu(target_core: usize) {
         return;
     }
 
+    crate::sched_log!("Notifying core {}", target_core);
     hal::notify_core(IPIRequestType::SchedChange, target_core);
 }
 
@@ -1168,7 +1174,7 @@ pub fn create_thread_do_work(handler: DispatchRoutine, user_fn: Option<DispatchR
                 Err(e)
             }
             else {
-                debug!("Creating new task {} under process {}", thread_id, guard.get_id());
+                crate::sched_log!("Creating new task {} under process {}", thread_id, guard.get_id());
                 thread.lock().context_ptr = context_ptr;
                 thread.lock().process = Some(process_ref);
                 thread.lock().vcb = Some(proc_addr_space);

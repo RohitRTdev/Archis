@@ -87,7 +87,7 @@ impl LinkedListAllocator {
 static HEAP: Spinlock<LinkedListAllocator> = Spinlock::new(LinkedListAllocator::new());
 
 fn heap_alloc_impl(size: usize, align: usize) -> *mut u8 {
-    //kernel_intf::debug!("Requesting heap allocation, size={}, align={}", size, align);
+    crate::allocator_log!("Requesting heap allocation, size={}, align={}", size, align);
     let size = size.max(size_of::<ListNode>());
     let align = align.max(align_of::<ListNode>());
     let mut allocator = HEAP.lock();
@@ -120,7 +120,7 @@ fn heap_alloc_impl(size: usize, align: usize) -> *mut u8 {
 }
 
 fn heap_dealloc_impl(addr: *mut u8, size: usize, _align: usize) {
-    //kernel_intf::debug!("Requesting heap deallocation on addr={:#X}, size={}, align={}", addr.addr(), size, _align);
+    crate::allocator_log!("Requesting heap deallocation on addr={:#X}, size={}, align={}", addr.addr(), size, _align);
     let size = size.max(size_of::<ListNode>());
     let mut allocator = HEAP.lock();
     allocator.add_free_region(addr as usize, size);

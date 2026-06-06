@@ -85,7 +85,7 @@ fn pop_one() -> Option<ListNodeGuard<PnpRequest, PoolAllocator>> {
 }
 
 fn handle(req: &PnpRequest) {
-    info!("Handling request: {:?}", req);
+    crate::io_log!("Handling request: {:?}", req);
     match req {
         PnpRequest::InvalidateDevice { device_id } => {
             match get_device(*device_id) {
@@ -126,9 +126,9 @@ fn handle(req: &PnpRequest) {
 }
 
 fn pnp_worker() -> ! {
-    info!("pnp_worker: started");
+    info!("Started pnp worker thread");
     loop {
-        info!("pnp_worker: Waiting for requests");
+        crate::io_log!("pnp_worker: Waiting for requests");
         PNP_SIGNAL.get().unwrap().wait().expect("PnP signal wait failed");
         // Drain until empty, then go back to waiting.
         loop {
@@ -138,7 +138,7 @@ fn pnp_worker() -> ! {
             };
             handle(&*guard);
         }
-        info!("pnp_worker: Going back to sleep");
+        crate::io_log!("pnp_worker: Going back to sleep");
     }
 }
 

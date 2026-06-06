@@ -101,7 +101,7 @@ fn push_free_blocks(pool: &mut Pool, base: *mut u8, slots: usize, block_size: us
 }
 
 fn allocate_block(size: usize, align: usize) -> Result<NonNull<u8>, KError> {
-    //kernel_intf::debug!("Requesting pool allocation, size={}, align={}", size, align);
+    crate::allocator_log!("Requesting pool allocation, size={}, align={}", size, align);
     let _ = align;
     let block_size = size;
     let mut cb = POOL_CB.lock();
@@ -139,7 +139,7 @@ fn allocate_block(size: usize, align: usize) -> Result<NonNull<u8>, KError> {
 }
 
 unsafe fn deallocate_block(ptr: NonNull<u8>, size: usize, _align: usize) {
-    //kernel_intf::debug!("Requesting pool deallocation on addr={:#X}, size={}, align={}", ptr.as_ptr().addr(), size, _align);
+    crate::allocator_log!("Requesting pool deallocation on addr={:#X}, size={}, align={}", ptr.as_ptr().addr(), size, _align);
     let block_size = size;
     let mut cb = POOL_CB.lock();
 

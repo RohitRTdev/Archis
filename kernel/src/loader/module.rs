@@ -86,7 +86,7 @@ pub fn early_init() {
                 val.base_address = add_offset(val.base_address);
             }
 
-            debug!("Updated kernel module info = {:?}", mod_cb.info);
+            crate::loader_log!("Updated kernel module info = {:?}", mod_cb.info);
         }),
         flags: 0
     }).unwrap();

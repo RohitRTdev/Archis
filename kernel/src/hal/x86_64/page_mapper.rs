@@ -641,7 +641,7 @@ impl PageMapper {
         let pml4 = usize_to_ptr::<[u64; TOTAL_ENTRIES]>(pml4_virt);
         
         let mut page_tables = 0;
-        info!("Destroying page tables for process {}", self.proc_id);
+        crate::mem_log!("Destroying page tables for process {}", self.proc_id);
         
         // Go over PML4 entries 
         let layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).unwrap();
@@ -738,7 +738,7 @@ impl PageMapper {
         self.is_allocated = false;
         self.page_reserve_present = false;
 
-        info!("Destroyed {} page tables", page_tables);
+        crate::mem_log!("Destroyed {} page tables", page_tables);
     }
 }
 

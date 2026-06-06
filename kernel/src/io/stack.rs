@@ -202,7 +202,7 @@ pub fn load_boot_config() {
     let parsed = parse(&text);
     info!("boot.conf: parsed {} device stack descriptor(s)", parsed.len());
     for d in parsed.iter() {
-        info!("  stack id='{}' drivers={:?}", d.match_id, d.driver_names);
+        crate::io_log!("  stack id='{}' drivers={:?}", d.match_id, d.driver_names);
     }
     *DESCRIPTORS.get().unwrap().lock() = parsed;
 }
@@ -229,8 +229,8 @@ pub fn load_root_stacks() {
         None => panic!("DESCRIPTORS is uninitialized??")
     };
 
+    info!("Loading root stack");
     for descriptor in root_descriptors {
-        info!("Loading root stack");
         // The ROOT device is never attached to a stack (it is never removed).
         start_stack_instance(descriptor, root.clone(), false);
     }
@@ -333,7 +333,7 @@ fn continue_stack(stack: &Arc<DeviceStack>, from_level: usize) {
         parent = fdo;
     }
 
-    info!("stack '{}' fully loaded", stack.match_id());
+    crate::io_log!("stack '{}' fully loaded", stack.match_id());
 }
 
 // Parse the bus-written enumerate buffer back into a slice of device pointers.
@@ -400,7 +400,7 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
 
     let added: Vec<usize> = new_ids.iter().copied().filter(|id| !old.contains(id)).collect();
     let removed: Vec<usize> = old.iter().copied().filter(|id| !new_ids.contains(id)).collect();
-    info!("enumerate on '{}': +{} -{}", fdo.name(), added.len(), removed.len());
+    crate::io_log!("enumerate on '{}': +{} -{}", fdo.name(), added.len(), removed.len());
 
     // Tear down disappeared children first
     for id in removed {
@@ -428,7 +428,7 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
 
         match find_descriptor(&match_id) {
             Some(descriptor) => {
-                info!("PDO {} matched stack '{}'", id, match_id);
+                crate::io_log!("PDO {} matched stack '{}'", id, match_id);
                 // Each PDO is the base of its own fresh instance.
                 start_stack_instance(descriptor, pdo.clone(), true);
             }
@@ -461,7 +461,7 @@ pub fn do_refresh_device_tree() {
 
     for stack in instances {
         if let Some(level) = stack.first_incomplete_level() {
-            info!("refresh: retrying stack '{}' from level {}", stack.match_id(), level);
+            crate::io_log!("refresh: retrying stack '{}' from level {}", stack.match_id(), level);
             continue_stack(&stack, level);
         }
     }

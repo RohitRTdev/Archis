@@ -537,7 +537,7 @@ impl VirtMemConBlk {
             // but not in the kernel half
             if blk.is_mapped && blk.start_virt_address < KERNEL_HALF_OFFSET {
                 // If page mapper fails, kernel panics, right now we don't have a fallback
-                debug!("Mapping memory blk => Virtual={:#X}, physical={:#X}, pages={:#X}, is_mmio={}",
+                crate::mem_log!("Mapping memory blk => Virtual={:#X}, physical={:#X}, pages={:#X}, is_mmio={}",
             blk.start_virt_address, blk.start_phy_address, blk.num_pages, blk.flags & PageDescriptor::MMIO != 0);
 
                 page_mapper.map_memory_non_self(

@@ -15,6 +15,7 @@ mod sched;
 mod fs;
 mod loader;
 mod io;
+mod utils;
 
 #[cfg(feature = "acpi")]
 mod acpica;
@@ -509,8 +510,9 @@ fn kern_main() -> ! {
     loader::init();
     io::init();
 
-    run_fence_tests();
-    run_state_tests();
+    interative_thread_spawn_tests();
+    //run_fence_tests();
+    //run_state_tests();
 
     loop {
         sched::delay_ms(1000);

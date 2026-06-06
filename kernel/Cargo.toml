@@ -14,6 +14,11 @@ stack_down = []
 deadlock_detection = []
 acpi = ["common/acpi"]
 test-kernel = ["common/test-kernel", "kernel_intf/test-kernel"]
+debug-scheduler-logs = []
+debug-io-logs = []
+debug-loader-logs = []
+debug-mem-logs = []
+debug-allocator-logs = []
 
 [dependencies]
 kernel_intf = {workspace = true, features = ["link-kernel"]}

@@ -33,7 +33,7 @@ impl Drop for ModuleDescriptor {
     fn drop(&mut self) {
         {
             let mut registry = KERNEL_MODULES.lock();
-            info!("Dropping image {}, with registry_len={}", self.name, registry.get_nodes());
+            crate::loader_log!("Dropping image {}, with registry_len={}", self.name, registry.get_nodes());
 
             // Cleanup: Remove all weak refs from the registry
             while registry.find_and_remove(|entry| {
@@ -41,7 +41,7 @@ impl Drop for ModuleDescriptor {
                 item.is_none()
             }).is_some() {}
 
-            info!("New registry len = {}", registry.get_nodes());
+            crate::loader_log!("New registry len = {}", registry.get_nodes());
         }
 
         deallocate_memory(
@@ -78,7 +78,7 @@ pub fn init() {
 }
 
 pub fn load_image(path: &str, is_user: bool) -> Result<LoadedImage, KError> {
-    info!("Start load_image for {}", path);
+    crate::loader_log!("Start load_image for {}", path);
 
     // Serialize the whole recursive load
     let _guard = semaphore_guard(LOAD_LOCK.get().expect("loader::init() not called before load_image()"));
@@ -99,7 +99,7 @@ fn load_image_inner(
     }
 
     if let Some(cached) = find_loaded_module(path) {
-        info!("Loading image {} from cache", path);
+        crate::loader_log!("Loading image {} from cache", path);
         return Ok(cached);
     }
 
@@ -123,7 +123,7 @@ fn load_image_uncached(
     is_user: bool,
     in_progress: &mut Vec<String>
 ) -> Result<LoadedImage, KError> {
-    info!("Loading image {} from disk", path);
+    crate::loader_log!("Loading image {} from disk", path);
     let file = open(path)?;
     let file_size = file.lock().len();
 
@@ -159,14 +159,14 @@ fn load_image_uncached(
     KERNEL_MODULES.lock().add_node(weak)
     .expect("Failed to add image reference to module registry");
 
-    info!("Loaded image '{}' with name={}", path, module_name);
+    crate::loader_log!("Loaded image '{}' with name={}", path, module_name);
 
     Ok(arc)
 }
 
 fn find_loaded_module(path: &str) -> Option<LoadedImage> {
     let resolved = resolve_symlink(path);
-    info!("Resolved symlink:{} -> {}", path, resolved);
+    crate::loader_log!("Resolved symlink:{} -> {}", path, resolved);
 
     let registry = KERNEL_MODULES.lock();
     for node in registry.iter() {
@@ -501,7 +501,7 @@ fn load_dependencies(
                 in_progress
             )?;
             
-            info!("Loaded dependency {}", name);
+            crate::loader_log!("Loaded dependency {}", name);
             deps.push(res);
         }
         else {
@@ -522,7 +522,7 @@ fn load_dependencies(
                         return Err(e);
                     },
                     Ok(dep) => {
-                        info!("Loaded dependency {}", filename);
+                        crate::loader_log!("Loaded dependency {}", filename);
                         found_entry = true;
                         deps.push(dep);
                         break;

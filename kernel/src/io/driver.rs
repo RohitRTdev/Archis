@@ -208,7 +208,7 @@ impl DeviceObjectK {
 
 impl Drop for DeviceObjectK {
     fn drop(&mut self) {
-        info!("Dropping device id: {}", self.id);
+        crate::io_log!("Dropping device id: {}", self.id);
     }
 }
 
@@ -446,7 +446,7 @@ pub extern "C" fn io_create_device(
         }
     }
 
-    info!("io_create_device: device {} (driver {}) parent {:?}", id, driver_id, parent_id);
+    crate::io_log!("io_create_device: device {} (driver {}) parent {:?}", id, driver_id, parent_id);
     device_ptr
 }
 
@@ -512,7 +512,7 @@ pub fn remove_device(dev: &DeviceObjectK) {
     if let Some(n) = dev.device.get_name() {
         DEVICE_BY_NAME.lock().remove(n);
     }
-    info!("remove_device: dropped device {}", dev.id);
+    crate::io_log!("remove_device: dropped device {}", dev.id);
 }
 
 #[unsafe(no_mangle)]
@@ -578,7 +578,7 @@ extern "C" fn io_start_processing(irp: *mut Irp) -> bool {
     let irp = unsafe { &mut *irp };
     unsafe { acquire_spinlock(&mut irp.cancel_lock); }
     if irp.is_cancelled {
-        info!("Cancelled arm in io_start_processing by thread: {} on irp {:#X}", irp.thread_id, irp as *const Irp as usize);
+        crate::io_log!("Cancelled arm in io_start_processing by thread: {} on irp {:#X}", irp.thread_id, irp as *const Irp as usize);
         let ctx = irp.completion_ctx as *mut AsyncCtx;
         unsafe { release_spinlock(&mut irp.cancel_lock); }
         deallocate_irp(irp, ctx);
@@ -601,7 +601,7 @@ extern "C" fn io_set_cancel_routine(
 ) {
     let irp = unsafe { &mut *irp };
     unsafe { acquire_spinlock(&mut irp.cancel_lock); }
-    info!("Setting cancel routine by thread: {} on irp {:#X}", irp.thread_id, irp as *const Irp as usize);
+    crate::io_log!("Setting cancel routine by thread: {} on irp {:#X}", irp.thread_id, irp as *const Irp as usize);
     
     assert!(!irp.is_cancelled);
     assert!(irp.cancel_routine.is_none());
@@ -610,7 +610,7 @@ extern "C" fn io_set_cancel_routine(
 }
 
 pub fn deallocate_irp(irp: *mut Irp, ctx: *mut AsyncCtx) {
-    info!("Deallocating irp {:#X} by thread: {}", irp.addr(), unsafe{(*irp).thread_id});
+    crate::io_log!("Deallocating irp {:#X} by thread: {}", irp.addr(), unsafe{(*irp).thread_id});
     disable_preemption();
     drop(unsafe { Box::from_raw_in(irp, PoolAllocatorGlobal) });
     drop(unsafe { Box::from_raw_in(ctx, PoolAllocatorGlobal) });
