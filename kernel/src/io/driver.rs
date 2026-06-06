@@ -33,10 +33,13 @@ static ROOT_DEVICE: Once<DeviceHandleK> = Once::new();
 static DRIVER_LOAD_LOCK: Once<KSem> = Once::new();
 
 #[repr(usize)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DeviceState {
-    Stopped = 0,
-    Started = 1
+    Stopped  = 0,
+    Started  = 1,
+    Stopping = 2,
+    Removing = 3,
+    Removed  = 4
 }
 
 pub struct DriverObjectK {
@@ -88,8 +91,16 @@ impl DeviceObjectK {
         *self.parent.lock() = Some(pid);
     }
 
+    fn state(&self) -> DeviceState {
+        unsafe { core::mem::transmute(self.state.load(Ordering::Acquire)) }
+    }
+
+    fn set_state(&self, s: DeviceState) {
+        self.state.store(s as usize, Ordering::Release);
+    }
+
     fn is_started(&self) -> bool {
-        self.state.load(Ordering::Acquire) == DeviceState::Started as usize
+        self.state() == DeviceState::Started
     }
 
     pub fn config_guard(&self) -> ConfigGuard<'_> {
@@ -120,7 +131,7 @@ impl DeviceObjectK {
     // only carry bus resource info and never receive start/stop dispatches.
     pub fn mark_started_pdo(&self) {
         self.is_pdo.store(true, Ordering::Release);
-        self.state.store(DeviceState::Started as usize, Ordering::Release);
+        self.set_state(DeviceState::Started);
     }
 
     fn update_stack_state(&self, ls: LevelState) {
@@ -160,23 +171,21 @@ impl DeviceObjectK {
 
         let irp = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Start, EMPTY_REGION, 0)?;
         if irp.status == Status::Success {
-            self.state.store(DeviceState::Started as usize, Ordering::Release);
+            self.set_state(DeviceState::Started);
             self.update_stack_state(LevelState::Started);
         }
         Ok(irp.status)
     }
 
-    // Stop this single device (caller must hold the config guard). Flips the
-    // state to Stopped before dispatching, so concurrent read/write get
-    // DeviceStopped and the driver's stop handler sees no new requests.
     fn stop_self(&self) -> Status {
-        if self.is_pdo() || !self.is_started() {
+        if self.is_pdo() || self.state() != DeviceState::Started {
             return Status::Success;
         }
-        self.state.store(DeviceState::Stopped as usize, Ordering::Release);
+        self.set_state(DeviceState::Stopping);
         let status = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Stop, EMPTY_REGION, 0)
             .map(|irp| irp.status)
             .unwrap_or(Status::Failed);
+        self.set_state(DeviceState::Stopped);
         self.update_stack_state(LevelState::Stopped);
         status
     }
@@ -217,9 +226,16 @@ fn dispatch(driver: &DriverObjectK, major: IrpMajor, dev: *const DeviceObject, i
     }
 }
 
-fn bypasses_started_guard(major: IrpMajor, minor: IrpMinor) -> bool {
-    matches!(major, IrpMajor::Pnp) &&
-    matches!(minor, IrpMinor::Start | IrpMinor::Stop | IrpMinor::Remove)
+fn allowed_in_state(state: DeviceState, major: IrpMajor, minor: IrpMinor) -> bool {
+    match (major, minor) {
+        (IrpMajor::Read, _) | (IrpMajor::Write, _)  => state == DeviceState::Started,
+        (IrpMajor::Pnp,  IrpMinor::Enumerate)
+        | (IrpMajor::Pnp, IrpMinor::Query)          => state == DeviceState::Started,
+        (IrpMajor::Pnp,  IrpMinor::Start)           => state == DeviceState::Stopped,
+        (IrpMajor::Pnp,  IrpMinor::Stop)            => state == DeviceState::Stopping,
+        (IrpMajor::Pnp,  IrpMinor::Remove)          => state == DeviceState::Removing,
+        (IrpMajor::Pnp,  IrpMinor::None)            => false,
+    }
 }
 
 pub fn io_request_sync(
@@ -229,7 +245,7 @@ pub fn io_request_sync(
     buffer: MemoryRegion,
     offset: usize
 ) -> Result<IrpResult, KError> {
-    if !bypasses_started_guard(major, minor) && !dev.is_started() {
+    if !allowed_in_state(dev.state(), major, minor) {
         return Err(KError::DeviceStopped);
     }
     let driver = dev.driver.as_ref().ok_or(KError::Unsupported)?;
@@ -269,7 +285,7 @@ pub fn io_request_async(
     routine: extern "C" fn(*const IrpResult, *mut c_void),
     ctx: *mut c_void
 ) -> Result<Status, KError> {
-    if !bypasses_started_guard(major, minor) && !dev.is_started() {
+    if !allowed_in_state(dev.state(), major, minor) {
         return Err(KError::DeviceStopped);
     }
     let driver = dev.driver.as_ref().ok_or(KError::Unsupported)?;
@@ -460,19 +476,25 @@ pub fn cancel_pending_irp(dev: &DeviceHandleK) {
     } 
 }
 
-// Tear down a device subtree: remove children first, stop self, dispatch Remove
-// then detach and drop the device object.
+// Tear down a device subtree. 
 pub fn remove_device(dev: &DeviceObjectK) {
+    let _g = dev.config_guard();
+
     for cid in dev.children_snapshot() {
         if let Some(child) = get_device(cid) {
             remove_device(&child);
         }
     }
 
-    {
-        let _g = dev.config_guard();
-        dev.stop_self();
+    dev.stop_self();
+
+    let cur = dev.state();
+    if cur != DeviceState::Removing && cur != DeviceState::Removed {
+        dev.set_state(DeviceState::Removing);
         let _ = io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Remove, EMPTY_REGION, 0);
+        dev.set_state(DeviceState::Removed);
+    } else {
+        return;
     }
 
     if let Some(pid) = dev.parent_id() {

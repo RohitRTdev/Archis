@@ -170,7 +170,7 @@ extern "C" fn test1_cancel(_dev: *const DeviceObject, irp: *mut Irp) {
 fn read_worker() -> ! {
     // Sleep long enough that cancellation tests have time to fire before
     // the worker would otherwise complete the IRP normally.
-    unsafe { kernel_intf::delay_ms_ffi(1500); }
+    //unsafe { kernel_intf::delay_ms_ffi(1500); }
 
     let irp = PENDING_IRP.swap(core::ptr::null_mut(), Ordering::AcqRel);
     if !irp.is_null() {

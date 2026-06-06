@@ -20,6 +20,8 @@ mod io;
 mod acpica;
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::AtomicUsize;
+use io::DeviceHandleK;
 
 use kernel_intf::{info, debug};
 use common::*;
@@ -38,7 +40,8 @@ use cpu::install_interrupt_handler;
 use hal::read_port_u8;
 use mem::Regions::*;
 use mem::FixedList;
-use kernel_intf::driver::{IrpMajor, IrpMinor, IrpResult, create_device_by_id};
+use kernel_intf::driver::{IrpMajor, IrpMinor, IrpResult, Status, create_device_by_id};
+use kernel_intf::KError;
 use kernel_intf::list::{List, DynList};
 use sched::KThread;
 use sync::KSem;
@@ -199,8 +202,8 @@ fn task_kill_cancel_runner() -> ! {
 
     // If kill_thread fired during the wait, kill_sweep_irps cancelled the
     // IRP, the driver's cancel routine completed it, and the event was
-    // signalled with status=Cancelled. The thread won't make it here in
-    // practice (it's already TERMINATED).
+    // signalled with status cancelled. The thread won't make it here in
+    // practice (it's already terminated).
     info!("task_kill_cancel_runner: read returned (post-cancel)");
     loop { sched::delay_ms(1000); }
 }
@@ -272,6 +275,177 @@ fn run_cancel_tests() {
     info!("cancel test (c): PASSED");
 }
 
+static STATE_TEST_DEV: Once<DeviceHandleK> = Once::new();
+static STATE_TEST_RUN: AtomicBool = AtomicBool::new(false);
+static REJECTED_DURING_STOPPED: AtomicUsize = AtomicUsize::new(0);
+static SUCCESS_AFTER_START: AtomicUsize = AtomicUsize::new(0);
+static REJECTED_AFTER_REMOVE: AtomicUsize = AtomicUsize::new(0);
+
+fn state_test_handle() -> DeviceHandleK {
+    STATE_TEST_DEV.get().expect("state test device handle not initialised").clone()
+}
+
+// Bash on the device with reads while STATE_TEST_RUN; tally rejections.
+fn state_reject_loop() -> ! {
+    let dev = state_test_handle();
+    while STATE_TEST_RUN.load(Ordering::Acquire) {
+        let res = dev.read(io::ReadRequest {
+            buffer: MemoryRegion { base_address: 0, size: 0 },
+            offset: 0,
+        });
+        if let Err(KError::DeviceStopped) = res {
+            REJECTED_DURING_STOPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        sched::delay_ms(10);
+    }
+    sched::exit_thread();
+}
+
+fn state_start_once() -> ! {
+    let dev = state_test_handle();
+    let r = dev.start();
+    info!("state_start_once (tid={}): start -> {:?}",
+          sched::get_current_task_id().unwrap_or(0),
+          r.map(|s| s as isize));
+    sched::exit_thread();
+}
+
+fn state_write_once() -> ! {
+    let dev = state_test_handle();
+    let res = dev.write(io::ReadRequest {
+        buffer: MemoryRegion { base_address: 0, size: 0 },
+        offset: 0,
+    });
+    if let Ok(Status::Success) = res {
+        SUCCESS_AFTER_START.fetch_add(1, Ordering::Relaxed);
+    }
+    info!("state_write_once (tid={}): write -> {:?}",
+          sched::get_current_task_id().unwrap_or(0),
+          res.map(|s| s as isize));
+    sched::exit_thread();
+}
+
+fn state_post_remove_read() -> ! {
+    let dev = state_test_handle();
+    let res = dev.read(io::ReadRequest {
+        buffer: MemoryRegion { base_address: 0, size: 0 },
+        offset: 0,
+    });
+    if let Err(KError::DeviceStopped) = res {
+        REJECTED_AFTER_REMOVE.fetch_add(1, Ordering::Relaxed);
+    }
+    info!("state_post_remove_read: read -> {:?}", res.map(|s| s as isize));
+    sched::exit_thread();
+}
+
+fn run_state_tests() {
+    info!("=== run_state_tests: BEGIN ===");
+
+    let dev = match io::open_device_handle("test1") {
+        Ok(h) => h,
+        Err(_) => {
+            info!("run_state_tests: SKIP — test1 device missing");
+            return;
+        }
+    };
+    STATE_TEST_DEV.call_once(|| dev.clone());
+    let dev_id = dev.id();
+
+    // Phase 1 — Started baseline.
+    let baseline = dev.write(io::ReadRequest {
+        buffer: MemoryRegion { base_address: 0, size: 0 },
+        offset: 0,
+    });
+    info!("state phase 1 (Started baseline): write -> {:?}", baseline.map(|s| s as isize));
+    assert!(matches!(baseline, Ok(Status::Success)),
+            "baseline write on Started device must succeed");
+
+    // Phase 2 — Stop + concurrent rejected I/O.
+    STATE_TEST_RUN.store(true, Ordering::Release);
+    REJECTED_DURING_STOPPED.store(0, Ordering::Relaxed);
+    for _ in 0..3 {
+        sched::create_thread(state_reject_loop).expect("Failed to spawn state_reject_loop");
+    }
+    sched::delay_ms(50);                // let the readers start spinning
+    info!("state phase 2: stopping device");
+    dev.stop().expect("stop must succeed");
+    sched::delay_ms(300);
+    STATE_TEST_RUN.store(false, Ordering::Release);
+    sched::delay_ms(100);               // let the reject loops exit
+    let rejected = REJECTED_DURING_STOPPED.load(Ordering::Relaxed);
+    info!("state phase 2: rejected_during_stopped = {}", rejected);
+    assert!(rejected > 0, "reads issued after stop must be rejected");
+
+    // Phase 3 — Concurrent starts. Three threads attempt Start; serialized by
+    // config_guard, exactly one wins (state == Stopped); the others see Started
+    // and bail with DeviceStopped.
+    for _ in 0..3 {
+        sched::create_thread(state_start_once).expect("Failed to spawn state_start_once");
+    }
+    sched::delay_ms(300);
+    let post_start_write = dev.write(io::ReadRequest {
+        buffer: MemoryRegion { base_address: 0, size: 0 },
+        offset: 0,
+    });
+    info!("state phase 3: post-start sanity write -> {:?}", post_start_write.map(|s| s as isize));
+    assert!(matches!(post_start_write, Ok(Status::Success)),
+            "device must be Started after concurrent start attempts");
+
+    // Phase 4 — Concurrent writes from multiple threads (state must pass them
+    // all through the Started guard).
+    SUCCESS_AFTER_START.store(0, Ordering::Relaxed);
+    for _ in 0..3 {
+        sched::create_thread(state_write_once).expect("Failed to spawn state_write_once");
+    }
+    sched::delay_ms(300);
+    let succ = SUCCESS_AFTER_START.load(Ordering::Relaxed);
+    info!("state phase 4: success_after_start = {}", succ);
+    assert!(succ > 0, "at least one concurrent write after restart must succeed");
+
+    // Phase 5 — Remove + post-remove rejection.
+    info!("state phase 5: removing device {}", dev_id);
+    io::remove_device_async(dev_id);
+    io::pnp_fence();                    // wait until the worker finishes the removal
+    REJECTED_AFTER_REMOVE.store(0, Ordering::Relaxed);
+    for _ in 0..3 {
+        sched::create_thread(state_post_remove_read).expect("Failed to spawn state_post_remove_read");
+    }
+    sched::delay_ms(300);
+    let post_rm = REJECTED_AFTER_REMOVE.load(Ordering::Relaxed);
+    info!("state phase 5: rejected_after_remove = {}", post_rm);
+    assert!(post_rm == 3, "every read on a Removed device must be rejected");
+
+    let post_remove_start = dev.start();
+    info!("state phase 5: post-remove start -> {:?}", post_remove_start.map(|s| s as isize));
+    assert!(matches!(post_remove_start, Err(KError::DeviceStopped)),
+            "Removed device must not be restartable");
+
+    info!("=== run_state_tests: PASSED ===");
+}
+
+// === PnP fence test ===
+fn run_fence_tests() {
+    info!("=== run_fence_tests: BEGIN ===");
+
+    // Batch 1: post 4 register_driver calls, then fence.
+    for _ in 0..4 {
+        io::register_driver("test1".into());
+    }
+    info!("fence test: posted batch 1 (4x register_driver test1), entering fence");
+    io::pnp_fence();
+    info!("fence test: batch 1 fence returned");
+
+    // Batch 2: post 3 more, then fence.
+    for _ in 0..3 {
+        io::register_driver("test2".into());
+    }
+    info!("fence test: posted batch 2 (3x register_driver test2), entering fence");
+    io::pnp_fence();
+    info!("fence test: batch 2 fence returned");
+
+    info!("=== run_fence_tests: PASSED ===");
+}
+
 fn interative_thread_spawn_tests() {
     KEYBOARD_EVENT.call_once(|| {
         KEvent::new(true)
@@ -335,7 +509,8 @@ fn kern_main() -> ! {
     loader::init();
     io::init();
 
-    run_cancel_tests();
+    run_fence_tests();
+    run_state_tests();
 
     loop {
         sched::delay_ms(1000);

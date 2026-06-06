@@ -126,8 +126,6 @@ impl Process {
             }
         }
 
-        info!("Remove thread called with id {}", thread_id);
-
         unsafe {
             if let Some(killed_thread) = killed_thread {
                 self.threads.remove_node(killed_thread);

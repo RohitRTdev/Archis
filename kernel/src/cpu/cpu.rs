@@ -125,7 +125,6 @@ impl Stack {
             return;
         }
 
-        info!("Destroying stack with alloc_base={:#X} and base={:#X}", self.get_alloc_base(), self.get_stack_base());
         deallocate_memory(self.get_stack_top() as *mut u8,
         Layout::from_size_align(self.stack_size, PAGE_SIZE).unwrap(),
         PageDescriptor::VIRTUAL)
