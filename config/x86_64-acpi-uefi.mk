@@ -11,7 +11,7 @@ DRIVER_LINKER_SCRIPT = kernel/config/x86_64/driver_linker.ld
 OUTPUT_IMAGE = $(OUTPUT_DIR)/archis_os.iso
 PLATFORM = acpi
 BOOTLOADER = uefi
-KERNEL_OPTIONS = --features acpi,stack_down,debug-scheduler-logs,debug-mem-logs
+KERNEL_OPTIONS = --features acpi,stack_down,debug-io-logs
 BLR_OPTIONS = --features acpi
 
 ifeq ($(OS),Windows_NT)

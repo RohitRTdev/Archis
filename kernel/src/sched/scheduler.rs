@@ -15,7 +15,7 @@ use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores,
 use crate::hal::{self, IPIRequestType, create_kernel_context, disable_scheduler_timer, enable_scheduler_timer, fetch_context, get_per_cpu_base, get_per_cpu_data, get_per_cpu_kernel_base, set_per_cpu_base, set_per_cpu_data, switch_context};
 use crate::mem::{VCB, get_kernel_addr_space, set_address_space};
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
-use crate::io;
+use crate::{io, sched_log};
 use crate::io::{IrpPtr, deallocate_irp};
 use crate::sync::{KSem, KSemInnerType, Spinlock};
 use kernel_intf::mem::PoolAllocatorGlobal;
@@ -81,10 +81,10 @@ impl Task {
         let id = TASK_ID.fetch_add(1, Ordering::Relaxed);  
 
         if alloc_stack {
-            info!("Creating task with ID:{} and stack_addr={:#X} on core {}", id, stack.as_ref().unwrap().get_stack_base(), core);
+            crate::sched_log!("Creating task with ID:{} and stack_addr={:#X} on core {}", id, stack.as_ref().unwrap().get_stack_base(), core);
         } 
         else {
-            info!("Creating task with ID:{}", id);
+            crate::sched_log!("Creating task with ID:{}", id);
         }
 
         let task = Arc::new_in(Spinlock::new(Task {

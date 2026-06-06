@@ -309,8 +309,7 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
 
         println!("cargo:rerun-if-changed={}", stub_path.display());
 
-        let driver_conf_path =
-            driver_dir.join("driver.conf");
+        let driver_conf_path = driver_dir.join("driver.conf");
 
         if !driver_conf_path.exists() {
             continue;
@@ -321,12 +320,10 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
             driver_conf_path.display()
         );
 
-        let driver_conf =
-            fs::read_to_string(&driver_conf_path)
-                .map_err(|e| e.to_string())?;
+        let driver_conf = fs::read_to_string(&driver_conf_path)
+        .map_err(|e| e.to_string())?;
 
-        let imports =
-            parse_section(&driver_conf, "imports");
+        let imports = parse_section(&driver_conf, "imports");
 
         let driver_name = driver_dir
             .file_name()

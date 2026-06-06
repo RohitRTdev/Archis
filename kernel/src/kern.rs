@@ -510,9 +510,10 @@ fn kern_main() -> ! {
     loader::init();
     io::init();
 
-    interative_thread_spawn_tests();
+    //interative_thread_spawn_tests();
     //run_fence_tests();
     //run_state_tests();
+    run_i8042_tests();
 
     loop {
         sched::delay_ms(1000);
@@ -520,6 +521,80 @@ fn kern_main() -> ! {
     }
 
     //hal::sleep();
+}
+
+// The driver satisfies read IRPs only when the requested number of characters
+// has accumulated in the interrupt-driven ring buffer.  These tests therefore
+// block until the user presses enough keys on the physical (or QEMU) keyboard.
+//
+// Test layout:
+//   1. Single-threaded read: request 3 characters (main thread blocks).
+//   2. Three concurrent readers requesting 2, 4, and 1 character respectively.
+//      All are queued as pending IRPs; the ISR satisfies them as keys arrive.
+
+fn run_i8042_tests() {
+    // Give the PnP worker time to bring the i8042 device to Started state.
+    sched::delay_ms(500);
+
+    let handle = match io::open_device_handle("ps/2_port0") {
+        Ok(h) => h,
+        Err(_) => {
+            info!("i8042 test: device ps/2_port0 not found, skipping");
+            return;
+        }
+    };
+
+    // Test 1: single reader, 3 characters 
+    info!("i8042 test 1: press 3 keys to satisfy single read...");
+    let mut buf1 = [0u8; 3];
+    let _ = handle.read(io::ReadRequest {
+        buffer: MemoryRegion { base_address: buf1.as_mut_ptr() as usize, size: 3 },
+        offset: 0,
+    });
+    info!("i8042 test 1: got chars: {:?}", core::str::from_utf8(&buf1).unwrap_or("?"));
+
+    // Test 2: three concurrent readers 
+    // Each reader opens its own handle and issues a read of a specific length.
+    info!("i8042 test 2: spawning 3 concurrent readers (need 2+4+1 = 7 more keys)...");
+    sched::create_thread(i8042_reader_a).expect("i8042: spawn reader-a");
+    sched::create_thread(i8042_reader_b).expect("i8042: spawn reader-b");
+    sched::create_thread(i8042_reader_c).expect("i8042: spawn reader-c");
+}
+
+fn i8042_reader_a() -> ! {
+    let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-a: no device");
+    let mut buf = [0u8; 2];
+    info!("i8042 reader-a: waiting for 2 chars");
+    let _ = h.read(io::ReadRequest {
+        buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 2 },
+        offset: 0,
+    });
+    info!("i8042 reader-a: got chars: {:?}", core::str::from_utf8(&buf).unwrap_or("?"));
+    sched::exit_thread()
+}
+
+fn i8042_reader_b() -> ! {
+    let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-b: no device");
+    let mut buf = [0u8; 4];
+    info!("i8042 reader-b: waiting for 4 chars");
+    let _ = h.read(io::ReadRequest {
+        buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 4 },
+        offset: 0,
+    });
+    info!("i8042 reader-b: got chars: {:?}", core::str::from_utf8(&buf).unwrap_or("?"));
+    sched::exit_thread()
+}
+
+fn i8042_reader_c() -> ! {
+    let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-c: no device");
+    let mut buf = [0u8; 1];
+    info!("i8042 reader-c: waiting for 1 char");
+    let _ = h.read(io::ReadRequest {
+        buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 1 },
+        offset: 0,
+    });
+    info!("i8042 reader-c: got char: {:?}", core::str::from_utf8(&buf).unwrap_or("?"));
+    sched::exit_thread()
 }
 
 // This will be called from the entry point for the corresponding arch

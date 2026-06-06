@@ -1,0 +1,13 @@
+[package]
+name = "i8042"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+common.workspace = true
+kernel_intf.workspace = true
+kmod.workspace = true

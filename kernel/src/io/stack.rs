@@ -142,7 +142,7 @@ fn read_file_to_string(path: &str) -> Option<String> {
 }
 
 fn push_descriptor(out: &mut Vec<Arc<DeviceStackDescriptor>>, match_id: String, driver_names: Vec<String>) {
-    if out.iter().any(|d| d.match_id == match_id) {
+    if out.iter().any(|d| d.match_id != ROOT_ID && d.match_id == match_id) {
         panic!("boot.conf: duplicate device stack id '{}' (a PDO must belong to at most one stack)", match_id);
     }
     out.push(Arc::new(DeviceStackDescriptor { match_id, driver_names }));

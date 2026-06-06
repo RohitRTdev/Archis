@@ -146,5 +146,11 @@ unsafe extern "C" {
     pub fn create_kernel_thread(handler: fn() -> !) -> KError;
     pub fn exit_kernel_thread() -> !;
     pub fn delay_ms_ffi(value: usize);
+    pub fn install_interrupt_handler_ffi(
+        irq: usize,
+        handler: extern "C" fn(usize),
+        active_high: bool,
+        is_edge_triggered: bool,
+    );
 }
 

@@ -9,10 +9,11 @@ use arch::*;
 
 pub const KERNEL_FILE: &str = "/sys/aris";
 
-pub const ROOT_FILES: [&str; 4] = [
+pub const ROOT_FILES: [&str; 5] = [
     KERNEL_FILE,
     "/sys/drivers/libtest1.so",
     "/sys/drivers/libtest2.so",
+    "/sys/drivers/libi8042.so",
     "/sys/drivers/boot.conf"
 ];
 
