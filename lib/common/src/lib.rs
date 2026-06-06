@@ -11,9 +11,9 @@ pub mod madt;
 pub const PAGE_SIZE: usize = 4096;
 pub const MAX_DESCRIPTORS: usize = 200;
 
-pub struct FileDescriptor<'a> {
-    pub contents: &'a[u8],
-    pub name: &'a str
+pub struct FileDescriptor {
+    pub contents: &'static [u8],
+    pub name: &'static str
 }
 
 #[repr(C)]

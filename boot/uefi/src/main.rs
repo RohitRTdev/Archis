@@ -16,7 +16,7 @@ use core::panic::PanicInfo;
 
 use core::alloc::Layout;
 use uefi::{Identify, proto::media::fs::SimpleFileSystem};
-use blr::{KERNEL_FILE, ROOT_FILES, load_kernel, jump_to_kernel};
+use blr::{KERNEL_FILE, INITFS_CONF, load_kernel, jump_to_kernel};
 
 extern crate alloc;
 
@@ -123,7 +123,7 @@ fn main() -> Status {
     let supported_handles = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&SimpleFileSystem::GUID)).expect("Unable to locate partitions with fat32 fs");
 
     let root_partition = loader::list_fs(&supported_handles);
-    let file_table = loader::load_init_fs(root_partition, ROOT_FILES.as_slice());
+    let file_table = loader::load_init_fs(root_partition, INITFS_CONF);
     
     let kernel_data = file_table.fetch_file_data(KERNEL_FILE).unwrap();
     let kern_info  = load_kernel(kernel_data.as_ptr());

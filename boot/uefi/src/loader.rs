@@ -1,14 +1,16 @@
 extern crate alloc;
 
-use core::alloc::Layout;
 use core::ptr::copy_nonoverlapping;
-
+use core::alloc::Layout;
+use core::str::from_utf8;
 use alloc::format;
+use blr::{INITFS_CONF, KERNEL_FILE};
 use log::info;
 use alloc::vec;
 use alloc::{string::String, vec::Vec};
+use alloc::borrow::ToOwned;
 use uefi::proto::device_path::text::{AllowShortcuts, DisplayOnly};
-use uefi::proto::media::file::{File, FileAttribute, RegularFile};
+use uefi::proto::media::file::{Directory, File, FileAttribute, RegularFile};
 use uefi::{boot, CString16, Char16, Handle};
 use uefi::boot::{ScopedProtocol, HandleBuffer};
 use uefi::proto::{device_path::{DevicePath, media::{self,HardDrive}}, media::{file::FileMode, fs::SimpleFileSystem}};
@@ -18,13 +20,13 @@ use crate::loader_alloc;
 const ROOT_GUID: &str = "9ffd2959-915c-479f-8787-1f9f701e1034";  
 
 
-pub struct FileTable<'a> {
-    pub descriptors: &'a mut[FileDescriptor<'a>],
+pub struct FileTable {
+    pub descriptors: &'static mut [FileDescriptor],
     capacity: usize,
     pub length: usize
 }
 
-impl<'a> FileTable<'a> {
+impl FileTable {
     fn new() -> Self {
         // Let's start with a backing memory of 1 page size
         // We're not simply creating a vector here as we need precise control over alignment of memory
@@ -111,37 +113,60 @@ pub fn list_fs(supported_handles: &HandleBuffer) -> &Handle {
     root_partition.unwrap()
 }
 
-pub fn load_init_fs<'a>(root: &Handle, files: &[&str]) -> FileTable<'a> {
+fn parse_initfs_conf(init_conf: &str) -> Vec<String> {
+    let mut list: Vec<String> = init_conf
+        .split("\n")
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+        .collect();
+    info!("Found {} entries in {}", list.len(), INITFS_CONF);
+    list.insert(0, KERNEL_FILE.to_owned());
+
+    list
+}
+
+fn read_file(dir: &mut Directory, filename: &str) -> Vec<u8> {
+    let tmp_name = filename.strip_prefix('/');
+    let filename_new = if tmp_name.is_none() {
+        filename
+    }
+    else {
+        tmp_name.unwrap()
+    };
+
+    let mut filename_dos = CString16::try_from(filename_new).unwrap();
+    filename_dos.replace_char(Char16::try_from('/').unwrap(), Char16::try_from('\\').unwrap());
+
+    let file = dir.open(&filename_dos, FileMode::Read, FileAttribute::READ_ONLY).
+    expect(format!("Could not open file={}", filename).as_str());
+    
+    let mut reg_file = file.into_regular_file().unwrap();
+    reg_file.set_position(RegularFile::END_OF_FILE).unwrap();
+    let file_size = reg_file.get_position().unwrap();
+    reg_file.set_position(0).unwrap();
+
+    let mut buf: Vec<u8> = vec![0; file_size as usize];
+    reg_file.read(buf.as_mut_slice()).unwrap();
+
+
+    buf
+}
+
+pub fn load_init_fs(root: &Handle, init_conf: &str) -> FileTable {
     // Load all boot start drivers, font file, kernel elf etc
     let mut boot_fs: ScopedProtocol<SimpleFileSystem> = boot::open_protocol_exclusive(*root).expect("Could not open file protocol on root partition"); 
 
     let mut dir = boot_fs.open_volume().expect("Could not open root partition");
+    let initfs = read_file(&mut dir, init_conf);  
+    let initfs_contents = from_utf8(initfs.as_slice()).expect("Init fs conf not in UTF-8 format!");
+    let files =  parse_initfs_conf(initfs_contents); 
+
     let mut map = FileTable::new();
     for filename in files {
-        let tmp_name = filename.strip_prefix('/');
-        let filename_new = if tmp_name.is_none() {
-            filename
-        }
-        else {
-            tmp_name.unwrap()
-        };
-
-        let mut filename_dos = CString16::try_from(filename_new).unwrap();
-        filename_dos.replace_char(Char16::try_from('/').unwrap(), Char16::try_from('\\').unwrap());
-
-        let file = dir.open(&filename_dos, FileMode::Read, FileAttribute::READ_ONLY).
-        expect(format!("Could not open file={}", filename).as_str());
+        let file_contents = read_file(&mut dir, filename.as_str());
         
-        let mut reg_file = file.into_regular_file().unwrap();
-        reg_file.set_position(RegularFile::END_OF_FILE).unwrap();
-        let file_size = reg_file.get_position().unwrap();
-        reg_file.set_position(0).unwrap();
-
-        let mut buf: Vec<u8> = vec![0; file_size as usize];
-        reg_file.read(buf.as_mut_slice()).unwrap();
-
-        info!("Loaded file={} of size={} at location={:#X}", filename, file_size, buf.as_ptr() as usize);
-        map.insert(filename, buf.as_slice());
+        info!("Loaded file={} of size={} at location={:#X}", filename, file_contents.len(), file_contents.as_ptr().addr());
+        map.insert(filename.as_str(), file_contents.as_slice());
     }
 
     map

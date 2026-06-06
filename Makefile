@@ -69,6 +69,7 @@ build_kernel_template:
 		--target $(KERNEL_TARGET) \
 	)
 	@cp $(KERNEL_EXE) $(OUTPUT_DIR)/aris
+	@cp config/initfs.conf $(OUTPUT_DIR)
 
 build_kernel: $(OUTPUT_DIR)
 	@if [ -f "$(KERN_PLACEHOLDER)" ]; then cargo clean; fi

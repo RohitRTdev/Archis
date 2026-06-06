@@ -2,14 +2,14 @@
 #![feature(allocator_api)]
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_intf::{
     info, debug,
-    Lock,
+    Lock, InterruptHandle,
     create_spinlock, acquire_spinlock, release_spinlock,
     io_complete_irp, io_set_cancel_routine, io_start_processing,
-    install_interrupt_handler_ffi,
+    io_install_interrupt_handler, io_remove_interrupt_handler,
 };
 use kernel_intf::driver::{
     DeviceObject, DriverObject, Irp, IrpMinor, Status, create_device,
@@ -131,13 +131,15 @@ struct PendingEntry {
 }
 
 struct I8042Ctx {
-    lock:        Lock,
-    char_ring:   [u8; CHAR_BUF_SIZE],
-    char_head:   usize,
-    char_tail:   usize,
-    char_len:    usize,
-    pending:     [PendingEntry; MAX_PENDING],
-    pending_len: usize
+    lock:             Lock,
+    char_ring:        [u8; CHAR_BUF_SIZE],
+    char_head:        usize,
+    char_tail:        usize,
+    char_len:         usize,
+    pending:          [PendingEntry; MAX_PENDING],
+    pending_len:      usize,
+    /// Handle returned by io_install_interrupt_handler; used for O(1) removal in do_stop.
+    interrupt_handle: InterruptHandle,
 }
 
 unsafe impl Send for I8042Ctx {}
@@ -146,13 +148,14 @@ unsafe impl Sync for I8042Ctx {}
 impl I8042Ctx {
     const fn zeroed() -> Self {
         Self {
-            lock:        Lock { lock: 0, int_status: false },
-            char_ring:   [0; CHAR_BUF_SIZE],
-            char_head:   0,
-            char_tail:   0,
-            char_len:    0,
-            pending:     [PendingEntry { irp: core::ptr::null_mut(), requested: 0 }; MAX_PENDING],
-            pending_len: 0,
+            lock:             Lock { lock: 0, int_status: false },
+            char_ring:        [0; CHAR_BUF_SIZE],
+            char_head:        0,
+            char_tail:        0,
+            char_len:         0,
+            pending:          [PendingEntry { irp: core::ptr::null_mut(), requested: 0 }; MAX_PENDING],
+            pending_len:      0,
+            interrupt_handle: InterruptHandle { irq: 0, node_ptr: 0 },
         }
     }
 
@@ -186,13 +189,12 @@ impl I8042Ctx {
     }
 }
 
-static DEVICE_PTR: AtomicPtr<DeviceObject> = AtomicPtr::new(core::ptr::null_mut());
 static DEVICE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // We support up to two PS/2 ports
 static DEVICE_NAMES: [&str; 2] = ["ps/2_port0", "ps/2_port1"];
 
-#[kmod::init]
+#[kmod::init(driver)]
 fn driver_init(driver: &mut DriverObject) -> Status {
     info!("{} initializing (id={})...", driver.get_name(), driver.id);
 
@@ -269,11 +271,9 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
         }
     }
 
-    // Publish device pointer so the ISR can find the ctx.
-    DEVICE_PTR.store(device as *const _ as *mut DeviceObject, Ordering::Release);
-
-    // Install keyboard interrupt (IRQ 1, active-high, edge-triggered).
-    unsafe { install_interrupt_handler_ffi(1, keyboard_isr, true, true); }
+    ctx.interrupt_handle = unsafe {
+        io_install_interrupt_handler(1, device.ctx, keyboard_isr, true, true)
+    };
 
     request.complete_irp(Status::Success);
     Status::Success
@@ -283,6 +283,9 @@ fn do_stop(device: &DeviceObject, request: &mut Irp) -> Status {
     info!("i8042: stop '{}'", device.get_name().unwrap_or("?"));
 
     let ctx = unsafe { &mut *(device.ctx as *mut I8042Ctx) };
+
+    // Remove the interrupt handler first so no new chars arrive after this point.
+    unsafe { io_remove_interrupt_handler(ctx.interrupt_handle); }
 
     // Collect all pending IRPs under the lock, clear the list.
     let mut to_fail = [core::ptr::null_mut::<Irp>(); MAX_PENDING];
@@ -294,8 +297,6 @@ fn do_stop(device: &DeviceObject, request: &mut Irp) -> Status {
         to_fail[i] = ctx.pending[i].irp;
     }
     ctx.pending_len = 0;
-    // Prevent the ISR from touching a stopped device.
-    DEVICE_PTR.store(core::ptr::null_mut(), Ordering::Release);
     unsafe { release_spinlock(&mut ctx.lock); }
 
     // Fail all queued IRPs outside the lock (device stopping, not user cancellation).
@@ -385,36 +386,51 @@ extern "C" fn i8042_cancel(dev: *const DeviceObject, irp: *mut Irp) {
     unsafe { io_complete_irp(irp, Status::Cancelled); }
 }
 
-// Keyboard ISR (extern "C", bare fn pointer) 
+// Keyboard ISR
+//
+// Called from the interrupt dispatcher with the I8042Ctx pointer we supplied
+// at install time. Returns true to claim IRQ 1.
+//
+// Locking: ctx.lock disables interrupts when held, preventing re-entry on
+// single-CPU systems. On SMP it serialises with dispatch_read and i8042_cancel.
 
-extern "C" fn keyboard_isr(_vector: usize) {
+extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         let scancode = unsafe { inb(PORT_DATA) };
 
-        // Bit 7 set = key-release; ignore it.
+        // Bit 7 set = key-release event; claim but ignore.
         if scancode & 0x80 != 0 {
-            return;
+            return true;
         }
 
         let idx = scancode as usize;
         if idx >= SCANCODE_MAP.len() {
-            return;
+            return true;
         }
         let ch = SCANCODE_MAP[idx];
         if ch == 0 {
-            return; // modifier or unmapped key
+            return true; // modifier or unmapped key
         }
 
-        // Reach the per-device ctx through the global device pointer.
-        let dev = DEVICE_PTR.load(Ordering::Acquire);
-        if dev.is_null() {
-            return;
+        // ── TTY echo (canonical mode) ─────────────────────────────────────────
+        // Echo each printable keystroke to the screen immediately, before the
+        // character is buffered or any pending IRP is satisfied.
+        //   Backspace → erase the previous glyph (BS SP BS).
+        //   Enter     → CR+LF so the cursor moves to the next line's start.
+        //   Everything else → echo verbatim.
+        if ch == 0x08 {
+            kernel_intf::print!("\x08 \x08");
+        } else if ch == b'\n' {
+            kernel_intf::print!("\r\n");
+        } else {
+            kernel_intf::print!("{}", ch as char);
         }
-        let ctx = unsafe { &mut *((*dev).ctx as *mut I8042Ctx) };
 
-        // collect satisfiable IRPs under the lock 
-        let mut collected = [core::ptr::null_mut::<Irp>(); MAX_PENDING];
+        let ctx = unsafe { &mut *(ctx_ptr as *mut I8042Ctx) };
+
+        // Collect satisfiable IRPs under the lock.
+        let mut collected     = [core::ptr::null_mut::<Irp>(); MAX_PENDING];
         let mut collected_len = 0;
 
         unsafe { acquire_spinlock(&mut ctx.lock); }
@@ -428,7 +444,7 @@ extern "C" fn keyboard_isr(_vector: usize) {
                 let dst = unsafe { (*entry.irp).buffer.base_address as *mut u8 };
                 unsafe { ctx.dequeue_into(dst, entry.requested); }
                 unsafe { (*entry.irp).bytes_completed = entry.requested; }
-                // Swap-remove from pending list.
+                // Swap-remove: constant-time list shrink.
                 ctx.pending[i] = ctx.pending[ctx.pending_len - 1];
                 ctx.pending_len -= 1;
                 collected[collected_len] = entry.irp;
@@ -440,7 +456,7 @@ extern "C" fn keyboard_isr(_vector: usize) {
 
         unsafe { release_spinlock(&mut ctx.lock); }
 
-        // complete collected IRPs outside the lock
+        // Complete collected IRPs outside the lock.
         // io_start_processing atomically claims each IRP (prevents cancel from
         // firing after this point). If cancel already won, it returns false and
         // the IRP has been completed by the cancel path; we just move on.
@@ -451,4 +467,6 @@ extern "C" fn keyboard_isr(_vector: usize) {
             }
         }
     }
+
+    true // always claim IRQ 1 — we are the sole PS/2 keyboard handler
 }

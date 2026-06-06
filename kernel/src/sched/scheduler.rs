@@ -1,6 +1,5 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::collections::BTreeMap;
 use common::{MemoryRegion, PAGE_SIZE};
@@ -15,9 +14,8 @@ use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores,
 use crate::hal::{self, IPIRequestType, create_kernel_context, disable_scheduler_timer, enable_scheduler_timer, fetch_context, get_per_cpu_base, get_per_cpu_data, get_per_cpu_kernel_base, set_per_cpu_base, set_per_cpu_data, switch_context};
 use crate::mem::{VCB, get_kernel_addr_space, set_address_space};
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
-use crate::{io, sched_log};
-use crate::io::{IrpPtr, deallocate_irp};
 use crate::sync::{KSem, KSemInnerType, Spinlock};
+use crate::io::{self, IrpPtr, deallocate_irp};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::list::{List, ListNode, DynList};
 use kernel_intf::driver::{DeviceObject, Irp, IrpMajor, IrpMinor, IrpResult, Status};
@@ -598,7 +596,7 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
 extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
     disable_preemption();
     let status = unsafe { (*irp).status };
-    info!("io_complete: status_code {} on irp {} by thread {}", status as isize, irp.addr(), unsafe{(*irp).thread_id});
+    crate::io_log!("io_complete: status_code {} on irp {:#X} by thread {}", status as isize, irp.addr(), unsafe{(*irp).thread_id});
     let ctx_ptr = ctx as *mut AsyncCtx;
     let ctx = unsafe { &mut *ctx_ptr };
 

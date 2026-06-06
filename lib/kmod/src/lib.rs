@@ -5,37 +5,89 @@ use syn::parse::{Parse, ParseStream};
 
 #[proc_macro_attribute]
 pub fn init(
-    _attr: TokenStream,
+    attr: TokenStream,
     item: TokenStream,
 ) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
 
-    if func.sig.ident != "driver_init" {
-        return syn::Error::new_spanned(
-            &func.sig.ident,
-            "Expected module init fn: driver_init",
-        )
-        .to_compile_error()
-        .into(); 
-    }
+    let is_driver = if attr.is_empty() {
+        false
+    } else {
+        let ident = parse_macro_input!(attr as syn::Ident);
+
+        if ident != "driver" {
+            return syn::Error::new_spanned(
+                ident,
+                "expected `driver`",
+            )
+            .to_compile_error()
+            .into();
+        }
+
+        true
+    };
 
     let ident = &func.sig.ident;
 
+    let entry = if is_driver {
+        quote! {
+            mod import_stub;
+            use import_stub::*;
+
+            #[unsafe(no_mangle)]
+            extern "C" fn module_init() {}
+
+            #[unsafe(no_mangle)]
+            extern "C" fn shim_driver_init(
+                driver: *mut kernel_intf::driver::DriverObject
+            ) -> kernel_intf::driver::Status {
+                let obj = unsafe { &mut *driver };
+                #ident(obj)
+            }
+        }
+    } else {
+        quote! {
+            #[unsafe(no_mangle)]
+            extern "C" fn module_init() {
+                #ident()
+            }
+        }
+    };
+
     quote! {
         extern crate alloc;
+
         static MODULE_NAME_STR: &'static str = env!("CARGO_PKG_NAME");
 
         #[cfg(not(test))]
         #[panic_handler]
-        fn panic(info: &core::panic::PanicInfo) -> ! {
-            let message = info.message().as_str().or(Some("Panicking!")).unwrap();
-            let mod_name = common::StrRef::from_str(MODULE_NAME_STR);
-            let message_ref = common::StrRef::from_str(message);
-            unsafe {kernel_intf::panic_router(mod_name, message_ref)}
+        fn panic(
+            info: &core::panic::PanicInfo
+        ) -> ! {
+            let message = info
+                .message()
+                .as_str()
+                .or(Some("Panicking!"))
+                .unwrap();
+
+            let mod_name =
+                common::StrRef::from_str(MODULE_NAME_STR);
+
+            let message_ref =
+                common::StrRef::from_str(message);
+
+            unsafe {
+                kernel_intf::panic_router(
+                    mod_name,
+                    message_ref,
+                )
+            }
         }
 
         #[unsafe(no_mangle)]
-        extern "C" fn module_config() -> common::StrRef {
+        extern "C" fn module_config()
+            -> common::StrRef
+        {
             kernel_intf::init_logger(
                 MODULE_NAME_STR
             );
@@ -47,16 +99,9 @@ pub fn init(
             )
         }
 
-        mod import_stub;
-        use import_stub::*;
-
         #func
 
-        #[unsafe(no_mangle)]
-        extern "C" fn shim_driver_init(driver: *mut kernel_intf::driver::DriverObject) -> kernel_intf::driver::Status {
-            let obj = unsafe { &mut *driver };
-            #ident(obj)
-        }
+        #entry
     }
     .into()
 }

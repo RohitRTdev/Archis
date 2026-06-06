@@ -14,6 +14,7 @@ use crate::mem::{self, MapFetchType, PageDescriptor};
 #[derive(Clone)]
 pub struct ModuleDescriptor {
     pub name: &'static str,
+    pub driver_init_address: Option<usize>,
     pub file_handle: Option<FileInstance>,
     pub info: ModuleInfo,
     // This is here so that the dependencies are not released when this image is loaded
@@ -30,6 +31,7 @@ pub fn early_init() {
     let kernel_total_size = info.kernel_desc.total_size; 
     let mod_cb = ModuleDescriptor {
         name: env!("CARGO_PKG_NAME"),
+        driver_init_address: None,
         file_handle: None,
         info: info.kernel_desc,
         _deps: None

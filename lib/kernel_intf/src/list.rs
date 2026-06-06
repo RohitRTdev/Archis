@@ -150,21 +150,21 @@ impl<T, A: Allocator<ListNode<T>>> List<T, A> {
 
 
     pub fn add_node(&mut self, data: T) -> Result<(), KError> {
-        let size = mem::size_of::<ListNode<T>>();
+        self.add_node_get_handle(data).map(|_| ())
+    }
+
+    pub fn add_node_get_handle(&mut self, data: T) -> Result<NonNull<ListNode<T>>, KError> {
+        let size  = mem::size_of::<ListNode<T>>();
         let align = mem::align_of::<ListNode<T>>();
-        let ptr = A::alloc(Layout::from_size_align(size, align).unwrap())?.as_ptr();
-        let node = NonNull::new(ptr).unwrap();
+        let ptr   = A::alloc(Layout::from_size_align(size, align).unwrap())?.as_ptr();
+        let node  = NonNull::new(ptr).unwrap();
 
         unsafe {
-            ptr.write(ListNode {
-                data,
-                prev: node,
-                next: node
-            });
+            ptr.write(ListNode { data, prev: node, next: node });
         }
 
         self.insert_node_at_tail(node);
-        Ok(())
+        Ok(node)
     }
 
     pub fn get_nodes(&self) -> usize {

@@ -8,15 +8,7 @@ use common::{elf::*, *};
 use arch::*;
 
 pub const KERNEL_FILE: &str = "/sys/aris";
-
-pub const ROOT_FILES: [&str; 5] = [
-    KERNEL_FILE,
-    "/sys/drivers/libtest1.so",
-    "/sys/drivers/libtest2.so",
-    "/sys/drivers/libi8042.so",
-    "/sys/drivers/boot.conf"
-];
-
+pub const INITFS_CONF: &str = "/sys/initfs.conf";
 
 pub unsafe fn jump_to_kernel(boot_info: &BootInfo) -> ! {
     let kern_addr = canonicalize(boot_info.kernel_desc.entry);

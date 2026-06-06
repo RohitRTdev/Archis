@@ -279,7 +279,7 @@ fn build_acpica(out_dir: &Path, target: &str) {
 pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
     let drivers_dir = PathBuf::from(drivers_dir);
 
-    let mut dep_graph: HashMap<String, Vec<String>> = HashMap::new();
+    let mut dep_graph: HashMap<String, (Vec<String>, Vec<String>, Vec<String>)> = HashMap::new();
 
     for entry in fs::read_dir(&drivers_dir)
         .map_err(|e| e.to_string())?
@@ -312,6 +312,7 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
         let driver_conf_path = driver_dir.join("driver.conf");
 
         if !driver_conf_path.exists() {
+            println!("cargo:warning=Can't find driver.conf file for {}", driver_dir.display());
             continue;
         }
 
@@ -324,6 +325,16 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
         let imports = parse_section(&driver_conf, "imports");
+        let description = parse_section(&driver_conf, "description");
+
+        if description.len() < 2 {
+            return Err(format!("driver.conf file for {} has invalid description field!", driver_dir.display())); 
+        }
+
+        let device_stack = parse_section(&driver_conf, "DeviceStack");
+        if description.len() == 0 {
+            return Err(format!("driver.conf file for {} has invalid DeviceStack field!", driver_dir.display())); 
+        }
 
         let driver_name = driver_dir
             .file_name()
@@ -333,13 +344,12 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
 
         dep_graph.insert(
             driver_name.clone(),
-            imports.clone(),
+            (imports.clone(), description, device_stack),
         );
 
         if imports.is_empty() {
             continue;
         }
-
 
         for imported_mod in imports {
             let imported_conf_path = drivers_dir
@@ -418,7 +428,7 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
 
     fn dfs(
         node: &str,
-        graph: &HashMap<String, Vec<String>>,
+        graph: &HashMap<String, (Vec<String>, Vec<String>, Vec<String>)>,
         states: &mut HashMap<String, VisitState>,
         ordering: &mut Vec<String>
     ) -> Result<(), String> {
@@ -449,7 +459,7 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
                 )
             })?;
 
-        for dep in deps {
+        for dep in &deps.0 {
             if !graph.contains_key(dep) {
                 return Err(format!(
                     "Driver '{}' depends on unknown driver '{}'",
@@ -512,6 +522,26 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
         ordering.join("\n"),
     )
     .map_err(|e| e.to_string())?;
+
+    let boot_conf_path = Path::new(&drivers_dir).join("boot.conf");
+
+    // Build the description string
+    // This doesn't do any validation. Any problems will only be flagged at runtime
+    let mut description_contents = String::from("# Automatically generated file\n# Do not modify manually...\n\n");
+    for (_, description, device_stack) in dep_graph.values() {
+        description_contents.push_str("[description]\n");
+        description_contents.push_str(description.join("\n").as_str());
+        description_contents.push_str("\n\n");
+        
+        description_contents.push_str("[DeviceStack]\n");
+        description_contents.push_str(device_stack.join("\n").as_str());
+        description_contents.push_str("\n\n");
+    }
+
+    fs::write(
+        boot_conf_path,
+        description_contents
+    ).map_err(|e| e.to_string())?;
 
     Ok(())
 }

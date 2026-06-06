@@ -1,6 +1,5 @@
 use core::alloc::{Allocator, Layout};
-use core::ptr::NonNull;
-
+use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -33,6 +32,12 @@ pub enum LevelState {
     Started,
     Stopped,
     Failed
+}
+
+struct DriverInformation {
+    name: String,
+    path: String,
+    boot_start: bool
 }
 
 // Immutable template parsed from boot.conf: one per [DeviceStack] block. Tells us
@@ -130,6 +135,7 @@ impl DeviceStack {
 
 static DESCRIPTORS: Once<Spinlock<Vec<Arc<DeviceStackDescriptor>>>> = Once::new();
 static STACK_INSTANCES: Once<Spinlock<Vec<Arc<DeviceStack>>>> = Once::new();
+static DRIVER_INFO_REGISTRY: Spinlock<Vec<DriverInformation>> = Spinlock::new(Vec::new());
 
 fn read_file_to_string(path: &str) -> Option<String> {
     let file = open(path).ok()?;
@@ -153,6 +159,45 @@ fn parse(text: &str) -> Vec<Arc<DeviceStackDescriptor>> {
     let mut cur_id: Option<String> = None;
     let mut cur_drivers: Vec<String> = Vec::new();
     let mut in_block = false;
+    let mut parse_description = true;
+    let mut driver_name = None;
+    let mut driver_path = None;
+    let mut driver_boot_start = false;
+    let mut driver_info_registry = DRIVER_INFO_REGISTRY.lock();
+    let mut driver_names: BTreeSet<String> = BTreeSet::new();
+
+    let reduce_device_stack = |
+        cur_id: &mut Option<String>, 
+        descriptors: &mut Vec<Arc<DeviceStackDescriptor>>,
+        cur_drivers: &mut Vec<String>
+    | {
+        if let Some(id) = cur_id.take() {
+            push_descriptor(descriptors, id, core::mem::take(cur_drivers));
+        }
+    };
+
+    let mut reduce_description = |
+        driver_name: &mut Option<String>,
+        driver_path: &mut Option<String>,
+        driver_boot_start: bool
+    | {
+        if driver_name.is_none() || driver_path.is_none() {
+            panic!("Driver configuration is missing path/name!");
+        }
+
+        let name = driver_name.take().unwrap();
+        if driver_names.contains(&name) {
+            panic!("Duplicate driver name found while parsing boot.conf -> {}", name);
+        }
+
+        driver_info_registry.push(DriverInformation{
+            name: name.clone(),
+            path: driver_path.take().unwrap(),
+            boot_start: driver_boot_start
+        });
+
+        driver_names.insert(name);
+    };
 
     for raw in text.lines() {
         let line = raw.trim();
@@ -161,11 +206,35 @@ fn parse(text: &str) -> Vec<Arc<DeviceStackDescriptor>> {
         }
 
         if line == "[DeviceStack]" {
-            if let Some(id) = cur_id.take() {
-                push_descriptor(&mut descriptors, id, core::mem::take(&mut cur_drivers));
+            if in_block {
+                if !parse_description {
+                    reduce_device_stack(&mut cur_id, &mut descriptors, &mut cur_drivers);
+                }
+                else {
+                    reduce_description(&mut driver_name, &mut driver_path, driver_boot_start);
+                }
             }
+
             cur_drivers.clear();
             in_block = true;
+            parse_description = false;
+            continue;
+        }
+        else if line == "[description]" {
+            if in_block {
+                if !parse_description {
+                    reduce_device_stack(&mut cur_id, &mut descriptors, &mut cur_drivers);
+                }
+                else {
+                    reduce_description(&mut driver_name, &mut driver_path, driver_boot_start);
+                }
+            }
+
+            in_block = true;
+            parse_description = true;
+
+            // If boot_start field is absent we consider default value as false
+            driver_boot_start = false;
             continue;
         }
 
@@ -173,18 +242,53 @@ fn parse(text: &str) -> Vec<Arc<DeviceStackDescriptor>> {
             continue;
         }
 
-        if cur_id.is_none() {
-            cur_id = Some(line.to_string());
-        } else {
-            cur_drivers.push(line.to_string());
+        if parse_description {
+            let segments: Vec<&str> = raw.split("=").map(|e| e.trim()).collect();
+            if segments.len() != 2 {
+                panic!("Invalid field {} found while parsing boot.conf", raw);
+            }
+
+            if segments[0] == "name" {
+                driver_name = Some(segments[1].to_string());
+            }
+            else if segments[0] == "path" {
+                driver_path = Some(segments[1].to_string());
+            }
+            else if segments[0] == "boot_start" {
+                if segments[1] != "true" && segments[1] != "false" {
+                    panic!("Invalid boot_start value while parsing boot.conf -> {}", raw);
+                }
+
+                driver_boot_start = segments[1] == "true";
+            }
+        }
+        else {
+            if cur_id.is_none() {
+                cur_id = Some(line.to_string());
+            } else {
+                cur_drivers.push(line.to_string());
+            }
         }
     }
 
-    if let Some(id) = cur_id.take() {
-        push_descriptor(&mut descriptors, id, cur_drivers);
+    if in_block {
+        if !parse_description {
+            reduce_device_stack(&mut cur_id, &mut descriptors, &mut cur_drivers);
+        }
+        else {
+            reduce_description(&mut driver_name, &mut driver_path, driver_boot_start);
+        }
     }
 
     descriptors
+}
+
+pub fn get_driver_path(name: &str) -> Option<String> {
+    DRIVER_INFO_REGISTRY
+    .lock()
+    .iter()
+    .find(|n| {n.name == name})
+    .map(|n| {n.path.to_string()})
 }
 
 pub fn load_boot_config() {
@@ -201,6 +305,16 @@ pub fn load_boot_config() {
 
     let parsed = parse(&text);
     info!("boot.conf: parsed {} device stack descriptor(s)", parsed.len());
+
+    // Confirm that all boot start drivers can atleast be opened
+    DRIVER_INFO_REGISTRY.lock().iter().for_each(|f| {
+        if f.boot_start {
+            if open(&f.path).is_err() {
+                panic!("Unable to load boot start driver {} at path {}!", f.name, f.path);
+            }
+        }
+    });
+
     for d in parsed.iter() {
         crate::io_log!("  stack id='{}' drivers={:?}", d.match_id, d.driver_names);
     }
@@ -432,7 +546,7 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
                 // Each PDO is the base of its own fresh instance.
                 start_stack_instance(descriptor, pdo.clone(), true);
             }
-            None => info!("PDO {} id '{}' matched no stack", id, match_id)
+            None => { crate::io_log!("PDO {} id '{}' matched no stack", id, match_id); }
         }
     }
 }

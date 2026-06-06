@@ -9,6 +9,15 @@ pub mod driver;
 use core::fmt;
 use common::StrRef;
 
+pub type InterruptRoutine = extern "C" fn(*mut core::ffi::c_void) -> bool;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InterruptHandle {
+    pub irq:      usize,
+    pub node_ptr: usize
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KError {
@@ -18,6 +27,7 @@ pub enum KError {
     ProcessTerminated,
     WaitFailed,
     CircularDependency,
+    ModuleNotDriver,
     DriverLoadFailed,
     Unsupported,
     DeviceStopped
@@ -45,7 +55,7 @@ impl From<KError> for i64 {
             KError::Unsupported => E_NOT_SUPPORTED,
             KError::DeviceStopped => E_DEV_STOPPED,
             KError::ProcessTerminated | KError::WaitFailed |
-            KError::CircularDependency | KError::DriverLoadFailed => E_INTERNAL_FAILURE
+            KError::CircularDependency | KError::DriverLoadFailed | KError::ModuleNotDriver => E_INTERNAL_FAILURE
         }
     }
 }
@@ -61,6 +71,7 @@ impl fmt::Display for KError {
             KError::CircularDependency => "Circular dependency in module load",
             KError::DriverLoadFailed => "Driver load failed",
             KError::Unsupported => "Operation not supported",
+            KError::ModuleNotDriver => "Loaded module is not a driver",
             KError::DeviceStopped => "Device is stopped",
             KError::Success => "Success"
         };
@@ -142,15 +153,17 @@ unsafe extern "C" {
     ); 
     pub fn io_start_processing(irp: *mut driver::Irp) -> bool;
 
-    #[allow(improper_ctypes)]
     pub fn create_kernel_thread(handler: fn() -> !) -> KError;
     pub fn exit_kernel_thread() -> !;
     pub fn delay_ms_ffi(value: usize);
-    pub fn install_interrupt_handler_ffi(
+    pub fn io_install_interrupt_handler(
         irq: usize,
-        handler: extern "C" fn(usize),
+        context: *mut core::ffi::c_void,
+        handler: InterruptRoutine,
         active_high: bool,
         is_edge_triggered: bool,
-    );
+    ) -> InterruptHandle;
+
+    pub fn io_remove_interrupt_handler(handle: InterruptHandle);
 }
 

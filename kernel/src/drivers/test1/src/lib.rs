@@ -22,7 +22,7 @@ struct Test1Device {
 
 static PENDING_IRP: AtomicPtr<Irp> = AtomicPtr::new(core::ptr::null_mut());
 
-#[kmod::init]
+#[kmod::init(driver)]
 fn driver_init(driver: &mut DriverObject) -> Status {
     info!("{} initializing (id={})...", driver.get_name(), driver.id);
 

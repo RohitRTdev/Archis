@@ -348,7 +348,7 @@ fn load_driver(path: &str) -> Result<DriverHandle, KError> {
 
     let (name, entry_addr) = {
         let guard = image.lock();
-        (guard.name, guard.info.entry)
+        (guard.name, guard.driver_init_address)
     };
 
     let mut driver_k = DriverObjectK {
@@ -356,7 +356,11 @@ fn load_driver(path: &str) -> Result<DriverHandle, KError> {
         driver: DriverObject::new(id, StrRef::from_str(name))
     };
 
-    let entry: extern "C" fn(*mut DriverObject) -> Status = unsafe { core::mem::transmute(entry_addr) };
+    if entry_addr.is_none() {
+        return Err(KError::ModuleNotDriver);
+    }
+
+    let entry: extern "C" fn(*mut DriverObject) -> Status = unsafe { core::mem::transmute(entry_addr.unwrap()) };
     if entry(&mut driver_k.driver) == Status::Failed {
         info!("Driver init for {} failed!", path);
         return Err(KError::DriverLoadFailed);
@@ -375,7 +379,8 @@ pub fn load_driver_by_name(name: &str) -> Result<DriverHandle, KError> {
     if let Some(driver) = DRIVER_BY_NAME.lock().get(name) {
         return Ok(driver.clone());
     }
-    let path = format!("/sys/drivers/lib{}.so", name);
+
+    let path = stack::get_driver_path(name).ok_or(KError::InvalidArgument)?;
     let driver = load_driver(&path)?;
     DRIVER_BY_NAME.lock().insert(name.to_string(), driver.clone());
     Ok(driver)

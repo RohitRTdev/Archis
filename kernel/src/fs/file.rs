@@ -71,7 +71,7 @@ pub fn open(file_name: &str) -> Result<FileInstance, KError> {
 
     let entry = init_fs.fs.get(filename)
     .ok_or(KError::InvalidArgument).or_else(|e| {
-        info!("Failed to open file {}", file_name);
+        crate::io_log!("Failed to open file {}", file_name);
         Err(e)
     })?;
     

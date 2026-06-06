@@ -2,7 +2,6 @@
 #![feature(generic_const_exprs)]
 #![feature(likely_unlikely)]
 #![feature(allocator_api)]
-#![feature(box_as_ptr)]
 
 mod infra;
 mod hal;
@@ -454,7 +453,7 @@ fn interative_thread_spawn_tests() {
 
     // Sample invocation to test out interrupt subsystem
     clear_keyboard_output_buffer();
-    install_interrupt_handler(1, key_notifier, true, true);
+    install_interrupt_handler(1, core::ptr::null_mut(), key_notifier, true, true);
     
     sched::create_thread(watchdog).unwrap();
     let spawn_proc = sched::create_process(process_spawn, false).expect("Failed to create second process");
@@ -513,14 +512,15 @@ fn kern_main() -> ! {
     //interative_thread_spawn_tests();
     //run_fence_tests();
     //run_state_tests();
-    run_i8042_tests();
+    //run_i8042_tests();
 
-    loop {
-        sched::delay_ms(1000);
-        info!("Main task looping");
-    }
-
-    //hal::sleep();
+    //loop {
+    //    sched::delay_ms(1000);
+    //    info!("Main task looping");
+    //}
+    info!("Main task going to sleep");
+    info!("====TTY mode====");
+    hal::sleep();
 }
 
 // The driver satisfies read IRPs only when the requested number of characters
@@ -620,7 +620,7 @@ unsafe extern "C" fn kern_start(boot_info: *const BootInfo) -> ! {
 
 static KEYBOARD_EVENT: Once<KEvent> = Once::new();
 
-fn key_notifier(_: usize) {
+extern "C" fn key_notifier(_ctx: *mut core::ffi::c_void) -> bool {
     let stack_base = hal::get_current_stack_base();
     info!("Interrupt stack base = {:#X}", stack_base);
     let avl_memory = mem::get_available_memory();
@@ -635,12 +635,14 @@ fn key_notifier(_: usize) {
         let status = task.lock().get_status();
         info!("Called keyboard handler in task:{} with status: {:?}", id, status);
     }
-    
+
     KEYBOARD_EVENT.get().unwrap().signal();
     clear_keyboard_output_buffer();
 
     // Let the watchdog task know that we're active
     WATCHDOG_MARK.store(true, Ordering::Release);
+
+    true  // claim IRQ 1
 }
 
 static WATCHDOG_MARK: AtomicBool = AtomicBool::new(false);

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# === CONFIGURATION ===
+# CONFIGURATION
 IMG=output/archis_os.iso
 SIZE_MB=200
 EFI_SIZE_MB=100
@@ -44,9 +44,10 @@ install_kernel_image() {
     mkdir -p "$dst_blr/efi/boot"
 
     cp "$src"/drivers/*.so "$dst_kernel/sys/drivers/" || echo "No drivers found..."
-    cp "$src"/drivers/boot.conf "$dst_kernel/sys/drivers/" || echo "boot.conf not found..."
-    cp "$src"/aris "$dst_kernel/sys/" || echo "Kernel not found..."
-    cp "$src"/bootx64.efi "$dst_blr/efi/boot/" || echo "Bootloader not found..."
+    cp "$src/drivers/boot.conf" "$dst_kernel/sys/drivers/" || echo "boot.conf not found..."
+    cp "$src/aris" "$dst_kernel/sys/" || echo "Kernel not found..."
+    cp "$src/initfs.conf" "$dst_kernel/sys/" || echo "InitFS configuration not found..."
+    cp "$src/bootx64.efi" "$dst_blr/efi/boot/" || echo "Bootloader not found..."
 }
 
 # CREATE MOUNTPOINTS

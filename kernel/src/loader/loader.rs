@@ -10,7 +10,7 @@ use core::ptr::copy_nonoverlapping;
 use core::ffi::CStr;
 use common::{PAGE_SIZE, elf::*};
 use common::{ArrayTable, MemoryRegion, ModuleInfo, StrRef};
-use kernel_intf::{KError, info};
+use kernel_intf::{KError, driver, info};
 use crate::KERNEL_PATH;
 use crate::fs::{FileBuffer, open, resolve_symlink};
 use crate::infra::disable_preloader_phase;
@@ -144,10 +144,11 @@ fn load_image_uncached(
     let deps = load_dependencies(&mod_info, is_user, in_progress)?;
     apply_relocations(&mod_info, &deps)?;
 
-    let module_name = configure_module(&mod_info);
+    let (module_name, driver_init_address) = configure_module(&mod_info);
 
     let descriptor = ModuleDescriptor {
         name: module_name,
+        driver_init_address,
         file_handle: Some(file),
         info: mod_info,
         _deps: Some(deps)
@@ -191,10 +192,12 @@ unsafe fn read_cstr<'a>(base: usize, idx: usize) -> &'a str {
     }
 }
 
-fn configure_module(info: &ModuleInfo) -> &'static str {
+fn configure_module(info: &ModuleInfo) -> (&'static str, Option<usize>) {
     const FALLBACK: &str = "[none]";
-    let dyn_tab = match info.dyn_tab { Some(t) => t, None => return FALLBACK };
-    let dyn_str = match info.dyn_str { Some(s) => s, None => return FALLBACK };
+    let mut res_str: &str = FALLBACK;
+    let mut driver_init_addr = None;
+    let dyn_tab = match info.dyn_tab { Some(t) => t, None => return (FALLBACK, None) };
+    let dyn_str = match info.dyn_str { Some(s) => s, None => return (FALLBACK, None) };
 
     let entries = unsafe {
         core::slice::from_raw_parts(
@@ -208,20 +211,24 @@ fn configure_module(info: &ModuleInfo) -> &'static str {
             continue;
         }
         let sym_name = unsafe { read_cstr(dyn_str.base_address, sym.st_name as usize) };
-        if sym_name != "module_config" {
-            continue;
+        if sym_name == "module_config" {
+            let func_addr = info.base + sym.st_value as usize;
+            let func: extern "C" fn() -> StrRef = unsafe { core::mem::transmute(func_addr) };
+            let r = func();
+            if r.ptr.is_null() || r.len == 0 {
+                break;
+            }
+            else {
+                res_str = unsafe { r.as_str() };
+            }
         }
-
-        let func_addr = info.base + sym.st_value as usize;
-        let func: extern "C" fn() -> StrRef = unsafe { core::mem::transmute(func_addr) };
-        let r = func();
-        if r.ptr.is_null() || r.len == 0 {
-            return FALLBACK;
+        else if sym_name == "shim_driver_init" {
+            let func_addr = info.base + sym.st_value as usize;
+            driver_init_addr = Some(func_addr);
         }
-        return unsafe { r.as_str() };
     }
 
-    FALLBACK
+    (res_str, driver_init_addr)
 }
 
 fn resolve_import(name: &str, deps: &[LoadedImage]) -> Option<usize> {

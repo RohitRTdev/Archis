@@ -11,7 +11,7 @@ struct Test2Device {
     _x: u64
 }
 
-#[kmod::init]
+#[kmod::init(driver)]
 fn driver_init(driver: &mut DriverObject) -> Status {
     info!("{} initializing (id={})...", driver.get_name(), driver.id);
 
