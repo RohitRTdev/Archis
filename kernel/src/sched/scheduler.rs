@@ -6,8 +6,10 @@ use crate::mem::{VCB, get_kernel_addr_space, set_address_space};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::list::{List, ListNode, DynList};
 use crate::sync::{KSem, KSemInnerType, Spinlock};
-use super::{KProcess, ProcessStatus, get_current_process, get_process_info, KTimerInnerType};
-use core::sync::atomic::{AtomicU8,AtomicUsize, Ordering};
+use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_process_info, KTimerInnerType};
+use core::ffi::c_void;
+use core::ptr::null_mut;
+use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
 use core::ptr::NonNull;
 use core::mem::take;
 use alloc::collections::BTreeMap;
@@ -47,17 +49,19 @@ pub struct Task {
     context: usize,
     quanta: usize,
     panic_base: usize,
-    user_fn: Option<fn() -> !>,
+    user_fn: Option<DispatchRoutine>,
     wait_semaphores: DynList<KSemInnerType>,
     term_notify: KSem,
     process: Option<KProcess>,
     vcb: Option<VCB>,
+    pub context_ptr: *mut c_void,
+    exit_code: AtomicIsize,
 #[cfg(target_arch="x86_64")]
     per_cpu_base: u64
 }
 
 impl Task {
-    fn new(alloc_stack: bool, core: usize, user_fn: Option<fn() -> !>) -> Result<KThread, KError> {
+    fn new(alloc_stack: bool, core: usize, user_fn: Option<DispatchRoutine>) -> Result<KThread, KError> {
         let stack  = if alloc_stack {
             Some(Stack::new()?)
         } else {
@@ -75,7 +79,7 @@ impl Task {
         let task = Arc::new_in(Spinlock::new(Task {
             id,
             is_kernel_mode: true,
-            core, 
+            core,
             stack,
             status: TaskStatus::ACTIVE,
             context: 0,
@@ -86,6 +90,8 @@ impl Task {
             term_notify: KSem::new(0, 1),
             process: None,
             vcb: None,
+            context_ptr: null_mut(),
+            exit_code: AtomicIsize::new(0),
             #[cfg(target_arch = "x86_64")]
             per_cpu_base: get_per_cpu_kernel_base_for_core(core)
         }), PoolAllocatorGlobal);
@@ -120,6 +126,10 @@ impl Task {
         else {
             None
         }
+    }
+
+    pub fn get_exit_code(&self) -> isize {
+        self.exit_code.load(Ordering::Relaxed)
     }
 }
 
@@ -419,7 +429,7 @@ pub fn signal_waiting_task(task_id: usize, wait_semaphore: KSemInnerType) {
 // Note that there is no stack unwinding destructor calls to avoid this problem within the kernel
 // Doing stack unwinding for every process/task destruction is not practical and can cause lot
 // of bookkeeping and performance issues
-pub fn kill_thread(task_id: usize) {
+pub fn kill_thread(task_id: usize, exit_code: isize) {
     let mut yield_flag = false;
     let mut drop_task  = false;
     let mut skip_notify  = false;
@@ -442,10 +452,11 @@ pub fn kill_thread(task_id: usize) {
         };
 
         let status = {
-            let mut task_locked= this_task.lock();
+            let mut task_locked = this_task.lock();
             let status = task_locked.status;
             task_locked.status = TaskStatus::TERMINATED;
-            status 
+            task_locked.exit_code.store(exit_code, Ordering::Relaxed);
+            status
         };
 
         // Remove task from active list and add to terminated list
@@ -558,12 +569,12 @@ pub fn kill_thread(task_id: usize) {
     }
 }
 
-pub fn exit_thread() -> ! {
+pub fn exit_thread(exit_code: isize) -> ! {
     let thread_id = get_current_task_id().expect("Attempted to kill idle task!!");
 
     assert!(is_preemption_enabled(), "exit_thread() called with preemption disabled!");
 
-    kill_thread(thread_id);
+    kill_thread(thread_id, exit_code);
 
     panic!("exit_thread() unreachable reached!!");
 }
@@ -577,7 +588,7 @@ fn reap_tasks(sched_cb: &mut TaskQueue) {
         };
         
         let id = task_inner.lock().get_id();
-
+        let thread_exit_code = task_inner.lock().exit_code.load(Ordering::Relaxed);
         sched_cb.notifier_list.add_node(task_inner.lock().term_notify.clone()).expect("Failed to add semaphore to notifier list!");
 
         // Extract the pointer, release the lock and then call remove_thread
@@ -585,8 +596,11 @@ fn reap_tasks(sched_cb: &mut TaskQueue) {
         {
             let process_ref = task_inner.lock().process.as_ref().unwrap().clone();
             let mut process_guard = process_ref.lock();
-            let is_last_thread_in_proc = process_guard.remove_thread(id);
             
+            // If thread is last in the process and process is not already being killed with kill_process
+            // then set the process's exit code as the exit code for this thread
+            let is_last_thread_in_proc = process_guard.remove_thread(id, thread_exit_code);
+
             if is_last_thread_in_proc {
                 info!("Adding process {} notifier to notifier list as task {} is terminating", process_guard.get_id(), id);
                 sched_cb.notifier_list.add_node(process_guard.get_notify_sem()).expect("Failed to add process notify semaphore to notifier list!");
@@ -897,7 +911,7 @@ fn prep_idle_task(sched_cb: &mut TaskQueue, old_vcb: VCB) {
     }
 }
 
-fn idle_task() -> ! {
+extern "C" fn idle_task() -> ! {
     hal::sleep();
 }
 
@@ -911,7 +925,7 @@ fn notify_other_cpu(target_core: usize) {
     hal::notify_core(IPIRequestType::SchedChange, target_core);
 }
 
-fn create_thread_common(handler: fn() -> !, user_function: Option<fn() -> !>) -> Result<(KThread, usize), KError> {
+fn create_thread_common(handler: DispatchRoutine, user_function: Option<DispatchRoutine>) -> Result<(KThread, usize), KError> {
     // We will use simple round robin to determine the cpu which gets this task
     let core = TASK_CPU.fetch_add(1, Ordering::Relaxed) as usize % get_total_cores();   
     let task = Task::new(true, core, user_function)?;
@@ -930,7 +944,7 @@ fn create_thread_common(handler: fn() -> !, user_function: Option<fn() -> !>) ->
 }
 
 // Internal API: Do not call this
-pub fn create_init_thread(handler: fn() -> !, process: KProcess) -> Result<KThread, KError> {
+pub fn create_init_thread(handler: DispatchRoutine, process: KProcess, context_ptr: *mut c_void) -> Result<KThread, KError> {
     let is_user_thread = process.lock().get_user_flag();
     let proc_id = process.lock().get_id();
 
@@ -944,7 +958,8 @@ pub fn create_init_thread(handler: fn() -> !, process: KProcess) -> Result<KThre
     let thread_id = thread.lock().get_id();
     let proc_addr_space = process.lock().get_vcb();
     debug!("Created init thread {} on process {} on core {}", thread_id, proc_id, core);
-    
+
+    thread.lock().context_ptr = context_ptr;
     thread.lock().process = Some(process);
     thread.lock().vcb = Some(proc_addr_space);
     Ok(thread)
@@ -972,7 +987,7 @@ pub fn start_task(thread: &KThread, core: usize, process: &KProcess, registry: &
     Ok(())
 }
 
-pub fn create_thread_do_work(handler: fn() -> !, user_fn: Option<fn() -> !>) -> Result<KThread, KError> {
+pub fn create_thread_do_work(handler: DispatchRoutine, user_fn: Option<DispatchRoutine>, context_ptr: *mut c_void) -> Result<KThread, KError> {
     disable_preemption();
 
     let (thread, core) = match create_thread_common(handler, user_fn) {
@@ -1010,6 +1025,7 @@ pub fn create_thread_do_work(handler: fn() -> !, user_fn: Option<fn() -> !>) -> 
             }
             else {
                 debug!("Creating new task {} under process {}", thread_id, guard.get_id());
+                thread.lock().context_ptr = context_ptr;
                 thread.lock().process = Some(process_ref);
                 thread.lock().vcb = Some(proc_addr_space);
                 drop(guard);
@@ -1039,14 +1055,21 @@ pub fn create_thread_do_work(handler: fn() -> !, user_fn: Option<fn() -> !>) -> 
     Ok(thread)
 }
 
-// Must be called from valid process context 
-pub fn create_thread(handler: fn() -> !) -> Result<KThread, KError> {
-    let res = create_thread_do_work(handler, None);
+// Must be called from valid process context
+pub fn create_thread(handler: DispatchRoutine, context_ptr: *mut c_void) -> Result<KThread, KError> {
+    let res = create_thread_do_work(handler, None, context_ptr);
     if res.is_err() {
         info!("Failed to create kernel thread");
     }
 
     res
+}
+
+pub fn get_current_thread_args() -> *mut c_void {
+    match get_current_task() {
+        Some(t) => t.lock().context_ptr,
+        None => null_mut(),
+    }
 }
 
 impl Spinlock<Task> {

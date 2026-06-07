@@ -78,8 +78,19 @@ fn clear_keyboard_output_buffer() {
 
 static TASK_COUNTER: Once<KSem> = Once::new();
 
+extern "C" fn spawned_task_entry() -> ! {
+    let id = sched::get_current_task_id().unwrap();
+    info!("Running task: {}", id);
+    TASK_COUNTER.get().unwrap().signal();
+
+    loop {
+        info!("id:{}", id);
+        sched::delay_ms(1000);
+    }
+}
+
 // Checking thread subsystem
-fn task_spawn() -> ! {
+extern "C" fn task_spawn() -> ! {
     let mut tasks: VecDeque<KThread> = VecDeque::new();
     TASK_COUNTER.call_once(|| {
         KSem::new(0, 5)
@@ -90,19 +101,7 @@ fn task_spawn() -> ! {
 
     for idx in 0..5 {
         info!("Creating task {} in task spawner", idx);
-        tasks.push_back(sched::create_thread(|| {
-            let id = sched::get_current_task_id().unwrap(); 
-            info!("Running task: {}", id);
-            TASK_COUNTER.get().unwrap().signal();
-
-            info!("id={}", id);
-            
-            loop {
-                info!("id:{}", id);
-            
-                sched::delay_ms(1000);
-            }
-        }).unwrap());
+        tasks.push_back(sched::create_thread(spawned_task_entry, core::ptr::null_mut()).unwrap());
     }
 
     info!("Task spawner going to wait!");
@@ -121,45 +120,19 @@ fn task_spawn() -> ! {
             let task = tasks.pop_front().unwrap();
             let id = task.lock().get_id();
             info!("Killing task {}", id);
-            sched::kill_thread(id);
+            sched::kill_thread(id, 0);
         }
         else {
             info!("Killing self");
-            sched::exit_thread();
+            sched::exit_thread(0);
         }
     }
 }
 
-fn process_spawn() -> ! {
+extern "C" fn process_spawn() -> ! {
     for _ in 0..2 {
-        sched::create_process(|| {
-            let proc_id = sched::get_current_process_id().unwrap();
-            let thread_id = sched::get_current_task_id().unwrap();
-            info!("Created process with id {}", proc_id);  
-
-            for _ in 0..2 {
-                sched::create_thread(|| {
-                    let thread_id = sched::get_current_task_id().unwrap();
-                    let proc_id = sched::get_current_process_id().unwrap();
-                    info!("Created new thread with id {}", thread_id);
-
-                    loop {
-                        info!("Running thread with id {} with process id {} on core {}", thread_id, proc_id, hal::get_core());
-                        sched::delay_ms(1000);
-                    }
-                }).expect("Failed to create new thread");
-            }
-
-            loop {
-                info!("Running thread with id {} with process id {}", thread_id, proc_id);
-                info!("Process {} waiting for event..", proc_id);
-                KEYBOARD_EVENT.get().unwrap().wait().unwrap();
-                
-                // Kill process 1 and then kill self
-                sched::kill_process(1);
-                sched::exit_process();
-            }
-        }, false).expect("Failed to create process");
+        sched::create_process(alloc::vec!["/test_proc".into()], core::ptr::null_mut(), false)
+            .expect("Failed to create process");
     }
 
     // This pattern should be never followed in a real scenario, but this is here just for testing
@@ -168,25 +141,26 @@ fn process_spawn() -> ! {
     info!("Init Thread going to wait state");
     let _ = sem.wait();
 
-    // This is here incase this process is killed before it gets a chance to wait forever
-    sched::exit_thread();
+    // This is here in case this process is killed before it gets a chance to wait forever
+    sched::exit_thread(0);
 }
 
 static QUEUE: Spinlock<DynList<[i64; 64]>> = Spinlock::new(List::new());
 
-fn thread_creator() -> ! {
+extern "C" fn thread_creator() -> ! {
     let id = sched::get_current_task_id().unwrap();
     let mut counter = 1;
     loop {
         sched::delay_ms(1000);
         debug!("Running thread with id {}", id);
-        sched::create_thread(thread_creator).expect("Failed to create child thread!");
+        sched::create_thread(thread_creator, core::ptr::null_mut()).expect("Failed to create child thread!");
         if counter % 5 == 0 {
-            sched::create_process(thread_creator, false).expect("Failed to create child process!");
+            sched::create_process(alloc::vec!["/test_proc".into()], core::ptr::null_mut(), false)
+                .expect("Failed to create child process!");
         }
-        
+
         if counter % 10 == 0 {
-            sched::exit_process();
+            sched::exit_process(0);
         }
         counter += 1;
     }
@@ -312,7 +286,7 @@ fn key_notifier(_: usize) {
 
 static WATCHDOG_MARK: AtomicBool = AtomicBool::new(false);
 
-fn watchdog() -> ! {
+extern "C" fn watchdog() -> ! {
     loop {
         sched::delay_ms(10_000);
         let is_active = WATCHDOG_MARK.load(Ordering::Acquire);

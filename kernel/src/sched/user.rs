@@ -1,4 +1,5 @@
 use core::alloc::Layout;
+use core::ffi::c_void;
 use common::PAGE_SIZE;
 use kernel_intf::{KError, info};
 use crate::cpu::Stack;
@@ -33,9 +34,9 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
 ];
 
 
-// Must be called from valid process context 
-pub fn create_user_thread(handler: fn() -> !) -> Result<KThread, KError> {
-    let res = create_thread_do_work(user_init_handler,  Some(handler));
+// Must be called from valid process context
+pub fn create_user_thread(handler: DispatchRoutine, context: *mut c_void) -> Result<KThread, KError> {
+    let res = create_thread_do_work(user_init_handler, Some(handler), core::ptr::null_mut());
 
     if res.is_err() {
         info!("User thread creation failed!");
@@ -44,7 +45,7 @@ pub fn create_user_thread(handler: fn() -> !) -> Result<KThread, KError> {
     res
 }
 
-pub fn user_init_handler() -> ! {
+pub extern "C" fn user_init_handler() -> ! {
     // Create the user stack
     // Allocate the user memory range for init handler
     // Transfer control to user
@@ -102,7 +103,7 @@ pub fn syscall_dispatcher(syscall_number: u64, syscall_args: &[u64; MAX_ARCH_ARG
 fn sys_exit_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let id = get_current_process_id().expect("Called sys_exit_handler from idle task!");
 
-    kill_process(id);
+    kill_process(id, 0);
 
     E_SUCCESS
 }
@@ -110,7 +111,7 @@ fn sys_exit_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 fn sys_thread_exit_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let id = get_current_task_id().expect("Called sys_thread_exit_handler from idle task!");
 
-    kill_thread(id);
+    kill_thread(id, 0);
 
     E_SUCCESS
 }
@@ -149,15 +150,19 @@ fn sys_delay_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     E_SUCCESS
 }
 
+extern "C" fn placeholder_user_entry() -> ! {
+    loop {}
+}
+
 fn sys_thread_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     info!("Creating new user thread..");
-    let stat: KError = create_user_thread(|| {loop{}}).into();
+    let stat: KError = create_user_thread(placeholder_user_entry, core::ptr::null_mut()).into();
 
     stat.into()
 }
 
 fn sys_process_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    let stat: KError = create_process(|| {loop{}}, true).into();
+    let stat: KError = create_process(alloc::vec![], core::ptr::null_mut(), true).into();
 
     stat.into()
 }

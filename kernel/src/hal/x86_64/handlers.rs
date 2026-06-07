@@ -253,7 +253,7 @@ pub fn switch_context(new_context: usize) {
     PER_CPU_GLOBAL_CONTEXT.local().store(new_context, Ordering::Release);
 }
 
-pub fn create_kernel_context(handler: fn() -> !, stack_base: *mut u8) -> usize {
+pub fn create_kernel_context(handler: extern "C" fn() -> !, stack_base: *mut u8) -> usize {
     let mut sp = stack_base as usize;
 
     // 16 byte alignment is maintained since stack_base already aligned to 4096 bytes

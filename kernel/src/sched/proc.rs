@@ -1,18 +1,21 @@
 use alloc::sync::Arc;
 use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use common::{MemoryRegion, PAGE_SIZE};
 use kernel_intf::{KError, info, debug};
 use kernel_intf::list::{List, DynList};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use crate::fs::FileInstance;
-use crate::loader::LoadedImage;
-use crate::hal;
+use crate::loader::{LoadedImage, load_image};
+use crate::{KERNEL_PATH, hal};
 use crate::mem::{self, PageDescriptor, VCB, VirtMemConBlk, deallocate_memory, get_physical_address};
 use crate::sched::{self, *};
 use crate::sync::{KSem, Spinlock};
 use crate::io::DeviceHandleK;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use core::ptr::NonNull;
 use core::alloc::Layout;
 
@@ -49,17 +52,19 @@ pub struct Process {
 
     // List of physical addresses that are deallocated once the process is killed
     // The virtual address space would be destroyed prior to this deallocation
-    memory_list: DynList<MemoryRegion>
+    memory_list: DynList<MemoryRegion>,
+    args: Vec<String>,
+    exit_code: AtomicIsize
 }
 
 unsafe impl Send for Process {}
 
 impl Process {
-    fn new(clone_addr_space: bool, is_user: bool) -> Result<KProcess, KError> {
-        let id = PROCESS_ID.fetch_add(1, Ordering::Relaxed);  
+    fn new(clone_addr_space: bool, is_user: bool, args: Vec<String>) -> Result<KProcess, KError> {
+        let id = PROCESS_ID.fetch_add(1, Ordering::Relaxed);
         let kernel_addr_space = mem::get_kernel_addr_space();
         let new_addr_space = if clone_addr_space {
-            VirtMemConBlk::clone(kernel_addr_space, id)?     
+            VirtMemConBlk::clone(kernel_addr_space, id)?
         }
         else {
             kernel_addr_space
@@ -74,12 +79,22 @@ impl Process {
             term_notify: KSem::new(0, 1),
             init_notify: KSem::new(0, 1),
             memory_list: List::new(),
-            file_table: Vec::new()
+            file_table: Vec::new(),
+            args,
+            exit_code: AtomicIsize::new(0)
         }), PoolAllocatorGlobal);
-        
+
         info!("Creating new process with id {}", id);
 
         Ok(proc)
+    }
+
+    pub fn get_args(&self) -> &[String] {
+        &self.args
+    }
+
+    pub fn get_exit_code(&self) -> isize {
+        self.exit_code.load(Ordering::Relaxed)
     }
 
     pub fn get_vcb(&self) -> VCB {
@@ -102,7 +117,7 @@ impl Process {
         self.threads.add_node(thread_id)
     }
 
-    pub fn remove_thread(&mut self, thread_id: usize) -> bool {
+    pub fn remove_thread(&mut self, thread_id: usize, exit_code: isize) -> bool {
         let mut killed_thread = None;
         for node in self.threads.iter() {
             if **node == thread_id {
@@ -127,6 +142,7 @@ impl Process {
         // individual kill_thread calls instead of calling
         // kill_process directly
         if self.threads.get_nodes() == 0 {
+            self.exit_code.store(exit_code, Ordering::Relaxed);
             self.destroy_process();
             return true;
         }
@@ -202,7 +218,7 @@ impl Drop for Process {
 
 pub fn init() {
     // Create init process and attach init task (task id = 0) to it
-    let init_proc = Process::new(false, false)
+    let init_proc = Process::new(false, false, vec!(KERNEL_PATH.into()))
     .expect("Failed to create init process");
 
     PROCESSES.lock().insert(0, Arc::clone(&init_proc));
@@ -232,10 +248,50 @@ pub fn get_process_info(proc_id: usize) -> Option<KProcess> {
     })
 }
 
-pub fn create_process(start_function: fn() -> !, is_user: bool) -> Result<KProcess, KError> {
+extern "C" fn kernel_init_handler() -> ! {
+    let path = {
+        let proc = get_current_process().expect("kernel_init_handler: no current process");
+        let guard = proc.lock();
+        guard.args[0].clone()
+    };
+
+    let img = match load_image(&path, false) {
+        Ok(img) => img,
+        Err(e) => {
+            info!("kernel_init_handler: failed to load image '{}': {:?}", path, e);
+            exit_process(1);
+        }
+    };
+
+    let entry = img.lock().info.entry;
+    add_new_handle(Handle::ImgHandle(img));
+
+    let entry_fn: DispatchRoutine = unsafe { core::mem::transmute(entry) };
+    
+    // Call the user entry function
+    entry_fn()
+}
+
+pub fn get_current_process_args() -> *const Vec<String> {
+    let proc = match get_current_process() {
+        Some(p) => p,
+        None => return core::ptr::null(),
+    };
+    let guard = proc.lock();
+    
+    // The Arc keeps the Process alive as long as any thread runs within it,
+    // so this pointer remains valid for the caller's lifetime on the current thread.
+    &guard.args as *const Vec<String>
+}
+
+pub fn create_process(args: Vec<String>, context_ptr: *mut c_void, is_user: bool) -> Result<KProcess, KError> {
+    if !is_user && args.is_empty() {
+        return Err(KError::InvalidArgument);
+    }
+
     disable_preemption();
 
-    let process = match Process::new(true, is_user) {
+    let process = match Process::new(true, is_user, args) {
         Ok(p) => p,
         Err(e) => {
             enable_preemption();
@@ -245,7 +301,13 @@ pub fn create_process(start_function: fn() -> !, is_user: bool) -> Result<KProce
 
     let init_notify_sem = process.lock().init_notify.clone();
 
-    let thread = match sched::create_init_thread(start_function, Arc::clone(&process)) {
+    let init_handler: DispatchRoutine = if is_user {
+        super::user::user_init_handler
+    } else {
+        kernel_init_handler
+    };
+
+    let thread = match sched::create_init_thread(init_handler, Arc::clone(&process), context_ptr) {
         Ok(t) => t,
         Err(e) => {
             enable_preemption();
@@ -269,7 +331,7 @@ pub fn create_process(start_function: fn() -> !, is_user: bool) -> Result<KProce
     Ok(process)
 }
 
-pub fn kill_process(proc_id: usize) {
+pub fn kill_process(proc_id: usize, exit_code: isize) {
     let proc = get_process_info(proc_id);
     if proc.is_none() {
         return;
@@ -292,6 +354,7 @@ pub fn kill_process(proc_id: usize) {
         }
 
         guard.status = ProcessStatus::Terminated;
+        guard.exit_code.store(exit_code, Ordering::Relaxed);
         guard.threads.clone()
     };
 
@@ -308,32 +371,31 @@ pub fn kill_process(proc_id: usize) {
         // This happens if the current process is killing itself (exit)
         if is_idle_task || **thread_id != cur_task_id {
             kernel_intf::debug!("Issuing kill to thread {}", **thread_id);
-            sched::kill_thread(**thread_id);
+            sched::kill_thread(**thread_id, exit_code);
         }
         else {
             is_exit = true;
         }
     }
-    
+
     proc.lock().destroy_process();
 
-    
     enable_preemption();
 
     // Kill the current thread last
     if is_exit {
         // Drop it explicitly since we are not going to return from this call
         drop(proc);
-        sched::kill_thread(cur_task_id);
+        sched::kill_thread(cur_task_id, exit_code);
     }
 }
 
 /* Important to ensure that no locks are held or that preemption is not disabled during this call */
-pub fn exit_process() -> ! {
+pub fn exit_process(exit_code: isize) -> ! {
     assert!(super::is_preemption_enabled());
     let proc_id = get_current_process_id().expect("Attempted to kill idle process!!");
 
-    kill_process(proc_id);
+    kill_process(proc_id, exit_code);
 
     // We could land here. Suppose two thread of a process call exit_process.
     // Only one of them succeeds in acquiring lock and setting status to terminate.

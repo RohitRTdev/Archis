@@ -576,23 +576,6 @@ pub extern "C" fn io_send_request(
     result.unwrap_or(Status::Failed)
 }
 
-// Exported to drivers: spawn a kernel worker thread. The handler must never
-// return; it should finish by calling exit_kernel_thread. Stopgap until a
-// proper DPC/bottom-half mechanism exists.
-#[unsafe(no_mangle)]
-#[allow(improper_ctypes_definitions)]
-pub extern "C" fn create_kernel_thread(handler: fn() -> !) -> KError {
-    match crate::sched::create_thread(handler) {
-        Ok(_) => KError::Success,
-        Err(e) => e
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn exit_kernel_thread() -> ! {
-    crate::sched::exit_thread()
-}
-
 pub fn init() {
     DRIVER_LOAD_LOCK.call_once(|| KSem::new(1, 1));
     ROOT_DEVICE.call_once(create_root_device);
