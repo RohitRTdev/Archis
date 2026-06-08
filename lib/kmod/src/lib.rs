@@ -35,10 +35,10 @@ pub fn init(
             use import_stub::*;
 
             #[unsafe(no_mangle)]
-            extern "C" fn module_init() {}
+            extern "C" fn _shim_module_init() {}
 
             #[unsafe(no_mangle)]
-            extern "C" fn shim_driver_init(
+            extern "C" fn _shim_driver_init(
                 driver: *mut kernel_intf::driver::DriverObject
             ) -> kernel_intf::driver::Status {
                 let obj = unsafe { &mut *driver };
@@ -48,7 +48,7 @@ pub fn init(
     } else {
         quote! {
             #[unsafe(no_mangle)]
-            extern "C" fn module_init() {
+            extern "C" fn _shim_module_init() {
                 #ident()
             }
         }
@@ -85,7 +85,7 @@ pub fn init(
         }
 
         #[unsafe(no_mangle)]
-        extern "C" fn module_config()
+        extern "C" fn _shim_module_config()
             -> common::StrRef
         {
             kernel_intf::init_logger(
@@ -146,7 +146,7 @@ pub fn dispatch_handler(
     let func = parse_macro_input!(item as ItemFn);
     let ident = &func.sig.ident;
     let name = ident.to_string();
-    let shim_ident = format_ident!("shim_{}", ident);
+    let shim_ident = format_ident!("_shim_{}", ident);
 
     if name == "dispatch_add" {
         return quote! {
@@ -221,7 +221,7 @@ pub fn dispatch_init(input: TokenStream) -> TokenStream {
     } = parse_macro_input!(input as DispatchInit);
 
     let assignments = handlers.iter().map(|handler| {
-        let shim = format_ident!("shim_{}", handler);
+        let shim = format_ident!("_shim_{}", handler);
 
         quote! {
             #obj.dispatch.#handler = Some(#shim);
@@ -235,3 +235,4 @@ pub fn dispatch_init(input: TokenStream) -> TokenStream {
     }
     .into()
 }
+

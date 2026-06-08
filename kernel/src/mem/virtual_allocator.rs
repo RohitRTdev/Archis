@@ -503,7 +503,7 @@ impl VirtMemConBlk {
     }
 
     pub fn clone(parent_vcb: VCB, proc_id: usize) -> Result<VCB, KError> {
-        info!("Cloning kernel virtual address space for process id {}", proc_id);
+        crate::mem_log!("Cloning kernel virtual address space for process id {}", proc_id);
         let (free_list, alloc_list, total_mem, avl_mem) = {
             let parent_vcb = unsafe {
                 (*parent_vcb.as_ptr()).lock()

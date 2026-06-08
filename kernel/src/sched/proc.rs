@@ -3,7 +3,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use common::{MemoryRegion, PAGE_SIZE};
+use common::{MemoryRegion, PAGE_SIZE, StrRef};
 use kernel_intf::{KError, info, debug};
 use kernel_intf::list::{List, DynList};
 use kernel_intf::mem::PoolAllocatorGlobal;
@@ -84,7 +84,7 @@ impl Process {
             exit_code: AtomicIsize::new(0)
         }), PoolAllocatorGlobal);
 
-        info!("Creating new process with id {}", id);
+        crate::sched_log!("Creating new process with id {}", id);
 
         Ok(proc)
     }
@@ -259,7 +259,7 @@ extern "C" fn kernel_init_handler() -> ! {
         Ok(img) => img,
         Err(e) => {
             info!("kernel_init_handler: failed to load image '{}': {:?}", path, e);
-            exit_process(1);
+            exit_process(-1);
         }
     };
 
@@ -371,7 +371,7 @@ pub fn kill_process(proc_id: usize, exit_code: isize) {
         // This happens if the current process is killing itself (exit)
         if is_idle_task || **thread_id != cur_task_id {
             crate::sched_log!("Issuing kill to thread {}", **thread_id);
-            sched::kill_thread(**thread_id);
+            sched::kill_thread(**thread_id, exit_code);
         }
         else {
             is_exit = true;
@@ -442,8 +442,29 @@ pub fn add_new_handle(handle: Handle) -> usize {
     guard.file_table.len() - 1
 }
 
+#[unsafe(no_mangle)]
+extern "C" fn sched_exit_process_ffi(exit_code: isize) -> ! {
+    exit_process(exit_code)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn sched_get_num_process_args_ffi() -> usize {
+    get_current_process().expect("get_num_process_args() called in idle process!").lock().args.len()
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn sched_get_cur_process_arg_ffi(num: usize) -> StrRef {
+    let proc = get_current_process().expect("get_cur_process_arg() called in idle process!");
+    let guard = proc.lock();
+    
+    assert!(num < guard.args.len());
+    
+    // This is fine since the argument location is valid for the lifetime of this process
+    StrRef::from_str(guard.args[num].as_str())
+}
 
 impl Spinlock<Process> {
+    // Blocks caller until process terminates
     pub fn wait(&self) -> Result<(), KError> {
         let sem = {
             let task = self.lock();

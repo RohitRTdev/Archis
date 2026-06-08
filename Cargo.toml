@@ -3,7 +3,8 @@ resolver = "2"
 members = [
     "boot/uefi",
     "kernel",
-    "kernel/src/drivers/*"
+    "kernel/src/drivers/*",
+    "modules/*"
 ]
 
 [profile.dev]

@@ -10,7 +10,7 @@ use core::ptr::copy_nonoverlapping;
 use core::ffi::CStr;
 use common::{PAGE_SIZE, elf::*};
 use common::{ArrayTable, MemoryRegion, ModuleInfo, StrRef};
-use kernel_intf::{KError, driver, info};
+use kernel_intf::{KError, info};
 use crate::KERNEL_PATH;
 use crate::fs::{FileBuffer, open, resolve_symlink};
 use crate::infra::disable_preloader_phase;
@@ -89,15 +89,12 @@ pub fn load_image(path: &str, is_user: bool) -> Result<LoadedImage, KError> {
     result
 }
 
-fn load_image_inner(
+
+fn do_load_image_inner(
     path: &str,
     is_user: bool,
     in_progress: &mut Vec<String>
 ) -> Result<LoadedImage, KError> {
-    if is_user {
-        todo!("User-mode image loading not implemented");
-    }
-
     if let Some(cached) = find_loaded_module(path) {
         crate::loader_log!("Loading image {} from cache", path);
         return Ok(cached);
@@ -116,6 +113,43 @@ fn load_image_inner(
 
     in_progress.pop();
     result
+}
+
+fn load_image_inner(
+    path: &str,
+    is_user: bool,
+    in_progress: &mut Vec<String>
+) -> Result<LoadedImage, KError> {
+    if is_user {
+        todo!("User-mode image loading not implemented");
+    }
+
+    const PREDEFINED_DIRECTORIES: [&str; 3] = ["", "/sys", "/sys/drivers"];
+    // This is an absolute path
+    if path.starts_with("/") {
+        return do_load_image_inner(path, false, in_progress);
+    }
+    else {
+        // Check for the file in all the predefined directories
+        for prefix in PREDEFINED_DIRECTORIES {
+            let filename = format!("{}/{}", prefix, path);
+            let res = do_load_image_inner(filename.as_str(), false, in_progress);
+
+            match res {
+                Err(InvalidArgument) => {
+                    continue;
+                },
+                Err(e) => {
+                    return Err(e);
+                },
+                Ok(img) => {
+                    return Ok(img)
+                }
+            }
+        }    
+    }
+
+    Err(InvalidArgument)
 }
 
 fn load_image_uncached(
@@ -145,6 +179,11 @@ fn load_image_uncached(
     apply_relocations(&mod_info, &deps)?;
 
     let (module_name, driver_init_address) = configure_module(&mod_info);
+
+    let module_name = module_name.ok_or_else(|| {
+        info!("Image at path {} is not valid kernel module!", path);
+        KError::InvalidArgument
+    })?;
 
     let descriptor = ModuleDescriptor {
         name: module_name,
@@ -192,12 +231,11 @@ unsafe fn read_cstr<'a>(base: usize, idx: usize) -> &'a str {
     }
 }
 
-fn configure_module(info: &ModuleInfo) -> (&'static str, Option<usize>) {
-    const FALLBACK: &str = "[none]";
-    let mut res_str: &str = FALLBACK;
+fn configure_module(info: &ModuleInfo) -> (Option<&'static str>, Option<usize>) {
+    let mut res_str: Option<&str> = None;
     let mut driver_init_addr = None;
-    let dyn_tab = match info.dyn_tab { Some(t) => t, None => return (FALLBACK, None) };
-    let dyn_str = match info.dyn_str { Some(s) => s, None => return (FALLBACK, None) };
+    let dyn_tab = match info.dyn_tab { Some(t) => t, None => return (res_str, None) };
+    let dyn_str = match info.dyn_str { Some(s) => s, None => return (res_str, None) };
 
     let entries = unsafe {
         core::slice::from_raw_parts(
@@ -211,7 +249,7 @@ fn configure_module(info: &ModuleInfo) -> (&'static str, Option<usize>) {
             continue;
         }
         let sym_name = unsafe { read_cstr(dyn_str.base_address, sym.st_name as usize) };
-        if sym_name == "module_config" {
+        if sym_name == "_shim_module_config" {
             let func_addr = info.base + sym.st_value as usize;
             let func: extern "C" fn() -> StrRef = unsafe { core::mem::transmute(func_addr) };
             let r = func();
@@ -219,10 +257,10 @@ fn configure_module(info: &ModuleInfo) -> (&'static str, Option<usize>) {
                 break;
             }
             else {
-                res_str = unsafe { r.as_str() };
+                res_str = Some(unsafe { r.as_str() });
             }
         }
-        else if sym_name == "shim_driver_init" {
+        else if sym_name == "_shim_driver_init" {
             let func_addr = info.base + sym.st_value as usize;
             driver_init_addr = Some(func_addr);
         }
@@ -488,8 +526,6 @@ fn load_dependencies(
         core::slice::from_raw_parts(dyn_shn.start as *const ElfDyn, num_entries)
     };
 
-    const PREDEFINED_DIRECTORIES: [&str; 3] = ["", "/sys", "/sys/drivers"];
-
     for entry in entries {
         if entry.tag == DT_NULL {
             break;
@@ -498,51 +534,17 @@ fn load_dependencies(
             continue;
         }
         let name = unsafe { read_cstr(dyn_str.base_address, entry.val as usize) };
-        let mut found_entry = false;
 
-        // This is an absolute path, use it directly
-        if name.starts_with("/") {
-            let res = load_image_inner(
-                name,
-                is_user,
-                in_progress
-            )?;
-            
-            crate::loader_log!("Loaded dependency {}", name);
-            deps.push(res);
-        }
-        else {
-            // Check for this image in all of these predefined directories
-            for prefix in PREDEFINED_DIRECTORIES {
-                let filename = format!("{}/{}", prefix, name);
-                let res = load_image_inner(
-                    filename.as_str(),
-                    is_user,
-                    in_progress
-                );
-
-                match res {
-                    Err(InvalidArgument) => {
-                        continue;
-                    },
-                    Err(e) => {
-                        return Err(e);
-                    },
-                    Ok(dep) => {
-                        crate::loader_log!("Loaded dependency {}", filename);
-                        found_entry = true;
-                        deps.push(dep);
-                        break;
-                    }
-                }
-            }
-            
-            if !found_entry {
-                return Err(KError::InvalidArgument);
-            }
-        } 
+        crate::loader_log!("Loading dependency {}", name);
+        let res = load_image_inner(
+            name,
+            is_user,
+            in_progress
+        )?;
+        
+        deps.push(res);
     }
-
+            
     Ok(deps)
 }
 

@@ -1,5 +1,5 @@
 CONFIG ?= debug
-BUILD_CONFIG ?= x86_64-acpi-uefi
+BUILD_CONFIG ?= x86_64/x86_64-acpi-uefi
 CONFIG_FILE := config/$(BUILD_CONFIG).mk
 IMAGE_NAME = disk-tools
 OUTPUT_DIR = output
@@ -15,7 +15,7 @@ endif
 include $(CONFIG_FILE)
 
 KERNEL_FLAGS := -C link-arg=-T$(LINKER_SCRIPT)
-DRIVER_FLAGS := -C link-arg=-T$(DRIVER_LINKER_SCRIPT) -C link-arg=-Ltarget/$(KERNEL_ARCH)/$(CONFIG)
+MODULE_FLAGS := -C link-arg=-T$(MODULE_LINKER_SCRIPT) -C link-arg=-Ltarget/$(KERNEL_ARCH)/$(CONFIG)
 
 ifeq ($(CONFIG),release)
     BUILD_OPTIONS := --release
@@ -39,7 +39,7 @@ $(ENV_PLACEHOLDER):
 	@docker build -t $(IMAGE_NAME) ./scripts
 	@echo -e $(GEN_MSG) > $(ENV_PLACEHOLDER)
 
-build_image: build_kernel build_blr build_drivers $(ENV_PLACEHOLDER)
+build_image: build_kernel build_blr build_drivers build_modules $(ENV_PLACEHOLDER)
 	@echo "Starting image creation"
 	@touch $(OUTPUT_IMAGE)
 	$(RUN_DOCKER_SCRIPT)
@@ -66,7 +66,7 @@ build_kernel_template:
 		cargo build $(BUILD_OPTIONS) $(KERNEL_OPTIONS) \
 		-Z build-std=core,compiler_builtins,alloc \
 		-Z build-std-features=compiler-builtins-mem \
-		--target $(KERNEL_TARGET) \
+		--target ../$(KERNEL_TARGET) \
 	)
 	@cp $(KERNEL_EXE) $(OUTPUT_DIR)/aris
 	@cp config/initfs.conf $(OUTPUT_DIR)
@@ -89,15 +89,31 @@ build_drivers: build_kernel
 		if [ -f $$driver_path/Cargo.toml ]; then \
 			echo "Building driver $$name"; \
 			(cd $$driver_path && \
-				RUSTFLAGS="$(DRIVER_FLAGS)" \
+				RUSTFLAGS="$(MODULE_FLAGS)" \
 				cargo build $(BUILD_OPTIONS) \
 				-Z build-std=core,compiler_builtins,alloc \
 				-Z build-std-features=compiler-builtins-mem \
-				--target ../../../$(KERNEL_TARGET)); \
+				--target ../../../../$(KERNEL_TARGET)); \
 			cp target/$(KERNEL_ARCH)/$(CONFIG)/lib$$name.so $(OUTPUT_DIR)/drivers; \
 		fi \
 	done
 	@cp kernel/src/drivers/boot.conf $(OUTPUT_DIR)/drivers/ || echo "boot.conf not found..."
+
+build_modules: build_kernel
+	@echo "Building kernel modules..."
+	@set -e; for module_path in modules/*; do \
+		if [ -d "$$module_path" ] && [ -f "$$module_path/Cargo.toml" ]; then \
+			name=$$(basename "$$module_path"); \
+			echo "Building module $$name"; \
+			(cd "$$module_path" && \
+				RUSTFLAGS="$(MODULE_FLAGS)" \
+				cargo build $(BUILD_OPTIONS) \
+				-Z build-std=core,compiler_builtins,alloc \
+				-Z build-std-features=compiler-builtins-mem \
+				--target ../../$(KERNEL_TARGET)); \
+			cp target/$(KERNEL_ARCH)/$(CONFIG)/lib$$name.so $(OUTPUT_DIR); \
+		fi; \
+	done
 
 run_unit_test: build_kernel_test
 	@cargo test --manifest-path=boot/blr/Cargo.toml -- --nocapture

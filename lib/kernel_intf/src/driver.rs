@@ -113,7 +113,7 @@ impl Irp {
         thread_id: usize
     ) -> Self {
         let mut cancel_lock = Lock { lock: 0, int_status: false };
-        unsafe { super::create_spinlock(&mut cancel_lock); }
+        super::create_spinlock(&mut cancel_lock);
         Self {
             major_code,
             minor_code: IrpMinor::None,

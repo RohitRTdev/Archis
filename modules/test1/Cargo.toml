@@ -9,5 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 common.workspace = true
-kernel_intf.workspace = true 
+kernel_intf.workspace = true
 kmod.workspace = true
+

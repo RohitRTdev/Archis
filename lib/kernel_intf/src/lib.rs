@@ -6,7 +6,7 @@ pub use log::*;
 pub mod mem;
 pub mod list;
 pub mod driver;
-use core::fmt;
+use core::{ffi::c_void, fmt};
 use common::StrRef;
 
 pub type InterruptRoutine = extern "C" fn(*mut core::ffi::c_void) -> bool;
@@ -100,6 +100,13 @@ impl fmt::Display for RtcTime {
     }
 }
 
+#[macro_export]
+macro_rules! get_module_name {
+    () => {
+        MODULE_NAME_STR
+    }
+}
+
 #[repr(C)]
 pub struct Lock {
     pub lock: u64,
@@ -108,9 +115,9 @@ pub struct Lock {
 
 #[cfg_attr(not(feature = "link-kernel"), link(name = "aris"))]
 unsafe extern "C" {
-    pub fn create_spinlock(lock: &mut Lock);
-    pub fn acquire_spinlock(lock: &mut Lock);
-    pub fn release_spinlock(lock: &mut Lock);
+    fn create_spinlock_ffi(lock: &mut Lock);
+    fn acquire_spinlock_ffi(lock: &mut Lock);
+    fn release_spinlock_ffi(lock: &mut Lock);
     pub fn clear_screen();
     pub fn read_rtc() -> RtcTime;
     pub fn read_timestamp() -> usize;
@@ -125,7 +132,6 @@ unsafe extern "C" {
     pub fn heap_alloc_ffi(size: usize, align: usize, out: *mut *mut u8) -> KError;
     pub fn heap_dealloc_ffi(ptr: *mut u8, size: usize, align: usize) -> KError;
     pub fn panic_router(mod_name: StrRef, info: StrRef) -> !;
-    pub fn exported_function();
     pub fn io_create_device(
         driver_id: usize, 
         name: StrRef, 
@@ -133,7 +139,7 @@ unsafe extern "C" {
         parent: *const driver::DeviceObject) 
     -> *mut driver::DeviceObject;
 
-    pub fn io_send_request(
+    fn io_send_request_ffi(
         device: *const driver::DeviceObject,
         major: usize,
         minor: usize,
@@ -144,19 +150,17 @@ unsafe extern "C" {
         completion_ctx: *mut core::ffi::c_void
     ) -> driver::Status;
     
-    pub fn io_complete_irp(irp: *mut driver::Irp, status: driver::Status);
+    fn io_complete_irp_ffi(irp: *mut driver::Irp, status: driver::Status);
     pub fn io_get_driver_id(device: *const driver::DeviceObject) -> usize;
     pub fn io_invalidate_device(device: *const driver::DeviceObject) -> driver::Status;
-    pub fn io_set_cancel_routine(
+    fn io_set_cancel_routine_ffi(
         irp: *mut driver::Irp,
         routine: extern "C" fn(*const driver::DeviceObject, *mut driver::Irp)
     ); 
-    pub fn io_start_processing(irp: *mut driver::Irp) -> bool;
+    fn io_start_processing_ffi(irp: *mut driver::Irp) -> bool;
 
-    pub fn create_kernel_thread(handler: fn() -> !) -> KError;
-    pub fn exit_kernel_thread() -> !;
-    pub fn delay_ms_ffi(value: usize);
-    pub fn io_install_interrupt_handler(
+    fn sched_delay_ms_ffi(value: usize);
+    fn io_install_interrupt_handler_ffi(
         irq: usize,
         context: *mut core::ffi::c_void,
         handler: InterruptRoutine,
@@ -164,6 +168,88 @@ unsafe extern "C" {
         is_edge_triggered: bool,
     ) -> InterruptHandle;
 
-    pub fn io_remove_interrupt_handler(handle: InterruptHandle);
+    fn io_remove_interrupt_handler_ffi(handle: InterruptHandle);
+    fn sched_exit_process_ffi(exit_code: isize) -> !;
+    fn sched_get_num_process_args_ffi() -> usize;
+    fn sched_get_cur_process_arg_ffi(num: usize) -> StrRef;
+    fn sched_get_cur_thread_arg_ffi() -> *mut c_void;
+    fn sched_get_cur_thread_id_ffi() -> usize;
 }
 
+pub fn sched_delay_ms(value: usize) {
+    unsafe { sched_delay_ms_ffi(value); }
+}
+
+pub fn io_start_processing(irp: *mut driver::Irp) -> bool {
+    unsafe { io_start_processing_ffi(irp) }
+}
+
+pub fn io_complete_irp(irp: *mut driver::Irp, status: driver::Status) {
+    unsafe { io_complete_irp_ffi(irp, status) }
+}
+
+pub fn io_install_interrupt_handler(
+    irq: usize,
+    context: *mut core::ffi::c_void,
+    handler: InterruptRoutine,
+    active_high: bool,
+    is_edge_triggered: bool,
+) -> InterruptHandle {
+    unsafe { io_install_interrupt_handler_ffi(irq, context, handler, active_high, is_edge_triggered) }
+}
+
+pub fn io_remove_interrupt_handler(handle: InterruptHandle) {
+    unsafe { io_remove_interrupt_handler_ffi(handle); }
+}
+
+pub fn io_set_cancel_routine(
+    irp: &mut driver::Irp,
+    routine: extern "C" fn(*const driver::DeviceObject, *mut driver::Irp)
+) {
+    unsafe { io_set_cancel_routine_ffi(irp, routine); }
+}
+
+pub fn sched_exit_process(exit_code: isize) -> ! {
+    unsafe { sched_exit_process_ffi(exit_code) }
+}
+
+pub fn sched_get_num_process_args() -> usize {
+    unsafe { sched_get_num_process_args_ffi() }
+}
+
+pub fn sched_get_cur_process_arg(num: usize) -> StrRef {
+    unsafe { sched_get_cur_process_arg_ffi(num) }
+}
+
+pub fn sched_get_cur_thread_arg() -> *mut c_void {
+    unsafe { sched_get_cur_thread_arg_ffi() }
+}
+
+pub fn sched_get_cur_thread_id() -> usize {
+    unsafe { sched_get_cur_thread_id_ffi() }
+}
+
+pub fn create_spinlock(lock: &mut Lock) {
+    unsafe { create_spinlock_ffi(lock) }
+}
+
+pub fn acquire_spinlock(lock: &mut Lock) {
+    unsafe { acquire_spinlock_ffi(lock); }
+} 
+
+pub fn release_spinlock(lock: &mut Lock) {
+    unsafe { release_spinlock_ffi(lock); }
+}
+
+pub fn io_send_request(
+    device: *const driver::DeviceObject,
+    major: usize,
+    minor: usize,
+    buf_base: usize,
+    buf_size: usize,
+    offset: usize,
+    completion: Option<extern "C" fn(*const driver::IrpResult, *mut core::ffi::c_void)>,
+    completion_ctx: *mut core::ffi::c_void
+) -> driver::Status {
+    unsafe { io_send_request_ffi(device, major, minor, buf_base, buf_size, offset, completion, completion_ctx) }
+}

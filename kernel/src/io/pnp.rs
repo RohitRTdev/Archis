@@ -125,7 +125,7 @@ fn handle(req: &PnpRequest) {
     }
 }
 
-fn pnp_worker() -> ! {
+extern "C" fn pnp_worker() -> ! {
     info!("Started pnp worker thread");
     loop {
         crate::io_log!("pnp_worker: Waiting for requests");
@@ -144,5 +144,5 @@ fn pnp_worker() -> ! {
 
 pub fn start_worker() {
     PNP_SIGNAL.call_once(|| KEvent::new(true));
-    sched::create_thread(pnp_worker).expect("Failed to spawn PnP worker thread");
+    sched::create_thread(pnp_worker, core::ptr::null_mut()).expect("Failed to spawn PnP worker thread");
 }

@@ -21,6 +21,7 @@ mod acpica;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::sync::atomic::AtomicUsize;
+use core::ffi::c_void;
 use io::DeviceHandleK;
 
 use kernel_intf::{info, debug};
@@ -30,7 +31,7 @@ use loader::module;
 extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
-
+use alloc::vec;
 
 #[cfg(test)]
 mod tests;
@@ -185,12 +186,12 @@ extern "C" fn cancel_test_completion(result: *const IrpResult, _ctx: *mut core::
     info!("cancel_test_completion: IRP delivered with status {}", status as isize);
 }
 
-fn task_kill_cancel_runner() -> ! {
+extern "C" fn task_kill_cancel_runner() -> ! {
     let handle = match io::open_device_handle("test1") {
         Ok(h) => h,
         Err(_) => {
             info!("task_kill_cancel_runner: test1 device not found");
-            sched::exit_thread();
+            sched::exit_thread(0);
         }
     };
 
@@ -208,12 +209,12 @@ fn task_kill_cancel_runner() -> ! {
     loop { sched::delay_ms(1000); }
 }
 
-fn self_cancel_runner() -> ! {
+extern "C" fn self_cancel_runner() -> ! {
     let handle = match io::open_device_handle("test1") {
         Ok(h) => h,
         Err(_) => {
             info!("self_cancel_runner: test1 device not found");
-            sched::exit_thread();
+            sched::exit_thread(0);
         }
     };
 
@@ -240,23 +241,23 @@ fn self_cancel_runner() -> ! {
         "self_cancel_runner: pending_irps on test1 = {}",
         handle.pending_irps.lock().get_nodes()
     );
-    sched::exit_thread();
+    sched::exit_thread(0);
 }
 
 fn run_cancel_tests() {
     // (a) task-kill cancellation
-    let killer_target = sched::create_thread(task_kill_cancel_runner)
+    let killer_target = sched::create_thread(task_kill_cancel_runner, core::ptr::null_mut())
         .expect("Failed to spawn task_kill_cancel_runner");
     sched::delay_ms(300);
     let tid = killer_target.lock().get_id();
     info!("cancel test (a): killing thread {}", tid);
-    sched::kill_thread(tid);
+    sched::kill_thread(tid, 0);
     // Wait long enough that the driver worker hits io_start_processing and
     // exits cleanly (1500ms sleep in test1::read_worker + slack).
     sched::delay_ms(2500);
 
     // (b) per-handle self-cancellation
-    let _ = sched::create_thread(self_cancel_runner)
+    let _ = sched::create_thread(self_cancel_runner, core::ptr::null_mut())
         .expect("Failed to spawn self_cancel_runner");
     sched::delay_ms(3000);
 
@@ -286,7 +287,7 @@ fn state_test_handle() -> DeviceHandleK {
 }
 
 // Bash on the device with reads while STATE_TEST_RUN; tally rejections.
-fn state_reject_loop() -> ! {
+extern "C" fn state_reject_loop() -> ! {
     let dev = state_test_handle();
     while STATE_TEST_RUN.load(Ordering::Acquire) {
         let res = dev.read(io::ReadRequest {
@@ -298,19 +299,19 @@ fn state_reject_loop() -> ! {
         }
         sched::delay_ms(10);
     }
-    sched::exit_thread();
+    sched::exit_thread(0);
 }
 
-fn state_start_once() -> ! {
+extern "C" fn state_start_once() -> ! {
     let dev = state_test_handle();
     let r = dev.start();
     info!("state_start_once (tid={}): start -> {:?}",
           sched::get_current_task_id().unwrap_or(0),
           r.map(|s| s as isize));
-    sched::exit_thread();
+    sched::exit_thread(0);
 }
 
-fn state_write_once() -> ! {
+extern "C" fn state_write_once() -> ! {
     let dev = state_test_handle();
     let res = dev.write(io::ReadRequest {
         buffer: MemoryRegion { base_address: 0, size: 0 },
@@ -322,10 +323,10 @@ fn state_write_once() -> ! {
     info!("state_write_once (tid={}): write -> {:?}",
           sched::get_current_task_id().unwrap_or(0),
           res.map(|s| s as isize));
-    sched::exit_thread();
+    sched::exit_thread(0);
 }
 
-fn state_post_remove_read() -> ! {
+extern "C" fn state_post_remove_read() -> ! {
     let dev = state_test_handle();
     let res = dev.read(io::ReadRequest {
         buffer: MemoryRegion { base_address: 0, size: 0 },
@@ -335,7 +336,7 @@ fn state_post_remove_read() -> ! {
         REJECTED_AFTER_REMOVE.fetch_add(1, Ordering::Relaxed);
     }
     info!("state_post_remove_read: read -> {:?}", res.map(|s| s as isize));
-    sched::exit_thread();
+    sched::exit_thread(0);
 }
 
 fn run_state_tests() {
@@ -364,7 +365,7 @@ fn run_state_tests() {
     STATE_TEST_RUN.store(true, Ordering::Release);
     REJECTED_DURING_STOPPED.store(0, Ordering::Relaxed);
     for _ in 0..3 {
-        sched::create_thread(state_reject_loop).expect("Failed to spawn state_reject_loop");
+        sched::create_thread(state_reject_loop, core::ptr::null_mut()).expect("Failed to spawn state_reject_loop");
     }
     sched::delay_ms(50);                // let the readers start spinning
     info!("state phase 2: stopping device");
@@ -380,7 +381,7 @@ fn run_state_tests() {
     // config_guard, exactly one wins (state == Stopped); the others see Started
     // and bail with DeviceStopped.
     for _ in 0..3 {
-        sched::create_thread(state_start_once).expect("Failed to spawn state_start_once");
+        sched::create_thread(state_start_once, core::ptr::null_mut()).expect("Failed to spawn state_start_once");
     }
     sched::delay_ms(300);
     let post_start_write = dev.write(io::ReadRequest {
@@ -395,7 +396,7 @@ fn run_state_tests() {
     // all through the Started guard).
     SUCCESS_AFTER_START.store(0, Ordering::Relaxed);
     for _ in 0..3 {
-        sched::create_thread(state_write_once).expect("Failed to spawn state_write_once");
+        sched::create_thread(state_write_once, core::ptr::null_mut()).expect("Failed to spawn state_write_once");
     }
     sched::delay_ms(300);
     let succ = SUCCESS_AFTER_START.load(Ordering::Relaxed);
@@ -408,7 +409,7 @@ fn run_state_tests() {
     io::pnp_fence();                    // wait until the worker finishes the removal
     REJECTED_AFTER_REMOVE.store(0, Ordering::Relaxed);
     for _ in 0..3 {
-        sched::create_thread(state_post_remove_read).expect("Failed to spawn state_post_remove_read");
+        sched::create_thread(state_post_remove_read, core::ptr::null_mut()).expect("Failed to spawn state_post_remove_read");
     }
     sched::delay_ms(300);
     let post_rm = REJECTED_AFTER_REMOVE.load(Ordering::Relaxed);
@@ -446,61 +447,61 @@ fn run_fence_tests() {
     info!("=== run_fence_tests: PASSED ===");
 }
 
-fn interative_thread_spawn_tests() {
-    KEYBOARD_EVENT.call_once(|| {
-        KEvent::new(true)
-    });
-
-    // Sample invocation to test out interrupt subsystem
-    clear_keyboard_output_buffer();
-    install_interrupt_handler(1, core::ptr::null_mut(), key_notifier, true, true);
-    
-    sched::create_thread(watchdog).unwrap();
-    let spawn_proc = sched::create_process(process_spawn, false).expect("Failed to create second process");
-    info!("Main task waiting for process id 1 to complete");
-    spawn_proc.wait().expect("Unable to wait on process id 1");
-    
-    let spawn_task = sched::create_thread(task_spawn).unwrap();
-
-    info!("Main task waiting for task id 1 to complete");
-    spawn_task.wait().expect("Unable to wait on task id 1");
-}
-
-fn spam_threads_test() {
-    let user_proc0 = sched::create_process(|| -> ! {loop{}}, true)
-    .expect("Failed to create user process 0");
-    
-    sched::create_thread(thread_creator).expect("Failed to create kernel thread!");
-}
-
-fn producer_consumer_test() {
-    sched::create_thread(|| {
-        loop {
-            {
-                let mut queue = QUEUE.lock();
-                queue.add_node([0; 64]).expect("Failed to add node from producer!");
-                let addr = queue.last().unwrap().as_ptr().addr();
-                debug!("Added new node at address {:#X}", addr);
-            }
-            sched::delay_ms(1000);
-        }
-    }).expect("Failed to create producer thread!");
-
-    sched::create_process(|| {
-       loop {
-            {
-                let mut queue = QUEUE.lock();
-                let node = queue.first();
-                if node.is_some() {
-                    let node = node.unwrap();
-                    debug!("[Consumer]: Found node at address: {:#X}", node.as_ptr().addr());
-                }
-                queue.pop_node();
-            }
-            sched::delay_ms(1000);
-       } 
-    }, false).expect("Failed to create consumer process!");
-}
+//fn interative_thread_spawn_tests() {
+//    KEYBOARD_EVENT.call_once(|| {
+//        KEvent::new(true)
+//    });
+//
+//    // Sample invocation to test out interrupt subsystem
+//    clear_keyboard_output_buffer();
+//    install_interrupt_handler(1, core::ptr::null_mut(), key_notifier, true, true);
+//    
+//    sched::create_thread(watchdog).unwrap();
+//    let spawn_proc = sched::create_process(process_spawn, false).expect("Failed to create second process");
+//    info!("Main task waiting for process id 1 to complete");
+//    spawn_proc.wait().expect("Unable to wait on process id 1");
+//    
+//    let spawn_task = sched::create_thread(task_spawn).unwrap();
+//
+//    info!("Main task waiting for task id 1 to complete");
+//    spawn_task.wait().expect("Unable to wait on task id 1");
+//}
+//
+//fn spam_threads_test() {
+//    let user_proc0 = sched::create_process(|| -> ! {loop{}}, true)
+//    .expect("Failed to create user process 0");
+//    
+//    sched::create_thread(thread_creator).expect("Failed to create kernel thread!");
+//}
+//
+//fn producer_consumer_test() {
+//    sched::create_thread(|| {
+//        loop {
+//            {
+//                let mut queue = QUEUE.lock();
+//                queue.add_node([0; 64]).expect("Failed to add node from producer!");
+//                let addr = queue.last().unwrap().as_ptr().addr();
+//                debug!("Added new node at address {:#X}", addr);
+//            }
+//            sched::delay_ms(1000);
+//        }
+//    }).expect("Failed to create producer thread!");
+//
+//    sched::create_process(|| {
+//       loop {
+//            {
+//                let mut queue = QUEUE.lock();
+//                let node = queue.first();
+//                if node.is_some() {
+//                    let node = node.unwrap();
+//                    debug!("[Consumer]: Found node at address: {:#X}", node.as_ptr().addr());
+//                }
+//                queue.pop_node();
+//            }
+//            sched::delay_ms(1000);
+//       } 
+//    }, false).expect("Failed to create consumer process!");
+//}
 
 fn kern_main() -> ! {
     info!("Starting main kernel init");
@@ -518,6 +519,26 @@ fn kern_main() -> ! {
     //    sched::delay_ms(1000);
     //    info!("Main task looping");
     //}
+
+    #[repr(C)]
+    struct TestStruct {
+        val1: usize,
+        val2: isize
+    }
+
+    let mut test_arg = TestStruct {val1: 1, val2: -1};
+    
+    info!("Waiting for test process to complete...");
+    
+    let test_proc = sched::create_process(vec!["libtest1.so".into(), "arg1".into(), "arg2".into()], &mut test_arg as *mut TestStruct as *mut c_void, false)
+    .expect("Failed to create test process!");
+
+    test_proc.wait().expect("Test proc wait failed");
+
+    let exit_code = test_proc.lock().get_exit_code();
+    info!("Test process exit code: {}", exit_code);
+    info!("New arg parameters: val1 = {}, val2 = {}", test_arg.val1, test_arg.val2);
+
     info!("Main task going to sleep");
     info!("====TTY mode====");
     hal::sleep();
@@ -556,12 +577,12 @@ fn run_i8042_tests() {
     // Test 2: three concurrent readers 
     // Each reader opens its own handle and issues a read of a specific length.
     info!("i8042 test 2: spawning 3 concurrent readers (need 2+4+1 = 7 more keys)...");
-    sched::create_thread(i8042_reader_a).expect("i8042: spawn reader-a");
-    sched::create_thread(i8042_reader_b).expect("i8042: spawn reader-b");
-    sched::create_thread(i8042_reader_c).expect("i8042: spawn reader-c");
+    sched::create_thread(i8042_reader_a, core::ptr::null_mut()).expect("i8042: spawn reader-a");
+    sched::create_thread(i8042_reader_b, core::ptr::null_mut()).expect("i8042: spawn reader-b");
+    sched::create_thread(i8042_reader_c, core::ptr::null_mut()).expect("i8042: spawn reader-c");
 }
 
-fn i8042_reader_a() -> ! {
+extern "C" fn i8042_reader_a() -> ! {
     let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-a: no device");
     let mut buf = [0u8; 2];
     info!("i8042 reader-a: waiting for 2 chars");
@@ -570,10 +591,10 @@ fn i8042_reader_a() -> ! {
         offset: 0,
     });
     info!("i8042 reader-a: got chars: {:?}", core::str::from_utf8(&buf).unwrap_or("?"));
-    sched::exit_thread()
+    sched::exit_thread(0)
 }
 
-fn i8042_reader_b() -> ! {
+extern "C" fn i8042_reader_b() -> ! {
     let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-b: no device");
     let mut buf = [0u8; 4];
     info!("i8042 reader-b: waiting for 4 chars");
@@ -582,10 +603,10 @@ fn i8042_reader_b() -> ! {
         offset: 0,
     });
     info!("i8042 reader-b: got chars: {:?}", core::str::from_utf8(&buf).unwrap_or("?"));
-    sched::exit_thread()
+    sched::exit_thread(0)
 }
 
-fn i8042_reader_c() -> ! {
+extern "C" fn i8042_reader_c() -> ! {
     let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-c: no device");
     let mut buf = [0u8; 1];
     info!("i8042 reader-c: waiting for 1 char");
@@ -594,7 +615,7 @@ fn i8042_reader_c() -> ! {
         offset: 0,
     });
     info!("i8042 reader-c: got char: {:?}", core::str::from_utf8(&buf).unwrap_or("?"));
-    sched::exit_thread()
+    sched::exit_thread(0)
 }
 
 // This will be called from the entry point for the corresponding arch
@@ -642,7 +663,7 @@ extern "C" fn key_notifier(_ctx: *mut core::ffi::c_void) -> bool {
     // Let the watchdog task know that we're active
     WATCHDOG_MARK.store(true, Ordering::Release);
 
-    true  // claim IRQ 1
+    true 
 }
 
 static WATCHDOG_MARK: AtomicBool = AtomicBool::new(false);
@@ -661,9 +682,4 @@ extern "C" fn watchdog() -> ! {
             WATCHDOG_MARK.store(false, Ordering::Release);
         }
     }
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn exported_function() {
-    info!("Driver called exported function!");
 }

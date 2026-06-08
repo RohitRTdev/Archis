@@ -106,7 +106,7 @@ impl<T> Spinlock<T> {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn create_spinlock(lock: &mut Lock) {
+extern "C" fn create_spinlock_ffi(lock: &mut Lock) {
     let val = hal::Spinlock::new();
 
     unsafe {
@@ -115,7 +115,7 @@ extern "C" fn create_spinlock(lock: &mut Lock) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn acquire_spinlock(lock: &mut Lock) {
+extern "C" fn acquire_spinlock_ffi(lock: &mut Lock) {
     unsafe {
         #[cfg(not(test))]
         let stat = hal::disable_interrupts();
@@ -147,7 +147,7 @@ extern "C" fn acquire_spinlock(lock: &mut Lock) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn release_spinlock(lock: &mut Lock) {
+extern "C" fn release_spinlock_ffi(lock: &mut Lock) {
     unsafe {
         // Snapshot int_status BEFORE releasing the lock. Once unlock() runs,
         // another core can acquire the lock and overwrite lock.int_status with

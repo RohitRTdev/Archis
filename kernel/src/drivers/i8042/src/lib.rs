@@ -248,7 +248,7 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
     let ctx = unsafe { &mut *(device.ctx as *mut I8042Ctx) };
 
     // Initialise the spinlock and reset all state before enabling the IRQ.
-    unsafe { create_spinlock(&mut ctx.lock); }
+    create_spinlock(&mut ctx.lock);
     ctx.char_head   = 0;
     ctx.char_tail   = 0;
     ctx.char_len    = 0;
@@ -271,9 +271,7 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
         }
     }
 
-    ctx.interrupt_handle = unsafe {
-        io_install_interrupt_handler(1, device.ctx, keyboard_isr, true, true)
-    };
+    ctx.interrupt_handle = io_install_interrupt_handler(1, device.ctx, keyboard_isr, true, true);
 
     request.complete_irp(Status::Success);
     Status::Success
@@ -285,23 +283,23 @@ fn do_stop(device: &DeviceObject, request: &mut Irp) -> Status {
     let ctx = unsafe { &mut *(device.ctx as *mut I8042Ctx) };
 
     // Remove the interrupt handler first so no new chars arrive after this point.
-    unsafe { io_remove_interrupt_handler(ctx.interrupt_handle); }
+    io_remove_interrupt_handler(ctx.interrupt_handle);
 
     // Collect all pending IRPs under the lock, clear the list.
     let mut to_fail = [core::ptr::null_mut::<Irp>(); MAX_PENDING];
     let to_fail_len;
 
-    unsafe { acquire_spinlock(&mut ctx.lock); }
+    acquire_spinlock(&mut ctx.lock);
     to_fail_len = ctx.pending_len;
     for i in 0..to_fail_len {
         to_fail[i] = ctx.pending[i].irp;
     }
     ctx.pending_len = 0;
-    unsafe { release_spinlock(&mut ctx.lock); }
+    release_spinlock(&mut ctx.lock);
 
     // Fail all queued IRPs outside the lock (device stopping, not user cancellation).
     for i in 0..to_fail_len {
-        unsafe { io_complete_irp(to_fail[i], Status::Failed); }
+        io_complete_irp(to_fail[i], Status::Failed);
     }
 
     request.complete_irp(Status::Success);
@@ -338,20 +336,20 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
 
     let ctx = unsafe { &mut *(device.ctx as *mut I8042Ctx) };
 
-    unsafe { acquire_spinlock(&mut ctx.lock); }
+    acquire_spinlock(&mut ctx.lock);
 
     if ctx.char_len >= requested {
         // Enough characters already buffered – satisfy synchronously.
         let dst = request.buffer.base_address as *mut u8;
         unsafe { ctx.dequeue_into(dst, requested); }
         request.bytes_completed = requested;
-        unsafe { release_spinlock(&mut ctx.lock); }
+        release_spinlock(&mut ctx.lock);
         request.complete_irp(Status::Success);
         return Status::Success;
     }
 
     if ctx.pending_len == MAX_PENDING {
-        unsafe { release_spinlock(&mut ctx.lock); }
+        release_spinlock(&mut ctx.lock);
         request.complete_irp(Status::Failed);
         return Status::Failed;
     }
@@ -360,11 +358,11 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
     let irp_ptr = request as *mut Irp;
     ctx.pending[ctx.pending_len] = PendingEntry { irp: irp_ptr, requested };
     ctx.pending_len += 1;
-    unsafe { release_spinlock(&mut ctx.lock); }
+    release_spinlock(&mut ctx.lock);
 
     // Install cancel routine AFTER the IRP is in our list so the cancel
     // path always finds it and can remove it cleanly.
-    unsafe { io_set_cancel_routine(irp_ptr, i8042_cancel); }
+    io_set_cancel_routine(request, i8042_cancel);
 
     Status::Pending
 }
@@ -375,15 +373,15 @@ extern "C" fn i8042_cancel(dev: *const DeviceObject, irp: *mut Irp) {
     // Find and remove the IRP from the pending list.
     if !dev.is_null() {
         let ctx = unsafe { &mut *((*dev).ctx as *mut I8042Ctx) };
-        unsafe { acquire_spinlock(&mut ctx.lock); }
+        acquire_spinlock(&mut ctx.lock);
         ctx.remove_pending(irp);
-        unsafe { release_spinlock(&mut ctx.lock); }
+        release_spinlock(&mut ctx.lock);
     }
     // Always complete with Cancelled. If the ISR already removed the IRP from
     // the list and wrote data to its buffer, io_start_processing (called by the
     // ISR after releasing our lock) will see is_cancelled=true and bail out,
     // letting this path win.
-    unsafe { io_complete_irp(irp, Status::Cancelled); }
+    io_complete_irp(irp, Status::Cancelled);
 }
 
 // Keyboard ISR
@@ -433,7 +431,7 @@ extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
         let mut collected     = [core::ptr::null_mut::<Irp>(); MAX_PENDING];
         let mut collected_len = 0;
 
-        unsafe { acquire_spinlock(&mut ctx.lock); }
+        acquire_spinlock(&mut ctx.lock);
 
         ctx.push_char(ch);
 
@@ -454,7 +452,7 @@ extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
             }
         }
 
-        unsafe { release_spinlock(&mut ctx.lock); }
+        release_spinlock(&mut ctx.lock);
 
         // Complete collected IRPs outside the lock.
         // io_start_processing atomically claims each IRP (prevents cancel from
@@ -462,8 +460,8 @@ extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
         // the IRP has been completed by the cancel path; we just move on.
         for k in 0..collected_len {
             let irp = collected[k];
-            if unsafe { io_start_processing(irp) } {
-                unsafe { io_complete_irp(irp, Status::Success); }
+            if io_start_processing(irp) {
+                io_complete_irp(irp, Status::Success);
             }
         }
     }

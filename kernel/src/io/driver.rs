@@ -2,7 +2,6 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -10,7 +9,7 @@ use common::{MemoryRegion, StrRef};
 use kernel_intf::driver::{
     DeviceObject, DriverObject, EMPTY_REGION, Irp, IrpMajor, IrpMinor, IrpResult, Status
 };
-use kernel_intf::{acquire_spinlock, release_spinlock};
+use kernel_intf::{acquire_spinlock, io_complete_irp, release_spinlock};
 use kernel_intf::list::{DynList, List};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::{KError, info};
@@ -539,7 +538,7 @@ pub extern "C" fn io_invalidate_device(device: *const DeviceObject) -> Status {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn io_send_request(
+pub extern "C" fn io_send_request_ffi(
     device: *const DeviceObject,
     major: usize,
     minor: usize,
@@ -569,7 +568,7 @@ pub extern "C" fn io_send_request(
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn io_complete_irp(irp: *mut Irp, status: Status) {
+extern "C" fn io_complete_irp_ffi(irp: *mut Irp, status: Status) {
     assert!(status == Status::Success || status == Status::Failed || status == Status::Cancelled || status == Status::Unsupported);
     unsafe { (*irp).status = status }
     let completion_routine = unsafe { (*irp).completion_routine };
@@ -578,14 +577,14 @@ extern "C" fn io_complete_irp(irp: *mut Irp, status: Status) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn io_start_processing(irp: *mut Irp) -> bool {
+extern "C" fn io_start_processing_ffi(irp: *mut Irp) -> bool {
     disable_preemption();
     let irp = unsafe { &mut *irp };
-    unsafe { acquire_spinlock(&mut irp.cancel_lock); }
+    acquire_spinlock(&mut irp.cancel_lock);
     if irp.is_cancelled {
         crate::io_log!("Cancelled arm in io_start_processing by thread: {} on irp {:#X}", irp.thread_id, irp as *const Irp as usize);
         let ctx = irp.completion_ctx as *mut AsyncCtx;
-        unsafe { release_spinlock(&mut irp.cancel_lock); }
+        release_spinlock(&mut irp.cancel_lock);
         deallocate_irp(irp, ctx);
         enable_preemption();
 
@@ -593,25 +592,25 @@ extern "C" fn io_start_processing(irp: *mut Irp) -> bool {
     }
     else {
         irp.cancel_routine = None;
-        unsafe { release_spinlock(&mut irp.cancel_lock); }
+        release_spinlock(&mut irp.cancel_lock);
         enable_preemption();
         true
     }
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn io_set_cancel_routine(
+extern "C" fn io_set_cancel_routine_ffi(
     irp: *mut Irp, 
     routine: extern "C" fn(*const DeviceObject, *mut Irp)
 ) {
     let irp = unsafe { &mut *irp };
-    unsafe { acquire_spinlock(&mut irp.cancel_lock); }
+    acquire_spinlock(&mut irp.cancel_lock);
     crate::io_log!("Setting cancel routine by thread: {} on irp {:#X}", irp.thread_id, irp as *const Irp as usize);
     
     assert!(!irp.is_cancelled);
     assert!(irp.cancel_routine.is_none());
     irp.cancel_routine = Some(routine);
-    unsafe { release_spinlock(&mut irp.cancel_lock); }
+    release_spinlock(&mut irp.cancel_lock);
 }
 
 pub fn deallocate_irp(irp: *mut Irp, ctx: *mut AsyncCtx) {
@@ -620,23 +619,6 @@ pub fn deallocate_irp(irp: *mut Irp, ctx: *mut AsyncCtx) {
     drop(unsafe { Box::from_raw_in(irp, PoolAllocatorGlobal) });
     drop(unsafe { Box::from_raw_in(ctx, PoolAllocatorGlobal) });
     enable_preemption();
-}
-
-// Exported to drivers: spawn a kernel worker thread. The handler must never
-// return; it should finish by calling exit_kernel_thread. Stopgap until a
-// proper DPC/bottom-half mechanism exists.
-#[unsafe(no_mangle)]
-#[allow(improper_ctypes_definitions)]
-pub extern "C" fn create_kernel_thread(handler: fn() -> !) -> KError {
-    match crate::sched::create_thread(handler) {
-        Ok(_) => KError::Success,
-        Err(e) => e
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn exit_kernel_thread() -> ! {
-    crate::sched::exit_thread()
 }
 
 pub fn init() {

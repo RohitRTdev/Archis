@@ -74,6 +74,6 @@ pub fn delay_ms(value: usize) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn delay_ms_ffi(value: usize) {
+pub extern "C" fn sched_delay_ms_ffi(value: usize) {
     delay_ms(value);
 }

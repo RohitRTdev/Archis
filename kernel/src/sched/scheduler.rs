@@ -1,27 +1,23 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::collections::BTreeMap;
-use alloc::collections::BTreeMap;
 use common::{MemoryRegion, PAGE_SIZE};
 use core::ptr::NonNull;
 use core::mem::take;
 use core::sync::atomic::{AtomicU8, AtomicIsize, AtomicUsize, Ordering};
 use core::ffi::c_void;
 use core::ptr::null_mut;
-use core::mem::take;
-use super::{KProcess, ProcessStatus, get_current_process, get_process_info, KTimerInnerType};
+use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_process_info, KTimerInnerType};
 use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores, get_worker_stack, set_panic_base};
 use crate::hal::{self, IPIRequestType, create_kernel_context, disable_scheduler_timer, enable_scheduler_timer, fetch_context, get_per_cpu_base, get_per_cpu_data, get_per_cpu_kernel_base, set_per_cpu_base, set_per_cpu_data, switch_context};
 use crate::mem::{VCB, get_kernel_addr_space, set_address_space};
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
-use crate::sync::{KSem, KSemInnerType, Spinlock};
 use crate::io::{self, IrpPtr, deallocate_irp};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::list::{List, ListNode, DynList};
 use kernel_intf::driver::{DeviceObject, Irp, IrpMajor, IrpMinor, IrpResult, Status};
 use kernel_intf::{acquire_spinlock, release_spinlock};
 use kernel_intf::{KError, debug, info};
-use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_process_info, KTimerInnerType};
 
 #[cfg(target_arch = "x86_64")]
 use crate::hal::{get_per_cpu_kernel_base_for_core, set_tss_stack};
@@ -1105,7 +1101,7 @@ pub fn create_init_thread(handler: DispatchRoutine, process: KProcess, context_p
 
     let thread_id = thread.lock().get_id();
     let proc_addr_space = process.lock().get_vcb();
-    debug!("Created init thread {} on process {} on core {}", thread_id, proc_id, core);
+    crate::sched_log!("Created init thread {} on process {} on core {}", thread_id, proc_id, core);
 
     thread.lock().context_ptr = context_ptr;
     thread.lock().process = Some(process);
@@ -1221,6 +1217,7 @@ pub fn get_current_thread_args() -> *mut c_void {
 }
 
 impl Spinlock<Task> {
+    // Blocks caller until thread terminates
     pub fn wait(&self) -> Result<(), KError> {
         let sem = {
             let task = self.lock();
@@ -1230,3 +1227,14 @@ impl Spinlock<Task> {
         sem.wait()
     }
 }
+
+#[unsafe(no_mangle)]
+extern "C" fn sched_get_cur_thread_arg_ffi() -> *mut c_void {
+    let task = get_current_task().expect("sched_get_cur_thread_arg() called from idle task!");
+    task.lock().context_ptr
+} 
+
+#[unsafe(no_mangle)]
+extern "C" fn sched_get_cur_thread_id_ffi() -> usize {
+    get_current_task_id().expect("sched_get_cur_thread_id() called from idle task!")
+}   

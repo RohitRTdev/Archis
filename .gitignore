@@ -1,5 +1,6 @@
 **/placeholder*
 *stub*
+boot.conf
 output
 **/target
 trampoline_offsets.rs

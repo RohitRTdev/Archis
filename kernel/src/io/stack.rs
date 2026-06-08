@@ -9,7 +9,7 @@ use kernel_intf::driver::{DeviceObject, EMPTY_REGION, IrpMajor, IrpMinor, Status
 
 // Max devices a bus can report from a single Enumerate IRP. The caller
 // pre-allocates a buffer this big; the driver writes pointers and sets
-// bytes_completed. Bumped here if buses grow chattier.
+// bytes_completed.
 const MAX_ENUMERATE_DEVICES: usize = 16;
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::info;

@@ -84,7 +84,7 @@ pub fn install_interrupt_handler(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn io_install_interrupt_handler(
+pub extern "C" fn io_install_interrupt_handler_ffi(
     irq: usize,
     context: *mut core::ffi::c_void,
     handler: InterruptRoutine,
@@ -95,7 +95,7 @@ pub extern "C" fn io_install_interrupt_handler(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn io_remove_interrupt_handler(handle: InterruptHandle) {
+pub extern "C" fn io_remove_interrupt_handler_ffi(handle: InterruptHandle) {
     let int_stat = disable_interrupts();
 
     {

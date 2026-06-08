@@ -34,20 +34,21 @@ mkfs.vfat -F32 -n $EFI_LABEL ${LOOPp0} > /dev/null
 mkfs.vfat -F32 -n $ROOT_LABEL ${LOOPp1} > /dev/null
 
 install_kernel_image() {
-    local src="output"
-    local dst_kernel=$KERNEL_MNT_POINT
-    local dst_blr=$BLR_MNT_POINT
+  local src="output"
+  local dst_kernel=$KERNEL_MNT_POINT
+  local dst_blr=$BLR_MNT_POINT
 
-    echo "Installing kernel and bootloader into image..."
+  echo "Installing kernel and bootloader into image..."
 
-    mkdir -p "$dst_kernel/sys/drivers"
-    mkdir -p "$dst_blr/efi/boot"
+  mkdir -p "$dst_kernel/sys/drivers"
+  mkdir -p "$dst_blr/efi/boot"
 
-    cp "$src"/drivers/*.so "$dst_kernel/sys/drivers/" || echo "No drivers found..."
-    cp "$src/drivers/boot.conf" "$dst_kernel/sys/drivers/" || echo "boot.conf not found..."
-    cp "$src/aris" "$dst_kernel/sys/" || echo "Kernel not found..."
-    cp "$src/initfs.conf" "$dst_kernel/sys/" || echo "InitFS configuration not found..."
-    cp "$src/bootx64.efi" "$dst_blr/efi/boot/" || echo "Bootloader not found..."
+  cp "$src"/drivers/*.so "$dst_kernel/sys/drivers/" || echo "No drivers found..."
+  cp "$src/drivers/boot.conf" "$dst_kernel/sys/drivers/" || echo "boot.conf not found..."
+  cp "$src/aris" "$dst_kernel/sys/" || echo "Kernel file not found..."
+  cp "$src"/*.so "$dst_kernel/sys/" || echo "sys lib files not found..."
+  cp "$src/initfs.conf" "$dst_kernel/sys/" || echo "InitFS configuration not found..."
+  cp "$src/bootx64.efi" "$dst_blr/efi/boot/" || echo "Bootloader not found..."
 }
 
 # CREATE MOUNTPOINTS

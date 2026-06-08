@@ -524,6 +524,7 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     let boot_conf_path = Path::new(&drivers_dir).join("boot.conf");
+    println!("cargo:rerun-if-changed={}", boot_conf_path.display());
 
     // Build the description string
     // This doesn't do any validation. Any problems will only be flagged at runtime

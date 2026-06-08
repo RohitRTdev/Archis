@@ -406,15 +406,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "test2"
-version = "0.1.0"
-dependencies = [
- "common",
- "kernel_intf",
- "kmod",
-]
-
-[[package]]
 name = "tests"
 version = "0.1.0"
 

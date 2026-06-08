@@ -7,11 +7,11 @@ BLR_EXE = target/x86_64-unknown-uefi/$(CONFIG)/boot.efi
 BLR_TARGET_EXE = $(OUTPUT_DIR)/bootx64.efi 
 KERNEL_EXE = target/x86_64/$(CONFIG)/libaris.so
 LINKER_SCRIPT = kernel/config/x86_64/linker.ld
-DRIVER_LINKER_SCRIPT = kernel/config/x86_64/driver_linker.ld
+MODULE_LINKER_SCRIPT = config/x86_64/module_linker.ld
 OUTPUT_IMAGE = $(OUTPUT_DIR)/archis_os.iso
 PLATFORM = acpi
 BOOTLOADER = uefi
-KERNEL_OPTIONS = --features acpi,stack_down,debug-io-logs
+KERNEL_OPTIONS = --features acpi,stack_down,debug-io-logs,debug-scheduler-logs,debug-loader-logs
 BLR_OPTIONS = --features acpi
 
 ifeq ($(OS),Windows_NT)
