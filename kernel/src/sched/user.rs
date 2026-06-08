@@ -36,7 +36,7 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
 
 // Must be called from valid process context
 pub fn create_user_thread(handler: DispatchRoutine, context: *mut c_void) -> Result<KThread, KError> {
-    let res = create_thread_do_work(user_init_handler, Some(handler), core::ptr::null_mut());
+    let res = create_thread_do_work(None, user_init_handler, Some(handler), context);
 
     if res.is_err() {
         info!("User thread creation failed!");

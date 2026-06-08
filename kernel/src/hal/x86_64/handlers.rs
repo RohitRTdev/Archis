@@ -342,7 +342,12 @@ pub fn notify_core(req_type: IPIRequestType, target_core: usize) {
     };
 
     let mut req_queue = IPI_REQUESTS.lock();
-    req_queue.add_node(req).expect("Failed to queue ipi request");
+    let res = req_queue.add_node(req);
+    if res.is_err() {
+        // Infra uses this, so drop the lock
+        drop(req_queue);
+        panic!("Failed to queue ipi request");
+    }
 
     lapic::send_ipi(apic_id as u32, IPI_VECTOR as u8);
 }

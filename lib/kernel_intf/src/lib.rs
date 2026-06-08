@@ -1,6 +1,8 @@
 #![no_std]
 #![feature(allocator_api)]
 
+extern crate alloc;
+
 mod log;
 pub use log::*;
 pub mod mem;
@@ -8,6 +10,7 @@ pub mod list;
 pub mod driver;
 use core::{ffi::c_void, fmt};
 use common::StrRef;
+use alloc::vec::Vec;
 
 pub type InterruptRoutine = extern "C" fn(*mut core::ffi::c_void) -> bool;
 
@@ -174,6 +177,13 @@ unsafe extern "C" {
     fn sched_get_cur_process_arg_ffi(num: usize) -> StrRef;
     fn sched_get_cur_thread_arg_ffi() -> *mut c_void;
     fn sched_get_cur_thread_id_ffi() -> usize;
+
+    fn sched_create_process_ffi(args: *const StrRef, args_len: usize, context_ptr: *mut c_void) -> usize;
+    fn sched_wait_process_ffi(proc_id: usize);
+    fn sched_kill_process_ffi(proc_id: usize, exit_code: isize);
+    fn sched_create_thread_ffi(handler: extern "C" fn() -> !, context_ptr: *mut c_void) -> usize;
+    fn sched_exit_thread_ffi(exit_code: isize) -> !;
+    fn sched_kill_thread_ffi(thread_id: usize, exit_code: isize);
 }
 
 pub fn sched_delay_ms(value: usize) {
@@ -227,6 +237,43 @@ pub fn sched_get_cur_thread_arg() -> *mut c_void {
 
 pub fn sched_get_cur_thread_id() -> usize {
     unsafe { sched_get_cur_thread_id_ffi() }
+}
+
+pub fn sched_create_process(args: &[&str], context_ptr: *mut c_void) -> Option<usize> {
+    let refs: Vec<StrRef> = args.iter().map(|s| StrRef::from_str(s)).collect();
+    let res = unsafe { sched_create_process_ffi(refs.as_ptr(), refs.len(), context_ptr) };
+    if res == usize::MAX {
+        None
+    }
+    else {
+        Some(res)
+    }
+}
+
+pub fn sched_wait_process(proc_id: usize) {
+    unsafe { sched_wait_process_ffi(proc_id) }
+}
+
+pub fn sched_kill_process(proc_id: usize, exit_code: isize) {
+    unsafe { sched_kill_process_ffi(proc_id, exit_code) }
+}
+
+pub fn sched_create_thread(handler: extern "C" fn() -> !, context_ptr: *mut c_void) -> Option<usize> {
+    let res = unsafe { sched_create_thread_ffi(handler, context_ptr) };
+    if res == usize::MAX {
+        None
+    }
+    else {
+        Some(res)
+    }
+}
+
+pub fn sched_exit_thread(exit_code: isize) -> ! {
+    unsafe { sched_exit_thread_ffi(exit_code) }
+}
+
+pub fn sched_kill_thread(thread_id: usize, exit_code: isize) {
+    unsafe { sched_kill_thread_ffi(thread_id, exit_code) }
 }
 
 pub fn create_spinlock(lock: &mut Lock) {

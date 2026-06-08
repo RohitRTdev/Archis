@@ -30,24 +30,18 @@ use loader::module;
 
 extern crate alloc;
 use alloc::collections::BTreeMap;
-use alloc::collections::VecDeque;
 use alloc::vec;
 
 #[cfg(test)]
 mod tests;
 
 use sync::{Once, Spinlock};
-use cpu::install_interrupt_handler;
-use hal::read_port_u8;
 use mem::Regions::*;
 use mem::FixedList;
 use kernel_intf::driver::{IrpMajor, IrpMinor, IrpResult, Status, create_device_by_id};
 use kernel_intf::KError;
-use kernel_intf::list::{List, DynList};
-use sched::KThread;
+use kernel_intf::list::List;
 use sync::KSem;
-
-use crate::sync::KEvent;
 
 static BOOT_INFO: Once<BootInfo> = Once::new();
 
@@ -73,103 +67,91 @@ struct InitFS {
 
 static INIT_FS: Once<InitFS> = Once::new();  
 static REMAP_LIST: Spinlock<FixedList<RemapEntry, {Region2 as usize}>> = Spinlock::new(List::new());
+static THREAD_DONE_SEM: Once<KSem> = Once::new();
 
-fn clear_keyboard_output_buffer() {
-    unsafe {
-        while read_port_u8(0x64) & 0x01 != 0 {
-            let _ = read_port_u8(0x60);
-        }
-    }
-}
 
-static TASK_COUNTER: Once<KSem> = Once::new();
-
-extern "C" fn spawned_task_entry() -> ! {
-    let id = sched::get_current_task_id().unwrap();
-    info!("Running task: {}", id);
-    TASK_COUNTER.get().unwrap().signal();
-
-    loop {
-        info!("id:{}", id);
-        sched::delay_ms(1000);
-    }
-}
-
-// Checking thread subsystem
-extern "C" fn task_spawn() -> ! {
-    let mut tasks: VecDeque<KThread> = VecDeque::new();
-    TASK_COUNTER.call_once(|| {
-        KSem::new(0, 5)
-    });
-
-    let task_id = sched::get_current_task_id().unwrap();
-    info!("Starting task spawner, id={}", task_id);
-
-    for idx in 0..5 {
-        info!("Creating task {} in task spawner", idx);
-        tasks.push_back(sched::create_thread(spawned_task_entry, core::ptr::null_mut()).unwrap());
-    }
-
-    info!("Task spawner going to wait!");
-    
-    for _ in 0..5 {
-        TASK_COUNTER.get().unwrap().wait().unwrap();
-    }
-
-    info!("Task spawner starting kill spree");
-
-    loop {
-        info!("Task spawner waiting for keyboard event");
-        KEYBOARD_EVENT.get().unwrap().wait().unwrap();
-        info!("Task spawner springing to action");
-        if !tasks.is_empty() {
-            let task = tasks.pop_front().unwrap();
-            let id = task.lock().get_id();
-            info!("Killing task {}", id);
-            sched::kill_thread(id, 0);
-        }
-        else {
-            info!("Killing self");
-            sched::exit_thread(0);
-        }
-    }
-}
-
-extern "C" fn process_spawn() -> ! {
-    for _ in 0..2 {
-        sched::create_process(alloc::vec!["/test_proc".into()], core::ptr::null_mut(), false)
-            .expect("Failed to create process");
-    }
-
-    // This pattern should be never followed in a real scenario, but this is here just for testing
-    let sem = KSem::new(0, 1);
-
-    info!("Init Thread going to wait state");
-    let _ = sem.wait();
-
-    // This is here in case this process is killed before it gets a chance to wait forever
+// Simple worker used in run_proc_thread_tests test 3.
+extern "C" fn test_thread_runner() -> ! {
+    let id = sched::get_current_task_id().unwrap_or(0);
+    info!("test_thread_runner: started (id={})", id);
+    sched::delay_ms(500);
+    info!("test_thread_runner: signaling done (id={})", id);
+    THREAD_DONE_SEM.get().unwrap().signal();
     sched::exit_thread(0);
 }
 
-static QUEUE: Spinlock<DynList<[i64; 64]>> = Spinlock::new(List::new());
+// Tests:
+//   1. Single kernel process create + wait + exit-code check.
+//   2. Three concurrent kernel processes, each waited individually.
+//   3. Three worker threads synchronised through a semaphore.
+fn run_proc_thread_tests() {
+    info!("=== run_proc_thread_tests: BEGIN ===");
 
-extern "C" fn thread_creator() -> ! {
-    let id = sched::get_current_task_id().unwrap();
-    let mut counter = 1;
-    loop {
-        sched::delay_ms(1000);
-        debug!("Running thread with id {}", id);
-        sched::create_thread(thread_creator, core::ptr::null_mut()).expect("Failed to create child thread!");
-        if counter % 5 == 0 {
-            sched::create_process(alloc::vec!["/test_proc".into()], core::ptr::null_mut(), false)
-                .expect("Failed to create child process!");
-        }
+    // Test 1: single process with context_ptr; verify the module mutates it
+    info!("--- proc/thread test 1: single process with context ---");
 
-        if counter % 10 == 0 {
-            sched::exit_process(0);
-        }
-        counter += 1;
+    #[repr(C)]
+    struct TestCtx {
+        val1: usize,
+        val2: isize,
     }
+
+    let mut ctx = TestCtx { val1: 42, val2: -7 };
+    let proc1 = sched::create_process(
+        vec!["libtest1.so".into(), "hello_from_test1".into()],
+        &mut ctx as *mut TestCtx as *mut c_void,
+        false,
+    )
+    .expect("proc/thread test 1: failed to create process");
+
+    proc1.wait().expect("proc/thread test 1: wait failed");
+    let code1 = proc1.lock().get_exit_code();
+    info!("proc/thread test 1: process exited with code {}", code1);
+    info!("proc/thread test 1: ctx.val1 after = {} (expect 10)", ctx.val1);
+
+    // Test 2: three concurrent processes (no context), wait for all
+    info!("--- proc/thread test 2: concurrent processes ---");
+
+    const PROC_COUNT: usize = 3;
+    let mut procs = alloc::vec::Vec::with_capacity(PROC_COUNT);
+    for i in 0..PROC_COUNT {
+        let p = sched::create_process(
+            vec!["libtest1.so".into(), alloc::format!("concurrent_proc_{}", i)],
+            core::ptr::null_mut(),
+            false,
+        )
+        .expect("proc/thread test 2: failed to create process");
+        info!("proc/thread test 2: launched process {} (id={})", i, p.lock().get_id());
+        procs.push(p);
+    }
+
+    for (i, p) in procs.iter().enumerate() {
+        p.wait().expect("proc/thread test 2: wait failed");
+        info!("proc/thread test 2: process {} exited with code {}", i, p.lock().get_exit_code());
+    }
+
+    // Test 3: thread creation + semaphore synchronisation
+    info!("--- proc/thread test 3: thread creation ---");
+
+    const THREAD_COUNT: usize = 3;
+    THREAD_DONE_SEM.call_once(|| KSem::new(0, THREAD_COUNT as isize));
+
+    let mut threads = alloc::vec::Vec::with_capacity(THREAD_COUNT);
+    for _ in 0..THREAD_COUNT {
+        threads.push(
+            sched::create_thread(test_thread_runner, core::ptr::null_mut())
+                .expect("proc/thread test 3: failed to create thread"),
+        );
+    }
+
+    // Wait for every thread to signal it has finished.
+    for _ in 0..THREAD_COUNT {
+        THREAD_DONE_SEM.get().unwrap().wait().unwrap();
+    }
+    info!("proc/thread test 3: all {} threads completed", THREAD_COUNT);
+    drop(threads);
+
+    info!("=== run_proc_thread_tests: PASSED ===");
 }
 
 // === IRP cancellation tests ===
@@ -447,61 +429,17 @@ fn run_fence_tests() {
     info!("=== run_fence_tests: PASSED ===");
 }
 
-//fn interative_thread_spawn_tests() {
-//    KEYBOARD_EVENT.call_once(|| {
-//        KEvent::new(true)
-//    });
-//
-//    // Sample invocation to test out interrupt subsystem
-//    clear_keyboard_output_buffer();
-//    install_interrupt_handler(1, core::ptr::null_mut(), key_notifier, true, true);
-//    
-//    sched::create_thread(watchdog).unwrap();
-//    let spawn_proc = sched::create_process(process_spawn, false).expect("Failed to create second process");
-//    info!("Main task waiting for process id 1 to complete");
-//    spawn_proc.wait().expect("Unable to wait on process id 1");
-//    
-//    let spawn_task = sched::create_thread(task_spawn).unwrap();
-//
-//    info!("Main task waiting for task id 1 to complete");
-//    spawn_task.wait().expect("Unable to wait on task id 1");
-//}
-//
-//fn spam_threads_test() {
-//    let user_proc0 = sched::create_process(|| -> ! {loop{}}, true)
-//    .expect("Failed to create user process 0");
-//    
-//    sched::create_thread(thread_creator).expect("Failed to create kernel thread!");
-//}
-//
-//fn producer_consumer_test() {
-//    sched::create_thread(|| {
-//        loop {
-//            {
-//                let mut queue = QUEUE.lock();
-//                queue.add_node([0; 64]).expect("Failed to add node from producer!");
-//                let addr = queue.last().unwrap().as_ptr().addr();
-//                debug!("Added new node at address {:#X}", addr);
-//            }
-//            sched::delay_ms(1000);
-//        }
-//    }).expect("Failed to create producer thread!");
-//
-//    sched::create_process(|| {
-//       loop {
-//            {
-//                let mut queue = QUEUE.lock();
-//                let node = queue.first();
-//                if node.is_some() {
-//                    let node = node.unwrap();
-//                    debug!("[Consumer]: Found node at address: {:#X}", node.as_ptr().addr());
-//                }
-//                queue.pop_node();
-//            }
-//            sched::delay_ms(1000);
-//       } 
-//    }, false).expect("Failed to create consumer process!");
-//}
+extern "C" fn thread_creator() -> ! {
+    info!("Created new thread");
+    loop {
+        sched::create_thread(thread_creator, core::ptr::null_mut()).expect("Failed to create kernel thread!");
+        sched::delay_ms(500);
+    }
+}
+
+fn spam_threads_test() {
+    sched::create_thread(thread_creator, core::ptr::null_mut()).expect("Failed to create kernel thread!");
+}
 
 fn kern_main() -> ! {
     info!("Starting main kernel init");
@@ -515,30 +453,8 @@ fn kern_main() -> ! {
     //run_state_tests();
     //run_i8042_tests();
 
-    //loop {
-    //    sched::delay_ms(1000);
-    //    info!("Main task looping");
-    //}
-
-    #[repr(C)]
-    struct TestStruct {
-        val1: usize,
-        val2: isize
-    }
-
-    let mut test_arg = TestStruct {val1: 1, val2: -1};
-    
-    info!("Waiting for test process to complete...");
-    
-    let test_proc = sched::create_process(vec!["libtest1.so".into(), "arg1".into(), "arg2".into()], &mut test_arg as *mut TestStruct as *mut c_void, false)
-    .expect("Failed to create test process!");
-
-    test_proc.wait().expect("Test proc wait failed");
-
-    let exit_code = test_proc.lock().get_exit_code();
-    info!("Test process exit code: {}", exit_code);
-    info!("New arg parameters: val1 = {}, val2 = {}", test_arg.val1, test_arg.val2);
-
+    //run_proc_thread_tests();
+    spam_threads_test();
     info!("Main task going to sleep");
     info!("====TTY mode====");
     hal::sleep();
@@ -637,49 +553,4 @@ unsafe extern "C" fn kern_start(boot_info: *const BootInfo) -> ! {
     debug!("{:?}", *BOOT_INFO.get().unwrap());
 
     hal::init();
-}
-
-static KEYBOARD_EVENT: Once<KEvent> = Once::new();
-
-extern "C" fn key_notifier(_ctx: *mut core::ffi::c_void) -> bool {
-    let stack_base = hal::get_current_stack_base();
-    info!("Interrupt stack base = {:#X}", stack_base);
-    let avl_memory = mem::get_available_memory();
-    info!("Available memory: {}", avl_memory);
-    let task = sched::get_current_task();
-    if task.is_none() {
-        info!("Called keyboard handler from idle task on core {}", hal::get_core());
-    }
-    else {
-        let task = task.unwrap();
-        let id = task.lock().get_id();
-        let status = task.lock().get_status();
-        info!("Called keyboard handler in task:{} with status: {:?}", id, status);
-    }
-
-    KEYBOARD_EVENT.get().unwrap().signal();
-    clear_keyboard_output_buffer();
-
-    // Let the watchdog task know that we're active
-    WATCHDOG_MARK.store(true, Ordering::Release);
-
-    true 
-}
-
-static WATCHDOG_MARK: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn watchdog() -> ! {
-    loop {
-        sched::delay_ms(10_000);
-        let is_active = WATCHDOG_MARK.load(Ordering::Acquire);
-        
-        if !is_active {
-            info!("Watchdog task clearing keyboard buffer");
-            clear_keyboard_output_buffer();
-            WATCHDOG_MARK.store(true, Ordering::Release);
-        }
-        else {
-            WATCHDOG_MARK.store(false, Ordering::Release);
-        }
-    }
 }

@@ -456,11 +456,41 @@ extern "C" fn sched_get_num_process_args_ffi() -> usize {
 extern "C" fn sched_get_cur_process_arg_ffi(num: usize) -> StrRef {
     let proc = get_current_process().expect("get_cur_process_arg() called in idle process!");
     let guard = proc.lock();
-    
+
     assert!(num < guard.args.len());
-    
+
     // This is fine since the argument location is valid for the lifetime of this process
     StrRef::from_str(guard.args[num].as_str())
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn sched_create_process_ffi(
+    args: *const StrRef,
+    args_len: usize,
+    context_ptr: *mut c_void,
+) -> usize {
+    let args_vec: Vec<String> = unsafe {
+        core::slice::from_raw_parts(args, args_len)
+            .iter()
+            .map(|s| String::from(s.as_str()))
+            .collect()
+    };
+    match create_process(args_vec, context_ptr, false) {
+        Ok(proc) => proc.lock().get_id(),
+        Err(_) => usize::MAX,
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn sched_wait_process_ffi(proc_id: usize) {
+    if let Some(proc) = get_process_info(proc_id) {
+        let _ = proc.wait();
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn sched_kill_process_ffi(proc_id: usize, exit_code: isize) {
+    kill_process(proc_id, exit_code);
 }
 
 impl Spinlock<Process> {

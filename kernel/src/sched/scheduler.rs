@@ -11,6 +11,7 @@ use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_p
 use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores, get_worker_stack, set_panic_base};
 use crate::hal::{self, IPIRequestType, create_kernel_context, disable_scheduler_timer, enable_scheduler_timer, fetch_context, get_per_cpu_base, get_per_cpu_data, get_per_cpu_kernel_base, set_per_cpu_base, set_per_cpu_data, switch_context};
 use crate::mem::{VCB, get_kernel_addr_space, set_address_space};
+use crate::sched::get_current_process_id;
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
 use crate::io::{self, IrpPtr, deallocate_irp};
 use kernel_intf::mem::PoolAllocatorGlobal;
@@ -1131,7 +1132,7 @@ pub fn start_task(thread: &KThread, core: usize, process: &KProcess, registry: &
     Ok(())
 }
 
-pub fn create_thread_do_work(handler: DispatchRoutine, user_fn: Option<DispatchRoutine>, context_ptr: *mut c_void) -> Result<KThread, KError> {
+pub fn create_thread_do_work(proc_id: Option<usize>, handler: DispatchRoutine, user_fn: Option<DispatchRoutine>, context_ptr: *mut c_void) -> Result<KThread, KError> {
     disable_preemption();
 
     let (thread, core) = match create_thread_common(handler, user_fn) {
@@ -1143,7 +1144,12 @@ pub fn create_thread_do_work(handler: DispatchRoutine, user_fn: Option<DispatchR
     };
 
     let thread_id = thread.lock().get_id();
-    let cur_process = get_current_process();
+    let process = if let Some(id) = proc_id {
+        get_process_info(id)
+    }
+    else {
+        get_current_process()
+    };
 
     // Lock order => Scheduler -> Process -> Task
     // We compute the setup result inside this block so that all the locks
@@ -1154,7 +1160,7 @@ pub fn create_thread_do_work(handler: DispatchRoutine, user_fn: Option<DispatchR
             SCHEDULER_CON_BLK.get(core).task_queue.lock()
         };
 
-        if let Some(process) = cur_process {
+        if let Some(process) = process {
             let process_ref = Arc::clone(&process);
             let mut guard = process.lock();
 
@@ -1184,7 +1190,7 @@ pub fn create_thread_do_work(handler: DispatchRoutine, user_fn: Option<DispatchR
             }
         }
         else {
-            panic!("create_thread() called from idle task!!");
+            Err(KError::ProcessTerminated)
         }
     };
 
@@ -1201,9 +1207,19 @@ pub fn create_thread_do_work(handler: DispatchRoutine, user_fn: Option<DispatchR
 
 // Must be called from valid process context
 pub fn create_thread(handler: DispatchRoutine, context_ptr: *mut c_void) -> Result<KThread, KError> {
-    let res = create_thread_do_work(handler, None, context_ptr);
+    let res = create_thread_do_work(None, handler, None, context_ptr);
     if res.is_err() {
         info!("Failed to create kernel thread");
+    }
+
+    res
+}
+
+// Create a new worker thread under kernel process (which is always going to be process 0 and is guaranteed to exist)
+pub fn create_system_thread(handler: DispatchRoutine, context_ptr: *mut c_void) -> Result<KThread, KError> {
+    let res = create_thread_do_work(Some(0), handler, None, context_ptr);
+    if res.is_err() {
+        info!("Failed to create system thread");
     }
 
     res
@@ -1238,3 +1254,24 @@ extern "C" fn sched_get_cur_thread_arg_ffi() -> *mut c_void {
 extern "C" fn sched_get_cur_thread_id_ffi() -> usize {
     get_current_task_id().expect("sched_get_cur_thread_id() called from idle task!")
 }   
+
+#[unsafe(no_mangle)]
+extern "C" fn sched_create_thread_ffi(
+    handler: DispatchRoutine,
+    context_ptr: *mut c_void,
+) -> usize {
+    match create_thread(handler, context_ptr) {
+        Ok(thread) => thread.lock().get_id(),
+        Err(_) => usize::MAX,
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn sched_exit_thread_ffi(exit_code: isize) -> ! {
+    exit_thread(exit_code)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn sched_kill_thread_ffi(thread_id: usize, exit_code: isize) {
+    kill_thread(thread_id, exit_code)
+}
