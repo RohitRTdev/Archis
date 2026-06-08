@@ -214,8 +214,16 @@ impl<T, A: Allocator<ListNode<T>>> List<T, A> {
     pub fn insert_node_at_head(&mut self, this: NonNull<ListNode<T>>) {
         self.insert_node(this, false);
     }
+    
+    pub fn pop_head(&mut self) {
+        if let Some(node) = self.head {
+            unsafe {
+                self.remove_node(node);
+            }
+        }
+    }
 
-    pub fn pop_node(&mut self) {
+    pub fn pop_tail(&mut self) {
         if let Some(node) = self.tail {
             unsafe {
                 self.remove_node(node);

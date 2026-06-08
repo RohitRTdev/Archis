@@ -7,7 +7,7 @@ use core::mem::take;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicIsize, AtomicUsize, Ordering};
 use core::ffi::c_void;
 use core::ptr::null_mut;
-use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_process_info, KTimerInnerType};
+use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_process_info};
 use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores, get_worker_stack, set_panic_base};
 use crate::hal::{self, IPIRequestType, create_kernel_context, disable_scheduler_timer, enable_scheduler_timer, fetch_context, get_per_cpu_base, get_per_cpu_data, get_per_cpu_kernel_base, set_per_cpu_base, set_per_cpu_data, switch_context};
 use crate::mem::{VCB, get_kernel_addr_space, set_address_space};
@@ -54,9 +54,10 @@ pub struct Task {
     quanta: usize,
     panic_base: usize,
     user_fn: Option<DispatchRoutine>,
+    last_wait_on_expired_timer: bool,
     wait_semaphores: DynList<KSemInnerType>,
     issued_irps: DynList<IrpPtr>,
-    term_notify: KSem,
+    term_notify: KEvent,
     process: Option<KProcess>,
     vcb: Option<VCB>,
     pub context_ptr: *mut c_void,
@@ -93,7 +94,8 @@ impl Task {
             user_fn,
             wait_semaphores: List::new(),
             issued_irps: List::new(),
-            term_notify: KSem::new(0, 1),
+            last_wait_on_expired_timer: false,
+            term_notify: KEvent::new(false),
             process: None,
             vcb: None,
             context_ptr: null_mut(),
@@ -115,6 +117,14 @@ impl Task {
 
     pub fn get_status(&self) -> TaskStatus {
         self.status
+    }
+    
+    pub fn get_expired_timer_status(&self) -> bool {
+        self.last_wait_on_expired_timer
+    }
+    
+    pub fn reset_expired_timer_status(&mut self) {
+        self.last_wait_on_expired_timer = false;
     }
     
     pub fn get_core(&self) -> usize {
@@ -188,12 +198,19 @@ pub struct DriverWorker {
 
 unsafe impl Send for DriverWorker {}
 
+struct TimerInfo {
+    timer_count: usize,
+    task_id: usize,
+    sem: KSemInnerType
+}
+
 pub struct TaskQueue {
     active_tasks: DynList<KThread>,
     waiting_tasks: DynList<KThread>,
     terminated_tasks: DynList<KThread>,
-    notifier_list: DynList<KSem>,
-    timer_list: DynList<KTimerInnerType>,
+    notifier_list: DynList<KEvent>,
+    timer_notifier_list: DynList<TimerInfo>,
+    timer_list: DynList<TimerInfo>,
     running_task: Option<NonNull<ListNode<KThread>>>,
     idle_task_stack: NonNull<u8>,
     leftover_stack: DynList<Stack>,
@@ -210,6 +227,7 @@ impl TaskQueue {
             terminated_tasks: List::new(),
             notifier_list: List::new(),
             timer_list: List::new(),
+            timer_notifier_list: List::new(),
             running_task: None,
             idle_task_stack: NonNull::dangling(),
             leftover_stack: List::new(),
@@ -369,40 +387,8 @@ pub fn init() {
     enable_scheduler_timer();
 }
 
-// Set task to waiting and add the timer atomically
-pub fn add_cur_task_to_wait_queue_with_timer(wait_semaphore: KSemInnerType, timer: KTimerInnerType) -> bool {
+pub fn add_cur_task_to_wait_queue(wait_semaphore: KSemInnerType, timeout: Option<usize>) -> bool {
     let mut sched_cb = SCHEDULER_CON_BLK.local().task_queue.lock();
-    let cb = sched_cb.running_task;
-    if cb.is_none() {
-        panic!("add_cur_task_to_wait_queue_with_timer() called from idle task!!");
-    }
-    
-    let cur_task = unsafe { &**cb.unwrap().as_ptr() };
-    let mut task = cur_task.lock();
-    
-    // TERMINATED > WAITING, don't do anything
-    if task.status == TaskStatus::TERMINATED {
-        return false;
-    }
-    
-    let res = sched_cb.timer_list.add_node(timer);
-    if res.is_err() {
-        return false;
-    }
-
-    assert!(task.wait_semaphores.get_nodes() == 0);
-    let res = task.wait_semaphores.add_node(wait_semaphore);
-    if res.is_err() {
-        sched_cb.timer_list.pop_node();
-        return false;
-    }
-
-    task.status = TaskStatus::WAITING;
-    true
-}
-
-pub fn add_cur_task_to_wait_queue(wait_semaphore: KSemInnerType) -> bool {
-    let sched_cb = SCHEDULER_CON_BLK.local().task_queue.lock();
     let cb = sched_cb.running_task;
     if cb.is_none() {
         panic!("add_cur_task_to_wait_queue() called from idle task!!");
@@ -419,39 +405,34 @@ pub fn add_cur_task_to_wait_queue(wait_semaphore: KSemInnerType) -> bool {
     
     assert!(task.wait_semaphores.get_nodes() == 0);
 
-    let res = task.wait_semaphores.add_node(wait_semaphore);
-    if res.is_err() {
-        return false;
+    task.wait_semaphores.add_node(wait_semaphore.clone())
+    .expect("Failed to add semaphore to wait_semaphores list in task CB!");
+
+    if let Some(timer_count) = timeout {
+        assert!(timer_count > 0);
+        sched_cb.timer_list.add_node(TimerInfo {timer_count, task_id: task.id, sem: wait_semaphore})
+        .expect("Failed to add timer info into TaskQueue!");
     }
 
     task.status = TaskStatus::WAITING;
     true
 }
 
-fn remove_wait_semaphore(task: &mut Task, wait_semaphore: KSemInnerType) {
-    let mut sem = None;
-    let sem_val = (&*wait_semaphore) as *const _;
-
+fn remove_wait_semaphore(task: &mut Task, sched_cb: &mut TaskQueue, wait_semaphore: KSemInnerType) {
     assert!(task.wait_semaphores.get_nodes() == 1);
 
-    for semaphore in task.wait_semaphores.iter() {
-        let val = (&***semaphore) as *const _;
+    // Remove the timer and semaphore from task queue and task CB
+    sched_cb.timer_list.find_and_remove(|t| {
+        t.task_id == task.id && Arc::ptr_eq(&t.sem, &wait_semaphore) 
+    });
 
-        if val == sem_val {
-            sem = Some(NonNull::from(semaphore));
-            break;
-        } 
-    }
-
-    if sem.is_some() {
-        unsafe {
-            task.wait_semaphores.remove_node(sem.unwrap());
-        }
-    }
+    task.wait_semaphores.find_and_remove(|t| {
+        Arc::ptr_eq(t, &wait_semaphore)
+    });
 }
 
 
-pub fn signal_waiting_task(task_id: usize, wait_semaphore: KSemInnerType) {
+pub fn signal_waiting_task(task_id: usize, wait_semaphore: KSemInnerType, is_expired_timer: bool) {
     let this_task = get_task_info(task_id);
 
     // It could be that this task has been killed
@@ -495,7 +476,8 @@ pub fn signal_waiting_task(task_id: usize, wait_semaphore: KSemInnerType) {
                     task.status = TaskStatus::ACTIVE;
                 }
 
-                remove_wait_semaphore(&mut *task, wait_semaphore);
+                remove_wait_semaphore(&mut *task, &mut *sched_cb, wait_semaphore);
+                task.last_wait_on_expired_timer = is_expired_timer;
             },
 
             TaskStatus::TERMINATED => {
@@ -514,7 +496,12 @@ pub fn signal_waiting_task(task_id: usize, wait_semaphore: KSemInnerType) {
 
     enable_preemption();
 }
-
+            
+fn remove_timer_from_task_queue(sched_cb: &mut TaskQueue, id: usize) {
+    sched_cb.timer_list.find_and_remove(|t| {
+        t.task_id == id
+    });
+}
 
 // Killing a thread is an unsafe process in general
 // This procedure must be called in a coordinated manner, otherwise it simply
@@ -622,6 +609,10 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
                 skip_notify = true;
                 yield_flag = hal::get_core() == core;
             }
+        }
+
+        if drop_task {
+            remove_timer_from_task_queue(&mut sched_cb, task_id);
         }
     }
 
@@ -761,18 +752,18 @@ pub fn allocate_irp(
  
 pub fn cancel_irp(irp_ptr: IrpPtr) {
     let irp = unsafe { &mut *irp_ptr };
-    unsafe { acquire_spinlock(&mut irp.cancel_lock); }
+    acquire_spinlock(&mut irp.cancel_lock);
 
     // Either another path cancelled this explicitly, or the driver did
     // not (a) get a chance yet to register the cancel routine, or
     // (b) decided that cancellation was not required for this request.
     if irp.cancel_routine.is_none() || irp.is_cancelled {
-        unsafe { release_spinlock(&mut irp.cancel_lock); }
+        release_spinlock(&mut irp.cancel_lock);
         return;
     }
 
     (irp.cancel_routine.unwrap())(irp.device, irp_ptr);
-    unsafe { release_spinlock(&mut irp.cancel_lock); }
+    release_spinlock(&mut irp.cancel_lock);
 }
 
 fn kill_sweep_irps(task: &KThread) {
@@ -835,21 +826,21 @@ fn update_timers(sched_cb: &mut TaskQueue) {
     let list_size = sched_cb.timer_list.get_nodes();
 
     while idx < list_size {
-        let timer = sched_cb.timer_list.first().unwrap();
-
-        let is_done = timer.lock().update_timer_count(QUANTUM);
+        let timer = sched_cb.timer_list.first_mut().unwrap();
+        timer.timer_count = timer.timer_count.saturating_sub(QUANTUM);
+        let is_done = timer.timer_count == 0;
 
         if is_done {
-            let sem = timer.lock().get_semaphore();
-            sched_cb.notifier_list.add_node(sem).expect("Unable to add timer node semaphore into notifier list!");
-
-            unsafe {
-                sched_cb.timer_list.remove_node(NonNull::from(timer))
-            };
+            let task_id = timer.task_id;
+            let sem = timer.sem.clone();
+            let timer_new = TimerInfo { timer_count: 0, task_id, sem };
+            sched_cb.timer_notifier_list.add_node(timer_new).expect("Unable to add timer node semaphore into notifier list!");
+            sched_cb.timer_list.pop_head();
         }
         else {
+            let timer_ptr = NonNull::from(timer);
             let timer_ref = unsafe {
-                ListNode::into_inner(sched_cb.timer_list.remove_node(NonNull::from(timer)))
+                ListNode::into_inner(sched_cb.timer_list.remove_node(timer_ptr))
             };
             
             sched_cb.timer_list.insert_node_at_tail(timer_ref);
@@ -860,9 +851,13 @@ fn update_timers(sched_cb: &mut TaskQueue) {
 }
 
 
-fn notify_watchers(notifier_list: &DynList<KSem>) {
+fn notify_watchers(notifier_list: &DynList<KEvent>, timer_notifier_list: &DynList<TimerInfo>) {
     for sem in notifier_list.iter() {
         sem.signal();
+    }
+
+    for expired_timer in timer_notifier_list.iter() {
+        KSem::from(expired_timer.sem.clone()).signal_task(expired_timer.task_id);
     }
 }
 
@@ -947,14 +942,14 @@ fn setup_current_task_ptr(sched_cb: &mut TaskQueue) {
 
 // Main scheduler loop
 pub fn schedule() {
-    let notifier_list = {
+    let (notifier_list, timer_notifier_list) = {
         let sched_cb_cpu = SCHEDULER_CON_BLK.local();
         let mut sched_cb = sched_cb_cpu.task_queue.lock();
         update_timers(&mut sched_cb);
         
         if sched_cb_cpu.preemption_count.load(Ordering::Acquire) > 0
             || sched_cb_cpu.is_dw_mode.load(Ordering::Acquire) {
-            take(&mut sched_cb.notifier_list)
+            (take(&mut sched_cb.notifier_list), take(&mut sched_cb.timer_notifier_list))
         }
         else {
             if sched_cb.running_task.is_some() {
@@ -1101,11 +1096,11 @@ pub fn schedule() {
             }
 
             reap_tasks(&mut sched_cb);
-            take(&mut sched_cb.notifier_list)
+            (take(&mut sched_cb.notifier_list), take(&mut sched_cb.timer_notifier_list))
         }
     };
 
-    notify_watchers(&notifier_list);
+    notify_watchers(&notifier_list, &timer_notifier_list);
 }
 
 fn prep_idle_task(sched_cb: &mut TaskQueue, old_vcb: VCB) {
@@ -1302,7 +1297,7 @@ pub fn get_current_thread_args() -> *mut c_void {
 
 impl Spinlock<Task> {
     // Blocks caller until thread terminates
-    pub fn wait(&self) -> Result<(), KError> {
+    pub fn wait(&self) -> bool {
         let sem = {
             let task = self.lock();
             task.term_notify.clone() 
@@ -1342,4 +1337,17 @@ extern "C" fn sched_exit_thread_ffi(exit_code: isize) -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn sched_kill_thread_ffi(thread_id: usize, exit_code: isize) {
     kill_thread(thread_id, exit_code)
+}
+
+// Do not call this function from interrupt context
+pub fn delay_ms(value: usize) {
+    let timer = KSem::new(0, 1);
+
+    // Let's not panic if wait fails (Since this could happen if process/thread is getting killed)
+    let _ = timer.wait_with_timeout(value);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sched_delay_ms_ffi(value: usize) {
+    delay_ms(value);
 }

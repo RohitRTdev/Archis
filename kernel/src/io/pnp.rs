@@ -9,7 +9,7 @@ use kernel_intf::info;
 use crate::sync::{KEvent, Once, Spinlock};
 use crate::sched;
 
-use super::driver::{get_device, load_driver_by_name};
+use super::driver::get_device;
 use super::stack;
 
 pub enum PnpRequest {
@@ -72,7 +72,7 @@ pub fn register_driver(name: String) {
 pub fn pnp_fence() {
     let event = KEvent::new(false);
     pnp_post(PnpRequest::Fence { event: event.clone() });
-    event.wait().expect("pnp_fence wait failed");
+    event.wait();
 }
 
 fn pop_one() -> Option<ListNodeGuard<PnpRequest, PoolAllocator>> {
@@ -129,7 +129,7 @@ extern "C" fn pnp_worker() -> ! {
     info!("Started pnp worker thread");
     loop {
         crate::io_log!("pnp_worker: Waiting for requests");
-        PNP_SIGNAL.get().unwrap().wait().expect("PnP signal wait failed");
+        PNP_SIGNAL.get().unwrap().wait();
         // Drain until empty, then go back to waiting.
         loop {
             let guard = match pop_one() {

@@ -12,7 +12,7 @@ use crate::loader::{LoadedImage, load_image};
 use crate::{KERNEL_PATH, hal};
 use crate::mem::{self, PageDescriptor, VCB, VirtMemConBlk, deallocate_memory, get_physical_address};
 use crate::sched::{self, *};
-use crate::sync::{KSem, Spinlock};
+use crate::sync::{KEvent, Spinlock};
 use crate::io::DeviceHandleK;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
@@ -45,8 +45,8 @@ pub struct Process {
     addr_space: VCB,
     status: ProcessStatus,
     is_user: bool,
-    term_notify: KSem,
-    init_notify: KSem,
+    term_notify: KEvent,
+    init_notify: KEvent,
 
     file_table: Vec<Option<Handle>>,
 
@@ -76,8 +76,8 @@ impl Process {
             addr_space: new_addr_space,
             status: ProcessStatus::Ready,
             is_user,
-            term_notify: KSem::new(0, 1),
-            init_notify: KSem::new(0, 1),
+            term_notify: KEvent::new(false),
+            init_notify: KEvent::new(false),
             memory_list: List::new(),
             file_table: Vec::new(),
             args,
@@ -150,11 +150,11 @@ impl Process {
         false
     }
 
-    pub fn get_notify_sem(&self) -> KSem {
+    pub fn get_notify_sem(&self) -> KEvent {
         self.term_notify.clone()
     }
     
-    pub fn get_init_sem(&self) -> KSem {
+    pub fn get_init_sem(&self) -> KEvent {
         self.init_notify.clone()
     }
 
@@ -325,7 +325,7 @@ pub fn create_process(args: Vec<String>, context_ptr: *mut c_void, is_user: bool
     enable_preemption();
 
     if is_user {
-        init_notify_sem.wait().expect("Wait failed on init_notify semaphore!");
+        init_notify_sem.wait();
     }
 
     Ok(process)
@@ -495,7 +495,7 @@ extern "C" fn sched_kill_process_ffi(proc_id: usize, exit_code: isize) {
 
 impl Spinlock<Process> {
     // Blocks caller until process terminates
-    pub fn wait(&self) -> Result<(), KError> {
+    pub fn wait(&self) -> bool {
         let sem = {
             let task = self.lock();
             task.term_notify.clone() 

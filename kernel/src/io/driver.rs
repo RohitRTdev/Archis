@@ -266,7 +266,7 @@ pub fn io_request_sync(
 
     let status = dispatch(driver, major, dev.device_ptr(), irp);
     if status == Status::Pending {
-        event.wait().expect("io_request_sync: completion wait failed with a pending IRP outstanding");
+        event.wait();
     }
     else if status == Status::Unsupported {
         io_complete_irp(irp, status);

@@ -104,7 +104,7 @@ fn run_proc_thread_tests() {
     )
     .expect("proc/thread test 1: failed to create process");
 
-    proc1.wait().expect("proc/thread test 1: wait failed");
+    proc1.wait();
     let code1 = proc1.lock().get_exit_code();
     info!("proc/thread test 1: process exited with code {}", code1);
     info!("proc/thread test 1: ctx.val1 after = {} (expect 10)", ctx.val1);
@@ -126,7 +126,7 @@ fn run_proc_thread_tests() {
     }
 
     for (i, p) in procs.iter().enumerate() {
-        p.wait().expect("proc/thread test 2: wait failed");
+        p.wait();
         info!("proc/thread test 2: process {} exited with code {}", i, p.lock().get_exit_code());
     }
 
@@ -146,7 +146,7 @@ fn run_proc_thread_tests() {
 
     // Wait for every thread to signal it has finished.
     for _ in 0..THREAD_COUNT {
-        THREAD_DONE_SEM.get().unwrap().wait().unwrap();
+        THREAD_DONE_SEM.get().unwrap().wait();
     }
     info!("proc/thread test 3: all {} threads completed", THREAD_COUNT);
     drop(threads);
@@ -441,6 +441,449 @@ fn spam_threads_test() {
     sched::create_thread(thread_creator, core::ptr::null_mut()).expect("Failed to create kernel thread!");
 }
 
+// === KSem / KEvent test suite ===
+//
+//   - try_wait (timeout=0) must not mutate the semaphore counter.
+//   - last_wait_on_expired_timer must be reset on every wait (otherwise a
+//     stale TRUE from a previous timed-out wait leaks into the next call).
+//   - timer cleanup on signal must match by (task_id, sem), not just sem.
+//     Otherwise task A being signalled wipes task B's timer.
+//   - timer-fired-after-signal race must not double-bump the counter.
+
+static SYNC_TEST_SEM:    Once<KSem>   = Once::new();
+static SYNC_TEST_DONE:   Once<KSem>   = Once::new();
+static SYNC_AUTO_EVENT:  Once<KEvent> = Once::new();
+static SYNC_MANUAL_EVENT:Once<KEvent> = Once::new();
+
+// Per-test bookkeeping populated by worker threads.
+static SYNC_WAKE_COUNT:    AtomicUsize = AtomicUsize::new(0);
+static SYNC_TIMEOUT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SYNC_SIGNAL_COUNT:  AtomicUsize = AtomicUsize::new(0);
+
+fn reset_sync_counters() {
+    SYNC_WAKE_COUNT.store(0, Ordering::Relaxed);
+    SYNC_TIMEOUT_COUNT.store(0, Ordering::Relaxed);
+    SYNC_SIGNAL_COUNT.store(0, Ordering::Relaxed);
+}
+
+// Generic semaphore waiter. Records whether it was signalled vs timed out.
+extern "C" fn sync_sem_waiter() -> ! {
+    let res = SYNC_TEST_SEM.get().unwrap().wait();
+    if res {
+        SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+    SYNC_TEST_DONE.get().unwrap().signal();
+    sched::exit_thread(0);
+}
+
+// Waits for 300ms then signals SYNC_TEST_SEM once. Used to test
+// "signal arrives before timeout".
+extern "C" fn sync_delayed_signaller() -> ! {
+    sched::delay_ms(300);
+    SYNC_TEST_SEM.get().unwrap().signal();
+    sched::exit_thread(0);
+}
+
+// Test 5 helper. Three workers, each with a DIFFERENT timeout, all waiting on
+// the same KSem. After we signal twice the two longest-timeout waiters must
+// have been woken with success; the shortest must have timed out. This is the
+// regression test for the "timer-removed-by-wrong-task" bug.
+extern "C" fn sync_long_timeout_waiter() -> ! {
+    // 3 seconds — well beyond the 500ms we let the test run before signalling
+    let res = SYNC_TEST_SEM.get().unwrap().wait_with_timeout(3000);
+    if res {
+        SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+    SYNC_TEST_DONE.get().unwrap().signal();
+    sched::exit_thread(0);
+}
+
+extern "C" fn sync_short_timeout_waiter() -> ! {
+    // 200ms — must hit the timeout deterministically
+    let res = SYNC_TEST_SEM.get().unwrap().wait_with_timeout(200);
+    if res {
+        SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+    SYNC_TEST_DONE.get().unwrap().signal();
+    sched::exit_thread(0);
+}
+
+// Generic event waiter (manual reset event in SYNC_MANUAL_EVENT).
+extern "C" fn sync_manual_event_waiter() -> ! {
+    let res = SYNC_MANUAL_EVENT.get().unwrap().wait();
+    if res {
+        SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+    SYNC_TEST_DONE.get().unwrap().signal();
+    sched::exit_thread(0);
+}
+
+// Generic event waiter (auto reset event in SYNC_AUTO_EVENT).
+extern "C" fn sync_auto_event_waiter() -> ! {
+    let res = SYNC_AUTO_EVENT.get().unwrap().wait();
+    if res {
+        SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+    SYNC_TEST_DONE.get().unwrap().signal();
+    sched::exit_thread(0);
+}
+
+fn join_workers(done_sem: &KSem, count: usize) {
+    for _ in 0..count {
+        done_sem.wait();
+    }
+}
+
+fn run_sync_tests() {
+    info!("=== run_sync_tests: BEGIN ===");
+
+    // Initialise the global slots used by all sub-tests. We re-create the
+    // KSem/KEvent inside each test that needs different state, but the Once
+    // is filled with a placeholder first so .get() never panics.
+    SYNC_TEST_SEM.call_once(|| KSem::new(0, 1));
+    SYNC_TEST_DONE.call_once(|| KSem::new(0, 64));
+    SYNC_AUTO_EVENT.call_once(|| KEvent::new(true));
+    SYNC_MANUAL_EVENT.call_once(|| KEvent::new(false));
+
+    // Test 1: counting semaphore basic — signal N, wait N (no blocking)
+    info!("sync test 1: counting semaphore basic");
+    {
+        let sem = KSem::new(0, 4);
+        sem.signal();
+        sem.signal();
+        sem.signal();
+        // Three signals queued; three try_wait should succeed.
+        assert!(sem.wait_with_timeout(0), "test 1: first try_wait expected success");
+        assert!(sem.wait_with_timeout(0), "test 1: second try_wait expected success");
+        assert!(sem.wait_with_timeout(0), "test 1: third try_wait expected success");
+        // Fourth must fail (counter back at 0).
+        assert!(!sem.wait_with_timeout(0), "test 1: fourth try_wait must fail");
+        // Confirm counter wasn't corrupted by the failed try_wait.
+        sem.signal();
+        assert!(sem.wait_with_timeout(0),
+            "test 1: after signal post-failed-try_wait, try_wait must succeed (regression for try_wait counter leak)");
+    }
+    info!("sync test 1: PASSED");
+
+    // Test 2: counting semaphore max_count clamp
+    info!("sync test 2: counter clamped to max_count");
+    {
+        let sem = KSem::new(2, 2);   // already at max
+        sem.signal();                // must clamp, not overflow
+        sem.signal();
+        assert!(sem.wait_with_timeout(0), "test 2: 1st try_wait");
+        assert!(sem.wait_with_timeout(0), "test 2: 2nd try_wait");
+        assert!(!sem.wait_with_timeout(0), "test 2: 3rd try_wait must fail (counter must have been clamped at 2)");
+    }
+    info!("sync test 2: PASSED");
+
+    // Test 3: timeout actually expires; flag flips correctly
+    info!("sync test 3: wait_with_timeout expires without signal");
+    {
+        let sem = KSem::new(0, 1);
+        let res = sem.wait_with_timeout(200);
+        assert!(!res, "test 3: timed wait must return false on expiry");
+    }
+    info!("sync test 3: PASSED");
+
+    // Test 4: stale-flag regression — wait that doesn't block after one
+    // that timed out must NOT return "timeout".
+    info!("sync test 4: stale last_wait_on_expired_timer must be reset");
+    {
+        let sem = KSem::new(0, 1);
+        let res1 = sem.wait_with_timeout(100);
+        assert!(!res1, "test 4: setup wait must time out");
+        // Now make the next wait succeed immediately.
+        sem.signal();
+        let res2 = sem.wait();
+        assert!(res2, "test 4: immediate-success wait returned false — stale timer flag (regression)");
+    }
+    info!("sync test 4: PASSED");
+
+    // Test 5: signal arrives before timeout — returns true
+    info!("sync test 5: signal arrives before timeout");
+    {
+        let sem = KSem::new(0, 1);
+        // Spawn a thread that signals after 200ms.
+        static T5_SEM: Once<KSem> = Once::new();
+        T5_SEM.call_once(|| sem.clone());
+        // (We don't actually need T5_SEM since `sem.clone()` shares inner.)
+        let _ = T5_SEM;
+
+        extern "C" fn t5_signaller() -> ! {
+            sched::delay_ms(200);
+            T5_SEM.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+        let h = sched::create_thread(t5_signaller, core::ptr::null_mut())
+            .expect("test 5: spawn signaller");
+
+        let res = sem.wait_with_timeout(2000);
+
+        h.wait();
+        assert!(res, "test 5: must return true (signalled), got false (timeout)");
+    }
+    info!("sync test 5: PASSED");
+
+    // Test 6: multi-waiter FIFO + per-task timer isolation
+    //
+    // Three waiters all wait_with_timeout on the same KSem with
+    // very different timeouts. We then signal twice, then wait long enough
+    // for the third's timer to expire. Expectation:
+    //   - 2 of the long-timeout waiters wake with success
+    //   - the short-timeout waiter times out
+    //   - no other "timeout" is recorded by the long waiters
+    info!("sync test 6: per-task timer isolation under signal");
+    {
+        reset_sync_counters();
+        let sem = KSem::new(0, 4);
+        static T6_SEM: Once<KSem> = Once::new();
+        T6_SEM.call_once(|| sem.clone());
+
+        extern "C" fn t6_long() -> ! {
+            let res = T6_SEM.get().unwrap().wait_with_timeout(3000);
+            if res { SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed); }
+            else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
+            SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+            SYNC_TEST_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+        extern "C" fn t6_short() -> ! {
+            let res = T6_SEM.get().unwrap().wait_with_timeout(200);
+            if res { SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed); }
+            else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
+            SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+            SYNC_TEST_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+
+        let l1 = sched::create_thread(t6_long,  core::ptr::null_mut()).unwrap();
+        let l2 = sched::create_thread(t6_long,  core::ptr::null_mut()).unwrap();
+        let s1 = sched::create_thread(t6_short, core::ptr::null_mut()).unwrap();
+
+        // Make sure all three blocked.
+        sched::delay_ms(50);
+
+        // Two signals → wakes 2 of the 3 
+        sem.signal();
+        sem.signal();
+
+        // Wait for all three workers.
+        join_workers(SYNC_TEST_DONE.get().unwrap(), 3);
+        l1.wait(); l2.wait(); s1.wait();
+
+        let signalled = SYNC_SIGNAL_COUNT.load(Ordering::Relaxed);
+        let timed_out = SYNC_TIMEOUT_COUNT.load(Ordering::Relaxed);
+        assert!(signalled == 2,
+            "test 6: signalled count = {}, expected 2", signalled);
+        assert!(timed_out == 1,
+            "test 6: timeout count = {}, expected 1 (regression: timer-by-wrong-task removal)", timed_out);
+        info!("sync test 6: PASSED (signalled={}, timed_out={})", signalled, timed_out);
+    }
+
+    // Test 7: multi-waiter — N waiters, M < N signals → only M wake
+    info!("sync test 7: multi-waiter partial wake");
+    {
+        reset_sync_counters();
+        let sem = KSem::new(0, 8);
+        static T7_SEM: Once<KSem> = Once::new();
+        T7_SEM.call_once(|| sem.clone());
+
+        extern "C" fn t7_waiter() -> ! {
+            // 2s timeout so unsignalled waiters eventually time out and the
+            // test finishes (we want them all to die so we can read counts).
+            let res = T7_SEM.get().unwrap().wait_with_timeout(1500);
+            if res { SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed); }
+            else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
+            SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+            SYNC_TEST_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+
+        let mut handles = alloc::vec::Vec::new();
+        for _ in 0..5 {
+            handles.push(sched::create_thread(t7_waiter, core::ptr::null_mut()).unwrap());
+        }
+        sched::delay_ms(50);
+
+        // Signal 3 of 5 waiters.
+        sem.signal();
+        sem.signal();
+        sem.signal();
+
+        join_workers(SYNC_TEST_DONE.get().unwrap(), 5);
+        for h in &handles { h.wait(); }
+
+        let signalled = SYNC_SIGNAL_COUNT.load(Ordering::Relaxed);
+        let timed_out = SYNC_TIMEOUT_COUNT.load(Ordering::Relaxed);
+        assert!(signalled == 3, "test 7: signalled = {}, expected 3", signalled);
+        assert!(timed_out == 2, "test 7: timed_out = {}, expected 2", timed_out);
+        info!("sync test 7: PASSED (signalled={}, timed_out={})", signalled, timed_out);
+    }
+
+    // Test 8: manual-reset KEvent — signal once, all waiters wake, and
+    // subsequent waits also acquire without blocking.
+    info!("sync test 8: manual-reset event");
+    {
+        reset_sync_counters();
+        let ev = KEvent::new(false);  // manual reset
+        static T8_EV: Once<KEvent> = Once::new();
+        T8_EV.call_once(|| ev.clone());
+
+        extern "C" fn t8_waiter() -> ! {
+            T8_EV.get().unwrap().wait();
+            SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+            SYNC_TEST_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+
+        let mut hs = alloc::vec::Vec::new();
+        for _ in 0..4 {
+            hs.push(sched::create_thread(t8_waiter, core::ptr::null_mut()).unwrap());
+        }
+        sched::delay_ms(50);
+
+        ev.signal();
+
+        join_workers(SYNC_TEST_DONE.get().unwrap(), 4);
+        for h in &hs { h.wait(); }
+
+        // After signal, manual event stays set: a fresh wait must succeed.
+        assert!(ev.wait_with_timeout(0),
+            "test 8: try_wait on already-signalled manual event must succeed");
+        // Reset must un-signal it.
+        ev.reset();
+        assert!(!ev.wait_with_timeout(0),
+            "test 8: try_wait on reset manual event must fail");
+
+        let woken = SYNC_WAKE_COUNT.load(Ordering::Relaxed);
+        assert!(woken == 4, "test 8: woke {} threads, expected 4", woken);
+        info!("sync test 8: PASSED (woke {})", woken);
+    }
+
+    // Test 9: auto-reset KEvent — signal N times, exactly N waiters wake.
+    info!("sync test 9: auto-reset event");
+    {
+        reset_sync_counters();
+        let ev = KEvent::new(true); // auto reset
+        static T9_EV: Once<KEvent> = Once::new();
+        T9_EV.call_once(|| ev.clone());
+
+        extern "C" fn t9_waiter() -> ! {
+            // Bounded timeout so test exits even if signalling under-counts.
+            let res = T9_EV.get().unwrap().wait_with_timeout(1500);
+            if res { SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed); }
+            else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
+            SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+            SYNC_TEST_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+
+        let mut hs = alloc::vec::Vec::new();
+        for _ in 0..4 {
+            hs.push(sched::create_thread(t9_waiter, core::ptr::null_mut()).unwrap());
+        }
+        sched::delay_ms(50);
+
+        // Signal twice with a tiny gap so consume-and-signal races resolve.
+        ev.signal();
+        sched::delay_ms(20);
+        ev.signal();
+
+        join_workers(SYNC_TEST_DONE.get().unwrap(), 4);
+        for h in &hs { h.wait(); }
+
+        let signalled = SYNC_SIGNAL_COUNT.load(Ordering::Relaxed);
+        let timed_out = SYNC_TIMEOUT_COUNT.load(Ordering::Relaxed);
+        assert!(signalled == 2,
+            "test 9: signalled = {}, expected 2 (auto-reset consumes per wake)", signalled);
+        assert!(timed_out == 2,
+            "test 9: timed_out = {}, expected 2", timed_out);
+        info!("sync test 9: PASSED (signalled={}, timed_out={})", signalled, timed_out);
+    }
+
+    // Test 10: try_wait on KEvent — manual + auto behaviour.
+    info!("sync test 10: KEvent try_wait semantics");
+    {
+        // Manual: signalled stays raised; auto: signalled gets consumed by
+        // a real wait, but try_wait (timeout=0) per current implementation
+        // does NOT consume (it just reports state).
+        let manual = KEvent::new(false);
+        let auto   = KEvent::new(true);
+
+        assert!(!manual.wait_with_timeout(0), "test 10: manual unsignalled try_wait → false");
+        assert!(!auto.wait_with_timeout(0),   "test 10: auto unsignalled try_wait → false");
+
+        manual.signal();
+        auto.signal();
+        assert!(manual.wait_with_timeout(0), "test 10: manual signalled try_wait → true");
+        assert!(auto.wait_with_timeout(0),   "test 10: auto signalled try_wait → true");
+
+        // Manual: still signalled after try_wait.
+        assert!(manual.wait_with_timeout(0), "test 10: manual still signalled after try_wait");
+        // Auto: try_wait does NOT consume signal (per current code: returns
+        // *signalled). A real wait() would consume it. We document this.
+        assert!(!auto.wait_with_timeout(0), "auto event consumed — second try_wait → false")
+    }
+    info!("sync test 10: PASSED");
+
+    // Test 11: stress — high-volume signal/wait on one semaphore.
+    info!("sync test 11: stress signal/wait");
+    {
+        reset_sync_counters();
+        const N: usize = 200;
+        let sem = KSem::new(0, N as isize);
+        static T11_SEM: Once<KSem> = Once::new();
+        T11_SEM.call_once(|| sem.clone());
+
+        extern "C" fn t11_waiter() -> ! {
+            let res = T11_SEM.get().unwrap().wait_with_timeout(2000);
+            if res { SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed); }
+            else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
+            SYNC_TEST_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+        extern "C" fn t11_signaller() -> ! {
+            for _ in 0..N {
+                T11_SEM.get().unwrap().signal();
+            }
+            sched::exit_thread(0);
+        }
+
+        let mut waiters = alloc::vec::Vec::new();
+        for _ in 0..N {
+            waiters.push(sched::create_thread(t11_waiter, core::ptr::null_mut()).unwrap());
+        }
+        let signaller = sched::create_thread(t11_signaller, core::ptr::null_mut()).unwrap();
+
+        join_workers(SYNC_TEST_DONE.get().unwrap(), N);
+        for h in &waiters { h.wait(); }
+        signaller.wait();
+
+        let signalled = SYNC_SIGNAL_COUNT.load(Ordering::Relaxed);
+        let timed_out = SYNC_TIMEOUT_COUNT.load(Ordering::Relaxed);
+        assert!(signalled == N,
+            "test 11: signalled = {}, expected {} (regression: counter drift on signal/timer race)",
+            signalled, N);
+        assert!(timed_out == 0,
+            "test 11: timed_out = {}, expected 0", timed_out);
+        info!("sync test 11: PASSED (signalled={}, timed_out={})", signalled, timed_out);
+    }
+
+    info!("=== run_sync_tests: PASSED ===");
+}
+
 fn kern_main() -> ! {
     info!("Starting main kernel init");
 
@@ -452,10 +895,13 @@ fn kern_main() -> ! {
     //run_fence_tests();
     //run_state_tests();
     //run_i8042_tests();
+    info!("Waiting before starting tests...");
+    sched::delay_ms(5000);
 
+    run_sync_tests();
     //run_proc_thread_tests();
     //spam_threads_test();
-    run_driver_worker_tests();
+    //run_driver_worker_tests();
     info!("Main task going to sleep");
     info!("====TTY mode====");
     hal::sleep();
@@ -472,6 +918,8 @@ fn kern_main() -> ! {
 //   4. After everything drains, the CPU leaves DW mode.
 
 use core::sync::atomic::AtomicI64;
+
+use crate::sync::KEvent;
 
 static DW_COUNTER:        AtomicI64    = AtomicI64::new(0);
 static DW_RAN:            AtomicUsize  = AtomicUsize::new(0);
