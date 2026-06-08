@@ -54,6 +54,10 @@ static PER_CPU_GLOBAL_CONTEXT: PerCpu<AtomicUsize> = PerCpu::new_with(
     [const {AtomicUsize::new(0)}; MAX_CPUS]
 );
 
+static PER_CPU_NESTED_CONTEXT: PerCpu<AtomicUsize> = PerCpu::new_with(
+    [const {AtomicUsize::new(0)}; MAX_CPUS]
+);
+
 static IPI_REQUESTS: Spinlock<FixedList<IPIRequest, {Region3 as usize}>> = Spinlock::new(List::new());
 
 static mut VECTOR_TABLE: [fn(usize); MAX_INTERRUPT_VECTORS] = [default_handler; MAX_INTERRUPT_VECTORS];
@@ -135,7 +139,13 @@ impl CPUContext {
 
 #[unsafe(no_mangle)]
 extern "C" fn global_interrupt_handler(vector: u64, cpu_context: *const CPUContext) -> *const CPUContext {
-    PER_CPU_GLOBAL_CONTEXT.local().store(cpu_context.addr(), Ordering::Release);
+    let in_dw = crate::sched::is_in_dw_mode();
+
+    // While in DW mode the original interrupted-task context still lives in
+    // PER_CPU_GLOBAL_CONTEXT and must not be touched 
+    let slot = if in_dw { &PER_CPU_NESTED_CONTEXT } else { &PER_CPU_GLOBAL_CONTEXT };
+    slot.local().store(cpu_context.addr(), Ordering::Release);
+
     unsafe {
         VECTOR_TABLE[vector as usize](vector as usize);
     }
@@ -143,8 +153,13 @@ extern "C" fn global_interrupt_handler(vector: u64, cpu_context: *const CPUConte
     if vector as usize > DEBUG_VECTOR && vector as usize != SYS_VECTOR {
         eoi();
     }
-    
-    PER_CPU_GLOBAL_CONTEXT.local().load(Ordering::Acquire) as *const CPUContext
+
+    // Only drain the DW queue when this interrupt did not itself happen during a DW.
+    if !in_dw {
+        crate::sched::dw_handler();
+    }
+
+    slot.local().load(Ordering::Acquire) as *const CPUContext
 }
 
 fn default_handler(idx: usize) {
@@ -246,10 +261,12 @@ fn page_fault_handler(_vector: usize) {
 }
 
 pub fn fetch_context() -> usize {
+    assert!(!crate::sched::is_in_dw_mode(), "fetch_context() called while in DW mode");
     PER_CPU_GLOBAL_CONTEXT.local().load(Ordering::Acquire)
 }
 
 pub fn switch_context(new_context: usize) {
+    assert!(!crate::sched::is_in_dw_mode(), "switch_context() called while in DW mode");
     PER_CPU_GLOBAL_CONTEXT.local().store(new_context, Ordering::Release);
 }
 

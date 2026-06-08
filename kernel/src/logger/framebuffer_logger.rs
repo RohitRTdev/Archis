@@ -220,6 +220,11 @@ impl FramebufferLogger {
                 self.current_x += tab_width - (self.current_x % tab_width);
                 self.adjust_cursor_pos();
             },
+            '\x08' => {
+                // We will make it such that the cursor cannot go up a line
+                // That simplifies the logic a lot
+                self.current_x = self.current_x.saturating_sub(self.font_header.width as usize);
+            },
             _ => {
                 self.draw_char(c);
                 self.current_x += self.font_header.width as usize;

@@ -29,6 +29,7 @@ enum Wake {
 fn do_wait(inner_arc: &KSemInnerType) -> Result<(), KError> {
     let int_enabled = hal::are_interrupts_enabled();
     let preemption_enabled = is_preemption_enabled();
+    let in_dw = sched::is_in_dw_mode();
 
     let mut yield_flag = false;
     {
@@ -57,6 +58,7 @@ fn do_wait(inner_arc: &KSemInnerType) -> Result<(), KError> {
         };
 
         if should_block {
+            assert!(!in_dw, "wait() called while in DW mode — only driver workers may run");
             assert!(int_enabled, "wait() would block with interrupts disabled — deadlock risk");
             assert!(preemption_enabled, "wait() would block with preemption disabled — deadlock risk");
 
@@ -156,6 +158,7 @@ impl KSem {
     pub fn wait_with_timer(&self, timer: KTimerInnerType) -> Result<(), KError> {
         let int_enabled = hal::are_interrupts_enabled();
         let preemption_enabled = is_preemption_enabled();
+        let in_dw = sched::is_in_dw_mode();
         let mut yield_flag = false;
         {
             let mut inner = self.inner.lock();
@@ -174,6 +177,7 @@ impl KSem {
             };
 
             if should_block {
+                assert!(!in_dw, "wait_with_timer() called while in DW mode — only driver workers may run");
                 assert!(int_enabled, "wait_with_timer() would block with interrupts disabled — deadlock risk");
                 assert!(preemption_enabled, "wait() would block with preemption disabled — deadlock risk");
 

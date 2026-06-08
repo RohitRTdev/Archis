@@ -10,6 +10,7 @@ use kernel_intf::{
     create_spinlock, acquire_spinlock, release_spinlock,
     io_complete_irp, io_set_cancel_routine, io_start_processing,
     io_install_interrupt_handler, io_remove_interrupt_handler,
+    io_create_driver_worker
 };
 use kernel_intf::driver::{
     DeviceObject, DriverObject, Irp, IrpMinor, Status, create_device,
@@ -21,6 +22,7 @@ const PORT_STATUS: u16 = 0x64;
 const PORT_CMD:    u16 = 0x64;
 const CHAR_BUF_SIZE: usize = 256;
 const MAX_PENDING:   usize = 16;
+const SC_PENDING_SIZE: usize = 32;
 
 // Scan-code set 1 make-code → ASCII. Index 0x00 unused; 0x01–0x58 mapped;
 // 0x59–0x7F padded with 0 (39 zeros). Total: 128 entries.
@@ -136,6 +138,12 @@ struct I8042Ctx {
     char_head:        usize,
     char_tail:        usize,
     char_len:         usize,
+    // Scancode-derived chars that the ISR has decoded but a driver worker has
+    // not yet processed (echo + ring insert + IRP completion).
+    sc_pending:       [u8; SC_PENDING_SIZE],
+    sc_head:          usize,
+    sc_tail:          usize,
+    sc_len:           usize,
     pending:          [PendingEntry; MAX_PENDING],
     pending_len:      usize,
     /// Handle returned by io_install_interrupt_handler; used for O(1) removal in do_stop.
@@ -153,6 +161,10 @@ impl I8042Ctx {
             char_head:        0,
             char_tail:        0,
             char_len:         0,
+            sc_pending:       [0; SC_PENDING_SIZE],
+            sc_head:          0,
+            sc_tail:          0,
+            sc_len:           0,
             pending:          [PendingEntry { irp: core::ptr::null_mut(), requested: 0 }; MAX_PENDING],
             pending_len:      0,
             interrupt_handle: InterruptHandle { irq: 0, node_ptr: 0 },
@@ -252,6 +264,9 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
     ctx.char_head   = 0;
     ctx.char_tail   = 0;
     ctx.char_len    = 0;
+    ctx.sc_head     = 0;
+    ctx.sc_tail     = 0;
+    ctx.sc_len      = 0;
     ctx.pending_len = 0;
 
     // Hardware initialisation (x86_64 only — hardcoded resources, no ACPI yet).
@@ -386,11 +401,9 @@ extern "C" fn i8042_cancel(dev: *const DeviceObject, irp: *mut Irp) {
 
 // Keyboard ISR
 //
-// Called from the interrupt dispatcher with the I8042Ctx pointer we supplied
-// at install time. Returns true to claim IRQ 1.
-//
-// Locking: ctx.lock disables interrupts when held, preventing re-entry on
-// single-CPU systems. On SMP it serialises with dispatch_read and i8042_cancel.
+// Stays minimal: drains the controller's data port, decodes the scancode, and
+// stashes the resulting char in sc_pending. All heavier work (TTY echo, char
+// ring insert, IRP completion) is deferred to a driver worker
 
 extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -411,9 +424,40 @@ extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
             return true; // modifier or unmapped key
         }
 
+        let ctx = unsafe { &mut *(ctx_ptr as *mut I8042Ctx) };
+
+        acquire_spinlock(&mut ctx.lock);
+        if ctx.sc_len < SC_PENDING_SIZE {
+            ctx.sc_pending[ctx.sc_tail] = ch;
+            ctx.sc_tail = (ctx.sc_tail + 1) % SC_PENDING_SIZE;
+            ctx.sc_len += 1;
+        }
+        // If sc_pending is full we silently drop — the DW hasn't drained yet.
+        release_spinlock(&mut ctx.lock);
+
+        // Queue a driver worker to do the rest. Failure to allocate just
+        // means the char waits until the next interrupt queues a DW.
+        let _ = io_create_driver_worker(keyboard_dw, ctx_ptr);
+    }
+
+    true // always claim IRQ 1 — we are the sole PS/2 keyboard handler
+}
+
+extern "C" fn keyboard_dw(ctx_ptr: *mut c_void) {
+    let ctx = unsafe { &mut *(ctx_ptr as *mut I8042Ctx) };
+
+    loop {
+        acquire_spinlock(&mut ctx.lock);
+        if ctx.sc_len == 0 {
+            release_spinlock(&mut ctx.lock);
+            return;
+        }
+        let ch = ctx.sc_pending[ctx.sc_head];
+        ctx.sc_head = (ctx.sc_head + 1) % SC_PENDING_SIZE;
+        ctx.sc_len -= 1;
+        release_spinlock(&mut ctx.lock);
+
         // ── TTY echo (canonical mode) ─────────────────────────────────────────
-        // Echo each printable keystroke to the screen immediately, before the
-        // character is buffered or any pending IRP is satisfied.
         //   Backspace → erase the previous glyph (BS SP BS).
         //   Enter     → CR+LF so the cursor moves to the next line's start.
         //   Everything else → echo verbatim.
@@ -425,14 +469,11 @@ extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
             kernel_intf::print!("{}", ch as char);
         }
 
-        let ctx = unsafe { &mut *(ctx_ptr as *mut I8042Ctx) };
-
         // Collect satisfiable IRPs under the lock.
         let mut collected     = [core::ptr::null_mut::<Irp>(); MAX_PENDING];
         let mut collected_len = 0;
 
         acquire_spinlock(&mut ctx.lock);
-
         ctx.push_char(ch);
 
         let mut i = 0;
@@ -451,13 +492,9 @@ extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
                 i += 1;
             }
         }
-
         release_spinlock(&mut ctx.lock);
 
         // Complete collected IRPs outside the lock.
-        // io_start_processing atomically claims each IRP (prevents cancel from
-        // firing after this point). If cancel already won, it returns false and
-        // the IRP has been completed by the cancel path; we just move on.
         for k in 0..collected_len {
             let irp = collected[k];
             if io_start_processing(irp) {
@@ -465,6 +502,4 @@ extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
             }
         }
     }
-
-    true // always claim IRQ 1 — we are the sole PS/2 keyboard handler
 }

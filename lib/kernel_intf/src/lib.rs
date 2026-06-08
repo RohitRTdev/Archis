@@ -184,6 +184,22 @@ unsafe extern "C" {
     fn sched_create_thread_ffi(handler: extern "C" fn() -> !, context_ptr: *mut c_void) -> usize;
     fn sched_exit_thread_ffi(exit_code: isize) -> !;
     fn sched_kill_thread_ffi(thread_id: usize, exit_code: isize);
+
+    fn io_create_driver_worker_ffi(
+        routine: extern "C" fn(*mut c_void),
+        context: *mut c_void,
+    ) -> KError;
+}
+
+pub fn io_create_driver_worker(
+    routine: extern "C" fn(*mut c_void),
+    context: *mut c_void,
+) -> Result<(), KError> {
+    let res = unsafe { io_create_driver_worker_ffi(routine, context) };
+    match res {
+        KError::Success => Ok(()),
+        e => Err(e),
+    }
 }
 
 pub fn sched_delay_ms(value: usize) {

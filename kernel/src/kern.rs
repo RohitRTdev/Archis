@@ -454,10 +454,135 @@ fn kern_main() -> ! {
     //run_i8042_tests();
 
     //run_proc_thread_tests();
-    spam_threads_test();
+    //spam_threads_test();
+    run_driver_worker_tests();
     info!("Main task going to sleep");
     info!("====TTY mode====");
     hal::sleep();
+}
+
+// === Driver worker (DPC) tests ===
+//
+// Verifies the new io_create_driver_worker / dw_handler path:
+//   1. A queued DW actually runs, runs on the CPU it was queued on, runs with
+//      interrupts enabled, and sees is_in_dw_mode() == true.
+//   2. Several DWs queued back-to-back all execute and run to completion.
+//   3. A DW queued from inside another DW is drained by the same dw_handler
+//      loop (no need to wait for the next interrupt).
+//   4. After everything drains, the CPU leaves DW mode.
+
+use core::sync::atomic::AtomicI64;
+
+static DW_COUNTER:        AtomicI64    = AtomicI64::new(0);
+static DW_RAN:            AtomicUsize  = AtomicUsize::new(0);
+static DW_SAW_DW_MODE:    AtomicBool   = AtomicBool::new(false);
+static DW_SAW_INT_ENABLED:AtomicBool   = AtomicBool::new(false);
+static DW_RUN_CORE:       AtomicUsize  = AtomicUsize::new(usize::MAX);
+
+extern "C" fn dw_test_routine(ctx: *mut c_void) {
+    // ctx encodes a small i64 value to add to the counter.
+    let v = ctx as usize as i64;
+    DW_COUNTER.fetch_add(v, Ordering::Relaxed);
+    DW_RAN.fetch_add(1, Ordering::Relaxed);
+
+    if sched::is_in_dw_mode() {
+        DW_SAW_DW_MODE.store(true, Ordering::Relaxed);
+    }
+    if hal::are_interrupts_enabled() {
+        DW_SAW_INT_ENABLED.store(true, Ordering::Relaxed);
+    }
+    DW_RUN_CORE.store(hal::get_core(), Ordering::Relaxed);
+}
+
+extern "C" fn dw_chain_routine(ctx: *mut c_void) {
+    let v = ctx as usize;
+    DW_COUNTER.fetch_add(v as i64, Ordering::Relaxed);
+    DW_RAN.fetch_add(1, Ordering::Relaxed);
+
+    // First link of the chain queues a follow-up that adds 2. We confirm the
+    // second link runs inside this same dw_handler drain loop (i.e. the chain
+    // resolves without needing another hardware interrupt).
+    if v == 1 {
+        kernel_intf::io_create_driver_worker(dw_chain_routine, 2 as *mut c_void)
+            .expect("chain DW queue failed");
+    }
+}
+
+fn reset_dw_state() {
+    DW_COUNTER.store(0, Ordering::Relaxed);
+    DW_RAN.store(0, Ordering::Relaxed);
+    DW_SAW_DW_MODE.store(false, Ordering::Relaxed);
+    DW_SAW_INT_ENABLED.store(false, Ordering::Relaxed);
+    DW_RUN_CORE.store(usize::MAX, Ordering::Relaxed);
+}
+
+fn run_driver_worker_tests() {
+    info!("=== run_driver_worker_tests: BEGIN ===");
+
+    assert!(!sched::is_in_dw_mode(), "is_in_dw_mode() true outside any DW?");
+
+    // Test 1: single DW runs with expected invariants 
+    reset_dw_state();
+    let creator_core = hal::get_core();
+
+    kernel_intf::io_create_driver_worker(dw_test_routine, 7 as *mut c_void)
+        .expect("dw test 1: queue failed");
+
+    // delay_ms blocks via semaphore wait; while we sleep the timer (or any
+    // other interrupt) will land in global_interrupt_handler, which calls
+    // dw_handler after the vector handler runs. The DW drains then.
+    sched::delay_ms(50);
+
+    assert!(DW_RAN.load(Ordering::Relaxed) >= 1,
+        "dw test 1: DW did not run");
+    assert!(DW_COUNTER.load(Ordering::Relaxed) == 7,
+        "dw test 1: counter = {}, expected 7", DW_COUNTER.load(Ordering::Relaxed));
+    assert!(DW_SAW_DW_MODE.load(Ordering::Relaxed),
+        "dw test 1: is_in_dw_mode() was false inside DW");
+    assert!(DW_SAW_INT_ENABLED.load(Ordering::Relaxed),
+        "dw test 1: interrupts were disabled inside DW");
+    assert!(DW_RUN_CORE.load(Ordering::Relaxed) == creator_core,
+        "dw test 1: ran on core {}, queued from {}",
+        DW_RUN_CORE.load(Ordering::Relaxed), creator_core);
+    info!("dw test 1: PASSED (counter=7, core={}, dw_mode_seen=true, ints_on=true)",
+        creator_core);
+
+    // Test 2: batch of DWs all run 
+    reset_dw_state();
+    let values = [1i64, 2, 3, 4, 5];
+    let expected: i64 = values.iter().sum();
+    for v in values {
+        kernel_intf::io_create_driver_worker(dw_test_routine, v as usize as *mut c_void)
+            .expect("dw test 2: queue failed");
+    }
+    sched::delay_ms(50);
+
+    let ran = DW_RAN.load(Ordering::Relaxed);
+    let total = DW_COUNTER.load(Ordering::Relaxed);
+    assert!(ran == values.len(),
+        "dw test 2: ran {}, expected {}", ran, values.len());
+    assert!(total == expected,
+        "dw test 2: total {}, expected {}", total, expected);
+    info!("dw test 2: PASSED (ran={}, total={})", ran, total);
+
+    // Test 3: DW queued from inside a DW 
+    reset_dw_state();
+    kernel_intf::io_create_driver_worker(dw_chain_routine, 1 as *mut c_void)
+        .expect("dw test 3: queue failed");
+    sched::delay_ms(50);
+
+    let total = DW_COUNTER.load(Ordering::Relaxed);
+    let ran = DW_RAN.load(Ordering::Relaxed);
+    assert!(ran == 2, "dw test 3: ran {}, expected 2", ran);
+    assert!(total == 3, "dw test 3: total {}, expected 3 (1 + 2)", total);
+    info!("dw test 3: PASSED (chain ran={}, total={})", ran, total);
+
+    // Test 4: DW mode is cleared after the drain finishes
+    assert!(!sched::is_in_dw_mode(),
+        "dw test 4: is_in_dw_mode() still true after drain");
+    info!("dw test 4: PASSED (is_in_dw_mode = false post-drain)");
+
+    info!("=== run_driver_worker_tests: PASSED ===");
 }
 
 // The driver satisfies read IRPs only when the requested number of characters

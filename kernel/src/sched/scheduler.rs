@@ -4,18 +4,17 @@ use alloc::collections::BTreeMap;
 use common::{MemoryRegion, PAGE_SIZE};
 use core::ptr::NonNull;
 use core::mem::take;
-use core::sync::atomic::{AtomicU8, AtomicIsize, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicIsize, AtomicUsize, Ordering};
 use core::ffi::c_void;
 use core::ptr::null_mut;
 use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_process_info, KTimerInnerType};
 use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores, get_worker_stack, set_panic_base};
 use crate::hal::{self, IPIRequestType, create_kernel_context, disable_scheduler_timer, enable_scheduler_timer, fetch_context, get_per_cpu_base, get_per_cpu_data, get_per_cpu_kernel_base, set_per_cpu_base, set_per_cpu_data, switch_context};
 use crate::mem::{VCB, get_kernel_addr_space, set_address_space};
-use crate::sched::get_current_process_id;
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
 use crate::io::{self, IrpPtr, deallocate_irp};
-use kernel_intf::mem::PoolAllocatorGlobal;
-use kernel_intf::list::{List, ListNode, DynList};
+use kernel_intf::mem::{PoolAllocator, PoolAllocatorGlobal};
+use kernel_intf::list::{DynList, List, ListNode, ListNodeGuard};
 use kernel_intf::driver::{DeviceObject, Irp, IrpMajor, IrpMinor, IrpResult, Status};
 use kernel_intf::{acquire_spinlock, release_spinlock};
 use kernel_intf::{KError, debug, info};
@@ -174,8 +173,20 @@ pub struct AsyncCtx {
 
 struct SchedulerCB {
     preemption_count: AtomicUsize,
+    is_dw_mode: AtomicBool,
+    dw_queue: Spinlock<DynList<DriverWorker>>,
     task_queue: Spinlock<TaskQueue>
-} 
+}
+
+pub type DwRoutine = extern "C" fn(*mut c_void);
+
+#[derive(Clone, Copy)]
+pub struct DriverWorker {
+    routine: DwRoutine,
+    context: *mut c_void,
+}
+
+unsafe impl Send for DriverWorker {}
 
 pub struct TaskQueue {
     active_tasks: DynList<KThread>,
@@ -208,7 +219,12 @@ impl TaskQueue {
 }
 
 static SCHEDULER_CON_BLK: PerCpu<SchedulerCB> = PerCpu::new_with(
-    [const {SchedulerCB{preemption_count: AtomicUsize::new(0), task_queue: Spinlock::new(TaskQueue::new())}}; MAX_CPUS]
+    [const {SchedulerCB{
+        preemption_count: AtomicUsize::new(0),
+        is_dw_mode: AtomicBool::new(false),
+        dw_queue: Spinlock::new(List::new()),
+        task_queue: Spinlock::new(TaskQueue::new())
+    }}; MAX_CPUS]
 );
 
 pub fn get_task_info(task_id: usize) -> Option<KThread> {
@@ -249,6 +265,57 @@ pub fn yield_cpu() {
 
 pub fn is_preemption_enabled() -> bool {
     SCHEDULER_CON_BLK.local().preemption_count.load(Ordering::Acquire) == 0
+}
+
+pub fn is_in_dw_mode() -> bool {
+    SCHEDULER_CON_BLK.local().is_dw_mode.load(Ordering::Acquire)
+}
+
+fn create_driver_worker(routine: DwRoutine, context: *mut c_void) -> Result<(), KError> {
+    SCHEDULER_CON_BLK.local().dw_queue.lock().add_node(DriverWorker { routine, context })
+}
+
+fn pop_head_dw(q: &mut DynList<DriverWorker>) -> Option<ListNodeGuard<DriverWorker, PoolAllocator>> {
+    let head = q.first().map(NonNull::from)?;
+    let guard = unsafe { q.remove_node(head) };
+    Some(guard)
+}
+
+pub fn dw_handler() {
+    let cb = SCHEDULER_CON_BLK.local();
+
+    if cb.is_dw_mode.load(Ordering::Acquire) {
+        panic!("dw_handler() called in dw_mode!");
+    }
+
+    let mut dw = match pop_head_dw(&mut cb.dw_queue.lock()) {
+        Some(d) => d,
+        None => return,
+    };
+
+    cb.is_dw_mode.store(true, Ordering::Release);
+
+    // Stay in dw mode as long as long as dw queue is not empty
+    loop {
+        hal::enable_interrupts(true);
+        (dw.routine)(dw.context);
+        hal::disable_interrupts();
+
+        match pop_head_dw(&mut cb.dw_queue.lock()) {
+            Some(next) => { dw = next; }
+            None => break,
+        }
+    }
+
+    cb.is_dw_mode.store(false, Ordering::Release);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn io_create_driver_worker_ffi(routine: DwRoutine, context: *mut c_void) -> KError {
+    match create_driver_worker(routine, context) {
+        Ok(()) => KError::Success,
+        Err(e) => e,
+    }
 }
 
 pub fn init() {
@@ -885,7 +952,8 @@ pub fn schedule() {
         let mut sched_cb = sched_cb_cpu.task_queue.lock();
         update_timers(&mut sched_cb);
         
-        if sched_cb_cpu.preemption_count.load(Ordering::Acquire) > 0 {
+        if sched_cb_cpu.preemption_count.load(Ordering::Acquire) > 0
+            || sched_cb_cpu.is_dw_mode.load(Ordering::Acquire) {
             take(&mut sched_cb.notifier_list)
         }
         else {
