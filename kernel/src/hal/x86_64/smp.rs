@@ -21,7 +21,7 @@ use super::disable_interrupts;
 use super::syscall;
 
 #[cfg(feature = "acpi")]
-use {crate::acpica::{self, AcpiTableMadt}, common::madt::*};
+use {crate::acpica, common::madt::*, acpi_intf::*};
 
 #[allow(dead_code)]
 #[derive(Debug)]

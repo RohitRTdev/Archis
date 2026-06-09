@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use core::ptr::{read_volatile, write_volatile};
 
 #[cfg(feature="acpi")] 
-use {common::madt::*, crate::acpica::{self, *}};
+use {common::madt::*, crate::acpica, acpi_intf::*};
 
 const MAX_IOAPIC: usize = 4;
 const MAX_INT_OVERRIDE: usize = 20;

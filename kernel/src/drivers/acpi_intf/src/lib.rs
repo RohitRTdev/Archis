@@ -1,3 +1,4 @@
+#![no_std]
 #![allow(non_camel_case_types)]
 
 use core::ffi::{c_void, c_char};
@@ -6,10 +7,7 @@ pub type ACPI_STATUS = u32;
 pub type ACPI_PHYSICAL_ADDRESS = u64;
 pub type ACPI_THREAD_ID = u64;
 pub type ACPI_SIZE = usize;
-pub type ACPI_SEMAPHORE = *mut c_void;
-pub type ACPI_SPINLOCK = *mut c_void;
 pub type ACPI_STRING = *const c_char;
-pub type ACPI_OSD_HANDLER = extern "C" fn(*mut c_void);
 pub type ACPI_OSD_EXEC_CALLBACK = extern "C" fn(*mut c_void);
 
 #[repr(C)]
@@ -35,10 +33,10 @@ pub struct AcpiTableHeader {
 
 #[repr(C)]
 pub struct AcpiPciId {
-    segment: u16,
-    bus: u16,
-    device: u16,
-    function: u16
+    pub segment: u16,
+    pub bus: u16,
+    pub device: u16,
+    pub function: u16
 }
 
 #[derive(Debug)]
@@ -60,19 +58,42 @@ pub struct AcpiGenericAddress {
 }
 
 unsafe extern "C" {
+    // Init
     pub fn AcpiInitializeSubsystem() -> ACPI_STATUS;
     pub fn AcpiInitializeTables(initial_storage: *mut c_void, initial_table_count: u32, allow_resize: u8) -> ACPI_STATUS;
     pub fn AcpiLoadTables() -> ACPI_STATUS;
     pub fn AcpiEnableSubsystem(flags: u32) -> ACPI_STATUS;
     pub fn AcpiInitializeObjects(flags: u32) -> ACPI_STATUS;
+
+    // Sleep
+    pub fn AcpiEnterSleepStatePrep(sleep_state: u8) -> ACPI_STATUS;  
+    pub fn AcpiEnterSleepState(sleep_state: u8) -> ACPI_STATUS;
 }
 
-pub const AE_OK: ACPI_STATUS = 0x0000_0000;
-pub const AE_ERROR: ACPI_STATUS = 0x0000_0001;
+pub const AE_OK: ACPI_STATUS         = 0x0000_0000;
+pub const AE_ERROR: ACPI_STATUS      = 0x0000_0001;
+pub const AE_NOT_FOUND: ACPI_STATUS  = 0x0000_0005;
+pub const AE_BAD_PARAMETER: ACPI_STATUS = 0x0000_1001;
+pub const AE_TIME: ACPI_STATUS       = 0x0000_0011;
+pub const AE_SUPPORT: ACPI_STATUS    = 0x0000_001D;
+
+// AcpiOsInstallInterruptHandler return codes (ACPICA reads these from the
+// wrapper). 1 = interrupt was ours, 0 = pass through to next handler.
+pub const ACPI_INTERRUPT_HANDLED: u32 = 1;
+
+// AcpiOsSignal function codes.
+pub const ACPI_SIGNAL_FATAL: u32      = 0;
+pub const ACPI_SIGNAL_BREAKPOINT: u32 = 1;
+
+// Mutex timeout sentinel — ACPICA passes this when the caller wants to wait
+// forever. Anything below is interpreted as a millisecond timeout.
+pub const ACPI_WAIT_FOREVER: u16 = 0xFFFF;
+
 pub const ACPI_NAMESEG_SIZE: usize = 4;
 pub const ACPI_OEM_ID_SIZE: usize = 6;
 pub const ACPI_OEM_TABLE_ID_SIZE: usize = 8;
 
+pub const ACPI_SLEEP_S5: u8 = 5;
 
 // ACPI TABLES
 pub trait AcpiTable {

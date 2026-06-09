@@ -19,4 +19,5 @@ strip = true
 common = {path = "lib/common"}
 kernel_intf = {path = "lib/kernel_intf"}
 kmod = {path = "lib/kmod"}
+acpi_intf = {path = "kernel/src/drivers/acpi_intf"}
 log = "*"

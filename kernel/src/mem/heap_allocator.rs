@@ -69,15 +69,15 @@ impl LinkedListAllocator {
 
         // Sanity checks to prevent arithmetic underflow/corruption
         debug_assert!(next_aligned_addr >= aligned_addr, "next_aligned_addr must be >= aligned_addr");
-        debug_assert!(next_aligned_addr - addr <= node.size, "calculated split exceeds node size");
-
-        let remaining = node.size - (next_aligned_addr - addr);
-
+        
         // Maintain backing memory accounting
         self.backing_memory = self.backing_memory.saturating_sub(size);
-
-        if remaining >= size_of::<ListNode>() {
-            self.add_free_region(next_aligned_addr, remaining);
+        
+        if node.size >= (next_aligned_addr - addr) {
+            let remaining = node.size - (next_aligned_addr - addr);
+            if remaining >= size_of::<ListNode>() {
+                self.add_free_region(next_aligned_addr, remaining);
+            }
         }
 
         aligned_addr as *mut u8

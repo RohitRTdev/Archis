@@ -19,6 +19,9 @@ mod utils;
 #[cfg(feature = "acpi")]
 mod acpica;
 
+#[cfg(feature = "acpi")]
+use acpi_intf::{ACPI_SLEEP_S5, AcpiEnterSleepState, AcpiEnterSleepStatePrep};
+
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::sync::atomic::AtomicUsize;
 use core::ffi::c_void;
@@ -891,20 +894,47 @@ fn kern_main() -> ! {
     loader::init();
     io::init();
 
+#[cfg(feature = "acpi")]
+    acpica::init();
     //interative_thread_spawn_tests();
     //run_fence_tests();
     //run_state_tests();
     //run_i8042_tests();
-    info!("Waiting before starting tests...");
-    sched::delay_ms(5000);
-
-    run_sync_tests();
+    //run_sync_tests();
     //run_proc_thread_tests();
     //spam_threads_test();
     //run_driver_worker_tests();
     info!("Main task going to sleep");
     info!("====TTY mode====");
-    hal::sleep();
+    let kbd = open_device_handle("ps/2_port0").expect("Failed to open input device!");
+    
+    let input_buf: [u8; 256] = [0; 256];
+    loop {
+        kbd.read(ReadRequest{
+            buffer: MemoryRegion {
+                base_address: input_buf.as_ptr().addr(),
+                size: 9
+            },
+            offset: 0
+        }).expect("Failed to read input device!");
+
+        let command = unsafe {
+            let command_slice = core::slice::from_raw_parts(input_buf.as_ptr(), 9);
+            core::str::from_utf8(command_slice).expect("Failed to decode utf-8")
+        };
+
+        if command == "shutdown\n" {
+            info!("Shutting down system in 5 seconds...");
+            sched::delay_ms(5000);
+            #[cfg(feature = "acpi")]
+            unsafe {
+                AcpiEnterSleepStatePrep(ACPI_SLEEP_S5);
+                AcpiEnterSleepState(ACPI_SLEEP_S5);
+            }
+        }
+    }
+
+    //hal::sleep();
 }
 
 // === Driver worker (DPC) tests ===
@@ -919,6 +949,7 @@ fn kern_main() -> ! {
 
 use core::sync::atomic::AtomicI64;
 
+use crate::io::{ReadRequest, open_device_handle};
 use crate::sync::KEvent;
 
 static DW_COUNTER:        AtomicI64    = AtomicI64::new(0);

@@ -67,3 +67,17 @@ macro_rules! loader_log {
 macro_rules! loader_log {
     ($($arg:tt)*) => {};
 }
+
+#[cfg(all(debug_assertions, feature = "debug-acpica-logs"))]
+#[macro_export]
+macro_rules! acpica_log {
+    ($($arg:tt)*) => {{
+        ::kernel_intf::debug!("[ACPICA] {}", ::core::format_args!($($arg)*));
+    }};
+}
+
+#[cfg(not(all(debug_assertions, feature = "debug-acpica-logs")))]
+#[macro_export]
+macro_rules! acpica_log {
+    ($($arg:tt)*) => {};
+}

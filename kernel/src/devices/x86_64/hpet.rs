@@ -7,7 +7,7 @@ use crate::mem::PageDescriptor;
 use core::ptr::{read_volatile, write_volatile, read_unaligned};
 
 #[cfg(feature="acpi")]
-use crate::acpica::{self, *};
+use {acpi_intf::*, crate::acpica::fetch_acpi_table};
 
 const GEN_CAP_OFFSET: usize = 0;
 const GEN_CONF_OFFSET: usize = 0x10;
@@ -43,7 +43,7 @@ fn write_timer_reg(base: usize, offset: usize, value: u64) {
 #[cfg(feature = "acpi")]
 pub fn init() {
 
-    let hpet_tab = acpica::fetch_acpi_table::<AcpiTableHpet>(
+    let hpet_tab = fetch_acpi_table::<AcpiTableHpet>(
         BOOT_INFO.get().unwrap().rsdp as *const u8).expect("No HPET ACPI table found!");
 
     assert_eq!(hpet_tab.address.space_id, AcpiAddressType::SYSTEM_MEMORY as u8, "HPET block address space not in system memory");

@@ -190,11 +190,8 @@ AcpiError (
 
 
     ACPI_MSG_REDIRECT_BEGIN;
-    AcpiOsPrintf (ACPI_MSG_ERROR);
-
     va_start (ArgList, Format);
     AcpiOsVprintf (Format, ArgList);
-    ACPI_MSG_SUFFIX;
     va_end (ArgList);
 
     ACPI_MSG_REDIRECT_END;
@@ -234,20 +231,8 @@ AcpiException (
 
     /* For AE_OK, just print the message */
 
-    if (ACPI_SUCCESS (Status))
-    {
-        AcpiOsPrintf (ACPI_MSG_ERROR);
-
-    }
-    else
-    {
-        AcpiOsPrintf (ACPI_MSG_ERROR "%s, ",
-            AcpiFormatException (Status));
-    }
-
     va_start (ArgList, Format);
     AcpiOsVprintf (Format, ArgList);
-    ACPI_MSG_SUFFIX;
     va_end (ArgList);
 
     ACPI_MSG_REDIRECT_END;
@@ -281,11 +266,8 @@ AcpiWarning (
 
 
     ACPI_MSG_REDIRECT_BEGIN;
-    AcpiOsPrintf (ACPI_MSG_WARNING);
-
     va_start (ArgList, Format);
     AcpiOsVprintf (Format, ArgList);
-    ACPI_MSG_SUFFIX;
     va_end (ArgList);
 
     ACPI_MSG_REDIRECT_END;
@@ -316,11 +298,9 @@ AcpiInfo (
 
 
     ACPI_MSG_REDIRECT_BEGIN;
-    AcpiOsPrintf (ACPI_MSG_INFO);
 
     va_start (ArgList, Format);
     AcpiOsVprintf (Format, ArgList);
-    AcpiOsPrintf ("\n");
     va_end (ArgList);
 
     ACPI_MSG_REDIRECT_END;
@@ -355,11 +335,9 @@ AcpiBiosError (
 
 
     ACPI_MSG_REDIRECT_BEGIN;
-    AcpiOsPrintf (ACPI_MSG_BIOS_ERROR);
 
     va_start (ArgList, Format);
     AcpiOsVprintf (Format, ArgList);
-    ACPI_MSG_SUFFIX;
     va_end (ArgList);
 
     ACPI_MSG_REDIRECT_END;
@@ -399,20 +377,8 @@ AcpiBiosException (
 
     /* For AE_OK, just print the message */
 
-    if (ACPI_SUCCESS (Status))
-    {
-        AcpiOsPrintf (ACPI_MSG_BIOS_ERROR);
-
-    }
-    else
-    {
-        AcpiOsPrintf (ACPI_MSG_BIOS_ERROR "%s, ",
-            AcpiFormatException (Status));
-    }
-
     va_start (ArgList, Format);
     AcpiOsVprintf (Format, ArgList);
-    ACPI_MSG_SUFFIX;
     va_end (ArgList);
 
     ACPI_MSG_REDIRECT_END;
@@ -447,11 +413,9 @@ AcpiBiosWarning (
 
 
     ACPI_MSG_REDIRECT_BEGIN;
-    AcpiOsPrintf (ACPI_MSG_BIOS_WARNING);
 
     va_start (ArgList, Format);
     AcpiOsVprintf (Format, ArgList);
-    ACPI_MSG_SUFFIX;
     va_end (ArgList);
 
     ACPI_MSG_REDIRECT_END;

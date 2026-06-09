@@ -1,5 +1,11 @@
 use core::ptr::read_unaligned;
-use super::types::{AcpiTable, AcpiTableHeader};
+use acpi_intf::{AcpiTable, AcpiTableHeader};
+
+// Public wrapper for OSL use. Takes a raw signature string (e.g. "MADT") and
+// returns the physical address of the first matching table as a raw pointer.
+pub fn fetch_acpi_table_raw(rsdp_ptr: *const u8, signature: &str) -> Option<*const u8> {
+    fetch_acpi_table_core(rsdp_ptr, signature)
+}
 
 // These are helper table functions that can be used before/after acpica init
 fn fetch_acpi_table_core(rsdp_ptr: *const u8, signature: &str) -> Option<*const u8> {

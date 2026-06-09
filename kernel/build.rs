@@ -293,6 +293,13 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
             continue;
         }
         
+        let driver_conf_path = driver_dir.join("driver.conf");
+
+        if !driver_conf_path.exists() {
+            // We only consider a module as driver if it has an associated driver.conf file
+            continue;
+        }
+        
         let stub_path = driver_dir
             .join("src")
             .join("import_stub.rs");
@@ -308,13 +315,6 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
 
         println!("cargo:rerun-if-changed={}", stub_path.display());
-
-        let driver_conf_path = driver_dir.join("driver.conf");
-
-        if !driver_conf_path.exists() {
-            println!("cargo:warning=Can't find driver.conf file for {}", driver_dir.display());
-            continue;
-        }
 
         println!(
             "cargo:rerun-if-changed={}",
@@ -584,11 +584,11 @@ fn main() {
 
     generate_interrupt_stubs(&arch, is_test);
     generate_stubs(&arch);
-    generate_import_stubs("src/drivers").expect("Failed to build driver import stubs!");
     if is_test {
         println!("cargo:warning=Skipping build.rs logic during tests.");
         return;
     }
+    generate_import_stubs("src/drivers").expect("Failed to build driver import stubs!");
     
     let target = format!("{}-unknown-none", arch);
     println!("cargo:rerun-if-changed=src/hal/{}/asm", arch);

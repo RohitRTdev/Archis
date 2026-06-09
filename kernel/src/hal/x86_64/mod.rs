@@ -77,6 +77,11 @@ pub fn are_interrupts_enabled() -> bool {
 
 pub use asm::read_port_u8;
 pub use asm::write_port_u8;
+pub use asm::read_port_u16;
+pub use asm::write_port_u16;
+pub use asm::read_port_u32;
+pub use asm::write_port_u32;
+pub use timer::delay_ns;
 
 pub struct Spinlock {
     state: AtomicU64
