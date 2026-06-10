@@ -66,8 +66,17 @@ unsafe extern "C" {
     pub fn AcpiInitializeObjects(flags: u32) -> ACPI_STATUS;
 
     // Sleep
-    pub fn AcpiEnterSleepStatePrep(sleep_state: u8) -> ACPI_STATUS;  
-    pub fn AcpiEnterSleepState(sleep_state: u8) -> ACPI_STATUS;
+    fn AcpiEnterSleepStatePrep(sleep_state: u8) -> ACPI_STATUS;  
+    fn AcpiEnterSleepState(sleep_state: u8) -> ACPI_STATUS;
+}
+
+
+pub fn acpi_enter_sleep_state_prep(sleep_state: u8) -> ACPI_STATUS {
+    unsafe { AcpiEnterSleepStatePrep(sleep_state) }
+}  
+
+pub fn acpi_enter_sleep_state(sleep_state: u8) -> ACPI_STATUS {
+    unsafe { AcpiEnterSleepState(sleep_state) }
 }
 
 pub const AE_OK: ACPI_STATUS         = 0x0000_0000;

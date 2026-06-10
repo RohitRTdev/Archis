@@ -2,7 +2,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use core::alloc::Layout;
 
 use alloc::{collections::BTreeMap, vec::Vec};
-use common::{elf::*, ArrayTable, PAGE_SIZE};
+use common::{elf::*, PAGE_SIZE};
 use common::{MemoryRegion, ModuleInfo, FileDescriptor};
 use crate::fs::FileInstance;
 use crate::loader::LoadedImage;
@@ -50,25 +50,15 @@ pub fn early_init() {
             let add_offset = |a: usize| {
                 (a as isize + offset) as usize
             };
-            
+
             mod_cb.info.base = kern_base;
             mod_cb.info.entry = add_offset(mod_cb.info.entry);
 
-            let update_array_rgn = |array_rgn: &mut ArrayTable| {
-                let entries = unsafe {
-                    core::slice::from_raw_parts_mut(array_rgn.start as *mut MemoryRegion, array_rgn.size / array_rgn.entry_size)
-                };
-
-                // Update all the entries in the array with new values
-                entries.iter_mut().for_each(|reg| {
-                    reg.base_address = add_offset(reg.base_address);
-                });
-                
-                array_rgn.start = add_offset(array_rgn.start);
-            };
-            
             if let Some(val) = &mut mod_cb.info.sym_tab {
                 val.start = add_offset(val.start);
+            }
+            if let Some(val) = &mut mod_cb.info.sym_str {
+                val.base_address = add_offset(val.base_address);
             }
             if let Some(val) = &mut mod_cb.info.dyn_tab {
                 val.start = add_offset(val.start);
@@ -77,13 +67,8 @@ pub fn early_init() {
                 val.start = add_offset(val.start);
             }
             if let Some(val) = &mut mod_cb.info.rlc_shn {
-                update_array_rgn(val);
+                val.start = add_offset(val.start);
             }
-
-            if let Some(val) = &mut mod_cb.info.sym_str {
-                val.base_address = add_offset(val.base_address);
-            }
-
             if let Some(val) = &mut mod_cb.info.dyn_str {
                 val.base_address = add_offset(val.base_address);
             }
@@ -161,15 +146,6 @@ pub fn complete_handoff() {
     let mut mod_cb = ARIS.get().unwrap().lock();
     let boot_info = BOOT_INFO.get().unwrap();
     
-    if mod_cb.info.rlc_shn.is_none() {
-        return;
-    }
-
-    let rlc_tab_desc = mod_cb.info.rlc_shn.unwrap(); 
-    let reloc_sections = unsafe {
-        core::slice::from_raw_parts(rlc_tab_desc.start as *const MemoryRegion, rlc_tab_desc.size / rlc_tab_desc.entry_size)
-    };
-
     // This is the old unmapped kernel address
     let load_base = mod_cb.info.base;
     let dyn_tab = mod_cb.info.dyn_tab;
@@ -190,10 +166,10 @@ pub fn complete_handoff() {
         }
     };
 
-    for rlc_shn in reloc_sections {
+    if let Some(rlc_shn) = &mod_cb.info.rlc_shn {
         let num_rel_entries = rlc_shn.size / core::mem::size_of::<Elf64Rela>();
         let entries = unsafe {
-            core::slice::from_raw_parts(rlc_shn.base_address as *const Elf64Rela, num_rel_entries)
+            core::slice::from_raw_parts(rlc_shn.start as *const Elf64Rela, num_rel_entries)
         };
         
         for entry in entries {
@@ -206,20 +182,13 @@ pub fn complete_handoff() {
                 },
                 R_X86_64_64 | R_GLOB_DAT => {
                     assert!(dyn_tab.is_some());
-
-                    let dyn_entries = unsafe {
-                        let tab = dyn_tab.as_ref().unwrap();
-                        core::slice::from_raw_parts(
-                            tab.start as *const Elf64Sym,
-                            tab.size / tab.entry_size
-                        )
+                    let sym_idx = (entry.r_info >> 32) as usize;
+                    let sym = unsafe {
+                        &*(dyn_tab.as_ref().unwrap().start as *const Elf64Sym).add(sym_idx)
                     };
 
-                    let sym_idx = (entry.r_info >> 32) as usize;
-                    let sym = &dyn_entries[sym_idx];
-
-                    if dyn_entries[sym_idx].st_shndx == SHN_UNDEF {
-                        panic!("Could not find definition for symbol: {} during absolute relocation", stringizer(dyn_entries[sym_idx].st_name as usize));
+                    if sym.st_shndx == SHN_UNDEF {
+                        panic!("Could not find definition for symbol: {} during absolute relocation", stringizer(sym.st_name as usize));
                     }
 
                     let value = load_base + sym.st_value as usize + entry.r_addend as usize;
@@ -230,18 +199,16 @@ pub fn complete_handoff() {
                 }
                 R_JUMP_SLOT => {
                     assert!(dyn_tab.is_some());
-                    let dyn_entries = unsafe {
-                        let tab = dyn_tab.as_ref().unwrap();
-                        core::slice::from_raw_parts(tab.start as *const Elf64Sym, tab.size / tab.entry_size)
+                    let sym_idx = (entry.r_info >> 32) as usize;
+                    let sym = unsafe {
+                        &*(dyn_tab.as_ref().unwrap().start as *const Elf64Sym).add(sym_idx)
                     };
 
-                    let sym_idx = (entry.r_info >> 32) as usize;
-
-                    if dyn_entries[sym_idx].st_shndx == SHN_UNDEF {
-                        panic!("Could not find definition for symbol: {}", stringizer(dyn_entries[sym_idx].st_name as usize));
+                    if sym.st_shndx == SHN_UNDEF {
+                        panic!("Could not find definition for symbol: {}", stringizer(sym.st_name as usize));
                     }
 
-                    let value = load_base + dyn_entries[sym_idx].st_value as usize;
+                    let value = load_base + sym.st_value as usize;
 
                     unsafe {
                         *(address as *mut u64) = value as u64;

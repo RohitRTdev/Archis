@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::borrow::ToOwned;
 use kernel_intf::KError::InvalidArgument;
 use core::alloc::Layout;
-use core::mem::{size_of, align_of};
+use core::mem::size_of;
 use core::ptr::copy_nonoverlapping;
 use core::ffi::CStr;
 use common::{PAGE_SIZE, elf::*};
@@ -349,14 +349,10 @@ fn build_image_layout(bytes: &[u8]) -> Result<ModuleInfo, KError> {
 
     let mut symtab: Option<AuxRegion> = None;
     let mut symstr: Option<AuxRegion> = None;
-    let mut dynsymtab: Option<AuxRegion> = None;
-    let mut dynstr: Option<AuxRegion> = None;
-    let mut reloc_sections: Vec<AuxRegion> = Vec::new();
     let mut aux_alignment: usize = 0;
 
     for shdr in shdrs.iter() {
-        let ty = shdr.sh_type;
-        if ty != SHT_SYMTAB && ty != SHT_RELA && ty != SHT_DYNSYM {
+        if shdr.sh_type != SHT_SYMTAB {
             continue;
         }
         let reg = AuxRegion {
@@ -364,71 +360,44 @@ fn build_image_layout(bytes: &[u8]) -> Result<ModuleInfo, KError> {
             dest_addr: 0,
             src_size: shdr.sh_size as usize,
             dest_size: 0,
-            entry_size: shdr.sh_entsize as usize,
+            entry_size: shdr.sh_entsize as usize
         };
-        let link = shdr.sh_link as usize;
-        match ty {
-            SHT_SYMTAB => {
-                let str_shdr = &shdrs[link];
-                symtab = Some(reg);
-                symstr = Some(AuxRegion {
-                    src_addr: unsafe { base.add(str_shdr.sh_offset as usize) as usize },
-                    dest_addr: 0,
-                    src_size: str_shdr.sh_size as usize,
-                    dest_size: 0,
-                    entry_size: 0,
-                });
-            },
-            SHT_RELA => reloc_sections.push(reg),
-            SHT_DYNSYM => {
-                let str_shdr = &shdrs[link];
-                dynsymtab = Some(reg);
-                dynstr = Some(AuxRegion {
-                    src_addr: unsafe { base.add(str_shdr.sh_offset as usize) as usize },
-                    dest_addr: 0,
-                    src_size: str_shdr.sh_size as usize,
-                    dest_size: 0,
-                    entry_size: 0,
-                });
-            },
-            _ => {}
-        }
+        let str_shdr = &shdrs[shdr.sh_link as usize];
+        symtab = Some(reg);
+        symstr = Some(AuxRegion {
+            src_addr: unsafe { base.add(str_shdr.sh_offset as usize) as usize },
+            dest_addr: 0,
+            src_size: str_shdr.sh_size as usize,
+            dest_size: 0,
+            entry_size: 0,
+        });
         if shdr.sh_addralign != 0 && shdr.sh_addralign != 1 {
             aux_alignment = aux_alignment.max(shdr.sh_addralign as usize);
         }
-    }
-
-    let num_reloc_shns = reloc_sections.len();
-
-    if let Some(s) = &symtab {
-        reloc_sections.push(s.clone());
-        reloc_sections.push(symstr.as_ref().unwrap().clone());
-    }
-    if let Some(s) = &dynsymtab {
-        reloc_sections.push(s.clone());
-        reloc_sections.push(dynstr.as_ref().unwrap().clone());
+        break;
     }
 
     let last_main = load_regions.last().unwrap();
     let main_shn_size = last_main.dest_addr + last_main.dest_size;
 
-    let mut aux_size = 0usize;
-    for shn in reloc_sections.iter() {
-        aux_size += shn.src_size;
-        if aux_alignment != 0 {
-            aux_size += (aux_size as *const u8).align_offset(aux_alignment);
-        }
-    }
+    // Aux area holds symtab + symstr (debug-symbol pair only).
+    let aux_size = match (&symtab, &symstr) {
+        (Some(st), Some(ss)) => {
+            let pad = if aux_alignment != 0 {
+                (st.src_size as *const u8).align_offset(aux_alignment)
+            } else { 0 };
+            st.src_size + pad + ss.src_size
+        },
+        _ => 0,
+    };
 
     let aux_padding = if aux_alignment != 0 {
         (main_shn_size as *const u8).align_offset(aux_alignment)
     } else { 0 };
     let aux_shn_end = main_shn_size + aux_padding + aux_size;
-    let desc_alignment = align_of::<MemoryRegion>();
-    let desc_padding = (aux_shn_end as *const u8).align_offset(desc_alignment);
-    let total_module_size = aux_shn_end + desc_padding + num_reloc_shns * size_of::<MemoryRegion>();
+    let total_module_size = aux_shn_end;
 
-    let alloc_align = max_alignment.max(aux_alignment).max(desc_alignment).max(1);
+    let alloc_align = max_alignment.max(aux_alignment).max(1);
     assert!(alloc_align <= PAGE_SIZE);
 
     let layout = Layout::from_size_align(total_module_size, PAGE_SIZE).unwrap();
@@ -443,59 +412,39 @@ fn build_image_layout(bytes: &[u8]) -> Result<ModuleInfo, KError> {
         }
     }
 
-    let mut cur = unsafe { load_base.add(main_shn_size + aux_padding) };
-    for region in reloc_sections.iter_mut() {
+    // Copy symtab + symstr to aux area.
+    let (sym_tab_out, sym_str_out) = if let (Some(mut st), Some(mut ss)) = (symtab, symstr) {
+        let mut cur = unsafe { load_base.add(main_shn_size + aux_padding) };
         unsafe {
-            copy_nonoverlapping(region.src_addr as *const u8, cur, region.src_size);
-            region.dest_addr = cur.addr();
-            cur = cur.add(region.src_size);
+            copy_nonoverlapping(st.src_addr as *const u8, cur, st.src_size);
+            st.dest_addr = cur.addr();
+            cur = cur.add(st.src_size);
             if aux_alignment != 0 {
                 cur = cur.add(cur.align_offset(aux_alignment));
             }
+            copy_nonoverlapping(ss.src_addr as *const u8, cur, ss.src_size);
+            ss.dest_addr = cur.addr();
         }
-    }
+        (
+            Some(ArrayTable { start: st.dest_addr, size: st.src_size, entry_size: st.entry_size }),
+            Some(MemoryRegion { base_address: ss.dest_addr, size: ss.src_size }),
+        )
+    } else {
+        (None, None)
+    };
 
-    // Strip sym/dynsym pairs in reverse insertion order
-    let dynstr_loaded = if dynsymtab.is_some() { reloc_sections.pop() } else { None };
-    let dynsymtab_loaded = if dynsymtab.is_some() { reloc_sections.pop() } else { None };
-    let symstr_loaded = if symtab.is_some() { reloc_sections.pop() } else { None };
-    let symtab_loaded = if symtab.is_some() { reloc_sections.pop() } else { None };
-
-    let rlc_shn_out = if num_reloc_shns > 0 {
-        let desc_base = unsafe { load_base.add(aux_shn_end + desc_padding) };
-        let descs = unsafe {
-            core::slice::from_raw_parts_mut(desc_base as *mut MemoryRegion, num_reloc_shns)
-        };
-        for (idx, shn) in reloc_sections.iter().enumerate() {
-            descs[idx] = MemoryRegion {
-                base_address: shn.dest_addr,
-                size: shn.src_size,
-            };
-        }
-        Some(ArrayTable {
-            start: desc_base.addr(),
-            size: num_reloc_shns * size_of::<MemoryRegion>(),
-            entry_size: size_of::<MemoryRegion>(),
-        })
-    } else { None };
-
-    let sym_tab_out = symtab_loaded.as_ref().map(|s| ArrayTable {
-        start: s.dest_addr, size: s.src_size, entry_size: s.entry_size,
-    });
-    let sym_str_out = symstr_loaded.as_ref().map(|s| MemoryRegion {
-        base_address: s.dest_addr, size: s.src_size,
-    });
-    let dyn_tab_out = dynsymtab_loaded.as_ref().map(|s| ArrayTable {
-        start: s.dest_addr, size: s.src_size, entry_size: s.entry_size,
-    });
-    let dyn_str_out = dynstr_loaded.as_ref().map(|s| MemoryRegion {
-        base_address: s.dest_addr, size: s.src_size,
-    });
     let dyn_shn_out = dyn_shn_region.as_ref().map(|s| ArrayTable {
         start: load_base_addr + s.dest_addr,
-        size: s.src_size,
+        size:  s.src_size,
         entry_size: size_of::<ElfDyn>(),
     });
+
+    // Resolve dynsymtab / dynstr / .rela.dyn locations from the loaded
+    // PT_DYNAMIC entries.
+    let dyn_info = dyn_shn_out.as_ref().map(|d| parse_dynamic_section(load_base_addr, d));
+    let dyn_tab_out = dyn_info.as_ref().and_then(|i| i.dyn_tab);
+    let dyn_str_out = dyn_info.as_ref().and_then(|i| i.dyn_str);
+    let rlc_shn_out = dyn_info.as_ref().and_then(|i| i.rela);
 
     Ok(ModuleInfo {
         entry: ehdr.e_entry as usize + load_base_addr,
@@ -509,6 +458,67 @@ fn build_image_layout(bytes: &[u8]) -> Result<ModuleInfo, KError> {
         rlc_shn: rlc_shn_out,
         dyn_shn: dyn_shn_out,
     })
+}
+
+struct DynamicInfo {
+    dyn_tab: Option<ArrayTable>,
+    dyn_str: Option<MemoryRegion>,
+    rela:    Option<ArrayTable>,
+}
+
+fn parse_dynamic_section(load_base: usize, dyn_shn: &ArrayTable) -> DynamicInfo {
+    let nentries = dyn_shn.size / size_of::<ElfDyn>();
+    let entries = unsafe {
+        core::slice::from_raw_parts(dyn_shn.start as *const ElfDyn, nentries)
+    };
+
+    let mut symtab_vma: Option<usize> = None;
+    let mut strtab_vma: Option<usize> = None;
+    let mut rela_vma:   Option<usize> = None;
+    let mut hash_vma:   Option<usize> = None;
+    let mut strsz  = 0usize;
+    let mut relasz = 0usize;
+    let mut relaent = size_of::<Elf64Rela>();
+
+    for dynent in entries {
+        match dynent.tag {
+            DT_NULL    => break,
+            DT_SYMTAB  => symtab_vma = Some(dynent.val as usize),
+            DT_STRTAB  => strtab_vma = Some(dynent.val as usize),
+            DT_STRSZ   => strsz      = dynent.val as usize,
+            DT_RELA    => rela_vma   = Some(dynent.val as usize),
+            DT_RELASZ  => relasz     = dynent.val as usize,
+            DT_RELAENT => {
+                relaent = dynent.val as usize;
+                assert_eq!(relaent, size_of::<Elf64Rela>());
+            },
+            DT_HASH    => hash_vma   = Some(dynent.val as usize),
+            _ => {}
+        }
+    }
+
+    // Derive symtab size from DT_HASH: nchain (the 2nd 32-bit word) holds nsyms.
+    let symtab_size = hash_vma.map(|h| unsafe {
+        let nchain = *((load_base + h) as *const u32).add(1);
+        nchain as usize * size_of::<Elf64Sym>()
+    }).unwrap_or(0);
+
+    DynamicInfo {
+        dyn_tab: symtab_vma.map(|v| ArrayTable {
+            start: load_base + v,
+            size:  symtab_size,
+            entry_size: size_of::<Elf64Sym>(),
+        }),
+        dyn_str: strtab_vma.map(|v| MemoryRegion {
+            base_address: load_base + v,
+            size: strsz,
+        }),
+        rela: rela_vma.map(|v| ArrayTable {
+            start: load_base + v,
+            size: relasz,
+            entry_size: relaent,
+        }),
+    }
 }
 
 fn load_dependencies(
@@ -552,7 +562,7 @@ fn apply_relocations(
     mod_info: &ModuleInfo,
     deps: &[LoadedImage]
 ) -> Result<(), KError> {
-    let rlc_shn = match mod_info.rlc_shn { Some(r) => r, None => return Ok(()) };
+    let rlc = match mod_info.rlc_shn { Some(r) => r, None => return Ok(()) };
 
     let load_base = mod_info.base;
     let dyn_tab = mod_info.dyn_tab;
@@ -560,55 +570,48 @@ fn apply_relocations(
 
     let info_field = |bitmap: u64| (bitmap & 0xffffffff) as u32;
 
-    let reloc_sections = unsafe {
-        core::slice::from_raw_parts(rlc_shn.start as *const MemoryRegion, rlc_shn.size / rlc_shn.entry_size)
+    let num_entries = rlc.size / rlc.entry_size;
+    let entries = unsafe {
+        core::slice::from_raw_parts(rlc.start as *const Elf64Rela, num_entries)
     };
 
-    for shn in reloc_sections {
-        let num_entries = shn.size / size_of::<Elf64Rela>();
-        let entries = unsafe {
-            core::slice::from_raw_parts(shn.base_address as *const Elf64Rela, num_entries)
-        };
+    for entry in entries {
+        let address = load_base + entry.r_offset as usize;
+        let rtype = info_field(entry.r_info);
+        match rtype {
+            R_X86_64_RELATIVE => unsafe {
+                *(address as *mut u64) = (load_base as i64 + entry.r_addend) as u64;
+            },
+            R_X86_64_64 | R_GLOB_DAT | R_JUMP_SLOT => {
+                let dyn_tab = dyn_tab.expect("Failed to find dyn_tab entry! Corrupted image?");
+                let sym_idx = (entry.r_info >> 32) as usize;
+                let sym = unsafe {
+                    &*(dyn_tab.start as *const Elf64Sym).add(sym_idx)
+                };
 
-        for entry in entries {
-            let address = load_base + entry.r_offset as usize;
-            let rtype = info_field(entry.r_info);
-            match rtype {
-                R_X86_64_RELATIVE => unsafe {
-                    *(address as *mut u64) = (load_base as i64 + entry.r_addend) as u64;
-                },
-                R_X86_64_64 | R_GLOB_DAT | R_JUMP_SLOT => {
-                    let dyn_tab = dyn_tab.expect("Failed to find dyn_tab entry! Corrupted image?");
-                    let dyn_entries = unsafe {
-                        core::slice::from_raw_parts(dyn_tab.start as *const Elf64Sym, dyn_tab.size / dyn_tab.entry_size)
-                    };
-                    let sym_idx = (entry.r_info >> 32) as usize;
-                    let sym = &dyn_entries[sym_idx];
-
-                    let resolved = if sym.st_shndx == SHN_UNDEF {
-                        let dyn_str = dyn_str.expect("Failed to find dyn_str entry! Corrupted image?");
-                        let name = unsafe { read_cstr(dyn_str.base_address, sym.st_name as usize) };
-                        match resolve_import(name, deps) {
-                            Some(v) => v,
-                            None => {
-                                info!("Unresolved import symbol: {}", name);
-                                return Err(KError::InvalidArgument);
-                            }
+                let resolved = if sym.st_shndx == SHN_UNDEF {
+                    let dyn_str = dyn_str.expect("Failed to find dyn_str entry! Corrupted image?");
+                    let name = unsafe { read_cstr(dyn_str.base_address, sym.st_name as usize) };
+                    match resolve_import(name, deps) {
+                        Some(v) => v,
+                        None => {
+                            info!("Unresolved import symbol: {}", name);
+                            return Err(KError::InvalidArgument);
                         }
-                    } else {
-                        load_base + sym.st_value as usize
-                    };
+                    }
+                } else {
+                    load_base + sym.st_value as usize
+                };
 
-                    let value = if rtype == R_JUMP_SLOT {
-                        resolved
-                    } else {
-                        (resolved as i64 + entry.r_addend) as usize
-                    };
+                let value = if rtype == R_JUMP_SLOT {
+                    resolved
+                } else {
+                    (resolved as i64 + entry.r_addend) as usize
+                };
 
-                    unsafe { *(address as *mut u64) = value as u64; }
-                },
-                _ => {}
-            }
+                unsafe { *(address as *mut u64) = value as u64; }
+            },
+            _ => {}
         }
     }
 

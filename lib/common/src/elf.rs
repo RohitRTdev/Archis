@@ -88,10 +88,18 @@ pub const R_X86_64_RELATIVE: u32 = 8;
 pub const R_GLOB_DAT: u32 = 6;
 pub const R_JUMP_SLOT: u32 = 7;
 
-pub const DT_NULL:   i64 = 0;
-pub const DT_NEEDED: i64 = 1;
-pub const DT_STRTAB: i64 = 5;
-pub const DT_JMPREL: i64 = 23;
+pub const DT_NULL:      i64 = 0;
+pub const DT_NEEDED:    i64 = 1;
+pub const DT_PLTRELSZ:  i64 = 2;
+pub const DT_HASH:      i64 = 4;
+pub const DT_STRTAB:    i64 = 5;
+pub const DT_SYMTAB:    i64 = 6;
+pub const DT_RELA:      i64 = 7;
+pub const DT_RELASZ:    i64 = 8;
+pub const DT_RELAENT:   i64 = 9;
+pub const DT_STRSZ:     i64 = 10;
+pub const DT_JMPREL:    i64 = 23;
+pub const DT_RELACOUNT: i64 = 0x6ffffff9;
 
 // ELF Magic numbers
 pub const ELFMAG: u32 = u32::from_le_bytes([0x7F, b'E', b'L', b'F']);

@@ -20,7 +20,7 @@ mod utils;
 mod acpica;
 
 #[cfg(feature = "acpi")]
-use acpi_intf::{ACPI_SLEEP_S5, AcpiEnterSleepState, AcpiEnterSleepStatePrep};
+use acpi_intf::{ACPI_SLEEP_S5, acpi_enter_sleep_state, acpi_enter_sleep_state_prep};
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::sync::atomic::AtomicUsize;
@@ -927,9 +927,9 @@ fn kern_main() -> ! {
             info!("Shutting down system in 5 seconds...");
             sched::delay_ms(5000);
             #[cfg(feature = "acpi")]
-            unsafe {
-                AcpiEnterSleepStatePrep(ACPI_SLEEP_S5);
-                AcpiEnterSleepState(ACPI_SLEEP_S5);
+            {
+                acpi_enter_sleep_state_prep(ACPI_SLEEP_S5);
+                acpi_enter_sleep_state(ACPI_SLEEP_S5);
             }
         }
     }
