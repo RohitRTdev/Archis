@@ -57,7 +57,9 @@ pub struct ModuleInfo {
     pub dyn_tab: Option<ArrayTable>,
     pub dyn_str: Option<MemoryRegion>,
     pub rlc_shn: Option<ArrayTable>,
-    pub dyn_shn: Option<ArrayTable>
+    pub plt_shn: Option<ArrayTable>,
+    pub dyn_shn: Option<ArrayTable>,
+    pub rlc_count: usize
 }
 
 #[repr(C)]

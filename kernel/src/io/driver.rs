@@ -347,7 +347,7 @@ fn load_driver(path: &str) -> Result<DriverHandle, KError> {
 
     let (name, entry_addr) = {
         let guard = image.lock();
-        (guard.name, guard.driver_init_address)
+        (guard.kernel().name, guard.kernel().driver_init_address)
     };
 
     let mut driver_k = DriverObjectK {

@@ -72,6 +72,11 @@ pub const ELFCLASS64: u8 = 2;
 pub const PT_LOAD: u32 = 1;
 pub const PT_DYNAMIC: u32 = 2;
 
+// Program header segment permission flags (p_flags)
+pub const PF_X: u32 = 1;
+pub const PF_W: u32 = 1 << 1;
+pub const PF_R: u32 = 1 << 2;
+
 pub const SHT_SYMTAB: u32 = 2;
 pub const SHT_STRTAB: u32 = 3;
 pub const SHT_RELA: u32 = 4;

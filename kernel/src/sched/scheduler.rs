@@ -115,6 +115,10 @@ impl Task {
         self.user_fn.is_some()
     }
 
+    pub fn get_user_fn(&self) -> Option<DispatchRoutine> {
+        self.user_fn
+    }
+
     pub fn get_status(&self) -> TaskStatus {
         self.status
     }

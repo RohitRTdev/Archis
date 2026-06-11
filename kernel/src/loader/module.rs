@@ -1,7 +1,8 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::alloc::Layout;
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use kernel_intf::mem::PoolAllocatorGlobal;
 use common::{elf::*, PAGE_SIZE};
 use common::{MemoryRegion, ModuleInfo, FileDescriptor};
 use crate::fs::FileInstance;
@@ -12,13 +13,96 @@ use kernel_intf::{info, debug};
 use crate::mem::{self, MapFetchType, PageDescriptor};
 
 #[derive(Clone)]
-pub struct ModuleDescriptor {
+pub struct KernelModule {
     pub name: &'static str,
     pub driver_init_address: Option<usize>,
     pub file_handle: Option<FileInstance>,
     pub info: ModuleInfo,
+
     // This is here so that the dependencies are not released when this image is loaded
     pub _deps: Option<Vec<LoadedImage>>
+}
+
+#[derive(Clone)]
+pub struct UserModuleSegment {
+    pub phys_addr: usize,
+    pub offset: usize,
+    pub size: usize,
+    pub writable: bool
+}
+
+pub type SharedUserModuleRef = Arc<Spinlock<SharedUserModule>, PoolAllocatorGlobal>;
+
+pub struct SharedUserModule {
+    pub file_handle: FileInstance,
+    pub segments: Vec<UserModuleSegment>,
+    pub total_size: usize,
+    pub entry_offset: usize,
+
+    // Module-relative locations of the dynamic symbol data (lives inside a read
+    // segment). Used to resolve imports from dependents via temporary kernel mappings.
+    pub dyn_tab_off: Option<usize>,
+    pub num_syms: usize,
+    pub dyn_str_off: Option<usize>,
+    pub dyn_str_size: usize,
+
+    // Keeps the shared descriptors of this module's dependencies alive
+    pub _deps: Vec<SharedUserModuleRef>
+}
+
+#[derive(Clone)]
+pub struct UserModule {
+    pub base: usize,
+    pub entry: usize,
+    pub shared: SharedUserModuleRef
+}
+
+#[derive(Clone)]
+pub enum ModuleType {
+    Kernel(KernelModule),
+    User(UserModule)
+}
+
+#[derive(Clone)]
+pub struct ModuleDescriptor {
+    pub mod_type: ModuleType
+}
+
+impl ModuleDescriptor {
+    pub fn kernel(&self) -> &KernelModule {
+        match &self.mod_type {
+            ModuleType::Kernel(k) => k,
+            ModuleType::User(_) => panic!("Expected kernel module descriptor!")
+        }
+    }
+
+    pub fn kernel_mut(&mut self) -> &mut KernelModule {
+        match &mut self.mod_type {
+            ModuleType::Kernel(k) => k,
+            ModuleType::User(_) => panic!("Expected kernel module descriptor!")
+        }
+    }
+
+    pub fn kernel_opt(&self) -> Option<&KernelModule> {
+        match &self.mod_type {
+            ModuleType::Kernel(k) => Some(k),
+            ModuleType::User(_) => None
+        }
+    }
+
+    pub fn user(&self) -> &UserModule {
+        match &self.mod_type {
+            ModuleType::User(u) => u,
+            ModuleType::Kernel(_) => panic!("Expected user module descriptor!")
+        }
+    }
+
+    pub fn user_mut(&mut self) -> &mut UserModule {
+        match &mut self.mod_type {
+            ModuleType::User(u) => u,
+            ModuleType::Kernel(_) => panic!("Expected user module descriptor!")
+        }
+    }
 }
 
 pub static ARIS: Once<Spinlock<ModuleDescriptor>> = Once::new(); 
@@ -30,11 +114,13 @@ pub fn early_init() {
     let kernel_base_address = info.kernel_desc.base;  
     let kernel_total_size = info.kernel_desc.total_size; 
     let mod_cb = ModuleDescriptor {
-        name: env!("CARGO_PKG_NAME"),
-        driver_init_address: None,
-        file_handle: None,
-        info: info.kernel_desc,
-        _deps: None
+        mod_type: ModuleType::Kernel(KernelModule {
+            name: env!("CARGO_PKG_NAME"),
+            driver_init_address: None,
+            file_handle: None,
+            info: info.kernel_desc,
+            _deps: None
+        })
     };
     
     // Map the kernel and auxiliary tables onto upper half
@@ -46,34 +132,38 @@ pub fn early_init() {
         },
         map_type: OffsetMapped(|kern_base| {
             let mut mod_cb = ARIS.get().unwrap().lock();
-            let offset = kern_base as isize - mod_cb.info.base as isize;
+            let kmod = mod_cb.kernel_mut();
+            let offset = kern_base as isize - kmod.info.base as isize;
             let add_offset = |a: usize| {
                 (a as isize + offset) as usize
             };
 
-            mod_cb.info.base = kern_base;
-            mod_cb.info.entry = add_offset(mod_cb.info.entry);
+            kmod.info.base = kern_base;
+            kmod.info.entry = add_offset(kmod.info.entry);
 
-            if let Some(val) = &mut mod_cb.info.sym_tab {
+            if let Some(val) = &mut kmod.info.sym_tab {
                 val.start = add_offset(val.start);
             }
-            if let Some(val) = &mut mod_cb.info.sym_str {
+            if let Some(val) = &mut kmod.info.sym_str {
                 val.base_address = add_offset(val.base_address);
             }
-            if let Some(val) = &mut mod_cb.info.dyn_tab {
+            if let Some(val) = &mut kmod.info.dyn_tab {
                 val.start = add_offset(val.start);
             }
-            if let Some(val) = &mut mod_cb.info.dyn_shn {
+            if let Some(val) = &mut kmod.info.dyn_shn {
                 val.start = add_offset(val.start);
             }
-            if let Some(val) = &mut mod_cb.info.rlc_shn {
+            if let Some(val) = &mut kmod.info.rlc_shn {
                 val.start = add_offset(val.start);
             }
-            if let Some(val) = &mut mod_cb.info.dyn_str {
+            if let Some(val) = &mut kmod.info.plt_shn {
+                val.start = add_offset(val.start);
+            }
+            if let Some(val) = &mut kmod.info.dyn_str {
                 val.base_address = add_offset(val.base_address);
             }
 
-            crate::loader_log!("Updated kernel module info = {:?}", mod_cb.info);
+            crate::loader_log!("Updated kernel module info = {:?}", kmod.info);
         }),
         flags: 0
     }).unwrap();
@@ -147,18 +237,18 @@ pub fn complete_handoff() {
     let boot_info = BOOT_INFO.get().unwrap();
     
     // This is the old unmapped kernel address
-    let load_base = mod_cb.info.base;
-    let dyn_tab = mod_cb.info.dyn_tab;
-    
+    let load_base = mod_cb.kernel().info.base;
+    let dyn_tab = mod_cb.kernel().info.dyn_tab;
+
     let info = |bitmap: u64| {
         (bitmap & 0xffffffff) as u32
     };
-    
+
     let stringizer = |str_idx: usize| {
         use core::ffi::CStr;
 
         let str_base = unsafe {
-            (mod_cb.info.dyn_str.unwrap().base_address as *const u8).add(str_idx)
+            (mod_cb.kernel().info.dyn_str.unwrap().base_address as *const u8).add(str_idx)
         };
 
         unsafe {
@@ -166,7 +256,11 @@ pub fn complete_handoff() {
         }
     };
 
-    if let Some(rlc_shn) = &mod_cb.info.rlc_shn {
+    if let Some(rlc_shn) = &mod_cb.kernel().info.rlc_shn {
+        // Usually we separate between plt and rlc relocations.
+        // However, kernel is known to have lot of relocations, so the reloc section
+        // will definitely exist and if it does, it will also contain the JUMP_SLOT plt entries
+        // We process them both from the same table unlike other parts within the kernel and blr
         let num_rel_entries = rlc_shn.size / core::mem::size_of::<Elf64Rela>();
         let entries = unsafe {
             core::slice::from_raw_parts(rlc_shn.start as *const Elf64Rela, num_rel_entries)
@@ -221,17 +315,18 @@ pub fn complete_handoff() {
     }
     
     // The module name needs to be patched up to new address
-    let name_ptr = mem::get_virtual_address(mod_cb.name.as_ptr() as usize, 0,  MapFetchType::Kernel)
+    let name_len = mod_cb.kernel().name.len();
+    let name_ptr = mem::get_virtual_address(mod_cb.kernel().name.as_ptr() as usize, 0,  MapFetchType::Kernel)
     .expect("Unable to find virtual address for module name");
 
-    mod_cb.name = unsafe {
-        let slice = core::slice::from_raw_parts(name_ptr as *const u8, mod_cb.name.len());
+    mod_cb.kernel_mut().name = unsafe {
+        let slice = core::slice::from_raw_parts(name_ptr as *const u8, name_len);
         core::str::from_utf8_unchecked(slice)
-    }; 
+    };
 
-    kernel_intf::set_logger_name(mod_cb.name);
+    kernel_intf::set_logger_name(mod_cb.kernel().name);
 
-    debug!("Module address:{:#X}, mod_name={}", mod_cb.name.as_ptr() as usize, mod_cb.name);
+    debug!("Module address:{:#X}, mod_name={}", mod_cb.kernel().name.as_ptr() as usize, mod_cb.kernel().name);
 
     // Reconstruct init fs as a hashmap. This is done here, since we now have access to heap
     crate::INIT_FS.call_once(|| {

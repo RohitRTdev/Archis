@@ -143,7 +143,7 @@ impl Irp {
     }
 
     pub fn complete_irp(&mut self, status: Status) {
-        unsafe { io_complete_irp(self as *mut Irp, status); }
+        io_complete_irp(self as *mut Irp, status);
     }
 }
 

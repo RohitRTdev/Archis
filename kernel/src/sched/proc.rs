@@ -8,7 +8,8 @@ use kernel_intf::{KError, info, debug};
 use kernel_intf::list::{List, DynList};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use crate::fs::FileInstance;
-use crate::loader::{LoadedImage, load_image};
+use crate::loader::{LoadedImage, LoadedImageWeak, load_image};
+use crate::loader::module::UserModule;
 use crate::{KERNEL_PATH, hal};
 use crate::mem::{self, PageDescriptor, VCB, VirtMemConBlk, deallocate_memory, get_physical_address};
 use crate::sched::{self, *};
@@ -47,8 +48,12 @@ pub struct Process {
     is_user: bool,
     term_notify: KEvent,
     init_notify: KEvent,
+    init_status: bool,
 
     file_table: Vec<Option<Handle>>,
+
+    // Per-process registry of user modules mapped into this process's address space
+    user_modules: Vec<LoadedImageWeak>,
 
     // List of physical addresses that are deallocated once the process is killed
     // The virtual address space would be destroyed prior to this deallocation
@@ -78,8 +83,10 @@ impl Process {
             is_user,
             term_notify: KEvent::new(false),
             init_notify: KEvent::new(false),
+            init_status: false,
             memory_list: List::new(),
             file_table: Vec::new(),
+            user_modules: Vec::new(),
             args,
             exit_code: AtomicIsize::new(0)
         }), PoolAllocatorGlobal);
@@ -158,7 +165,8 @@ impl Process {
         self.init_notify.clone()
     }
 
-    pub fn complete_init(&self) {
+    pub fn complete_init(&mut self, status: bool) {
+        self.init_status = status;
         self.init_notify.signal();
     }
 
@@ -170,6 +178,19 @@ impl Process {
 
     pub fn get_num_handles(&self) -> usize {
         self.file_table.len()
+    }
+
+    // Get all non-stale references of loadedImage from 
+    // per-process user module registry
+    pub fn get_user_modules(&self) -> Vec<LoadedImage> {
+        self.user_modules.iter()
+        .map(|p| {p.upgrade()})
+        .flatten()
+        .collect()
+    }
+
+    pub fn register_user_module(&mut self, module: &LoadedImage) {
+        self.user_modules.push(Arc::downgrade(module));
     }
 
 #[cfg(debug_assertions)]
@@ -263,7 +284,7 @@ extern "C" fn kernel_init_handler() -> ! {
         }
     };
 
-    let entry = img.lock().info.entry;
+    let entry = img.lock().kernel().info.entry;
     add_new_handle(Handle::ImgHandle(img));
 
     let entry_fn: DispatchRoutine = unsafe { core::mem::transmute(entry) };
@@ -285,7 +306,8 @@ pub fn get_current_process_args() -> *const Vec<String> {
 }
 
 pub fn create_process(args: Vec<String>, context_ptr: *mut c_void, is_user: bool) -> Result<KProcess, KError> {
-    if !is_user && args.is_empty() {
+    // args[0] must name the module to load (kernel and user alike)
+    if args.is_empty() {
         return Err(KError::InvalidArgument);
     }
 
@@ -326,6 +348,9 @@ pub fn create_process(args: Vec<String>, context_ptr: *mut c_void, is_user: bool
 
     if is_user {
         init_notify_sem.wait();
+        if !process.lock().init_status {
+            return Err(KError::ProcessInitFailed);
+        }
     }
 
     Ok(process)

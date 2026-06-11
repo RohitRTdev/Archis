@@ -18,6 +18,11 @@ include $(CONFIG_FILE)
 
 KERNEL_FLAGS := -C link-arg=-T$(LINKER_SCRIPT)
 MODULE_FLAGS := -C link-arg=-T$(MODULE_LINKER_SCRIPT) -C link-arg=-Ltarget/$(KERNEL_ARCH)/$(CONFIG)
+USER_LINKER_SCRIPT := config/x86_64/user_linker.ld
+USER_ASM_FLAGS := -c -fPIC -target x86_64-unknown-none -nostdlib
+USER_LLD_FLAGS := -flavor gnu --shared --hash-style=sysv -T $(USER_LINKER_SCRIPT)
+RUST_HOST := $(shell rustc -vV | grep '^host:' | cut -d' ' -f2)
+RUST_LLD  := $(shell rustc --print sysroot)/lib/rustlib/$(RUST_HOST)/bin/rust-lld
 
 ifeq ($(CONFIG),release)
     BUILD_OPTIONS := --release
@@ -32,7 +37,7 @@ ifeq ($(CONFIG),debug)
     DRIVER_FLAGS += -C force-frame-pointers=yes
 endif
 
-.PHONY: all clean build_blr build_kernel build_kernel_test build_kernel_template build_image
+.PHONY: all clean build_blr build_kernel build_kernel_test build_kernel_template build_image build_userspace
 
 all: build_image
 
@@ -41,7 +46,7 @@ $(ENV_PLACEHOLDER):
 	@docker build -t $(IMAGE_NAME) ./scripts
 	@echo -e $(GEN_MSG) > $(ENV_PLACEHOLDER)
 
-build_image: build_kernel build_blr build_drivers build_modules $(ENV_PLACEHOLDER)
+build_image: build_kernel build_blr build_drivers build_modules build_userspace $(ENV_PLACEHOLDER)
 	@echo "Starting image creation"
 	@touch $(OUTPUT_IMAGE)
 	$(RUN_DOCKER_SCRIPT)
@@ -116,6 +121,16 @@ build_modules: build_kernel
 			cp target/$(KERNEL_ARCH)/$(CONFIG)/lib$$name.so $(OUTPUT_DIR); \
 		fi; \
 	done
+
+build_userspace: $(OUTPUT_DIR)
+	@echo "Building userspace programs..."
+	@mkdir -p target/userspace
+	@clang $(USER_ASM_FLAGS) userspace/ulib/ulib.S -o target/userspace/ulib.o
+	@"$(RUST_LLD)" $(USER_LLD_FLAGS) target/userspace/ulib.o -o $(OUTPUT_DIR)/libulib.so
+	@clang $(USER_ASM_FLAGS) userspace/hello/hello.S -o target/userspace/hello.o
+	@"$(RUST_LLD)" $(USER_LLD_FLAGS) target/userspace/hello.o -L $(OUTPUT_DIR) -lulib -o $(OUTPUT_DIR)/libhello.so
+	@clang $(USER_ASM_FLAGS) userspace/spawner/spawner.S -o target/userspace/spawner.o
+	@"$(RUST_LLD)" $(USER_LLD_FLAGS) target/userspace/spawner.o -L $(OUTPUT_DIR) -lulib -o $(OUTPUT_DIR)/libspawner.so
 
 run_unit_test: build_kernel_test
 	@cargo test --manifest-path=boot/blr/Cargo.toml -- --nocapture

@@ -75,37 +75,3 @@ FUNC jump_to_user_code
     
     sysretq
 ENDF jump_to_user_code
-
-
-// User stub
-.global USER_FN_START, USER_FN_END
-USER_FN_START:
-    movq $2, %r12
-    movq $5, %rbx
-
-start_label:
-    movq $2, %rax
-    leaq msg(%rip), %rdi
-    movq $13, %rsi
-    syscall
-
-    movq $3, %rax
-    movq $1000, %rdi
-    syscall
-    movq $4, %rax
-    syscall
-    decq %rbx
-    jnz start_label
-
-    int $38
-    movq $5, %rax
-    syscall
-    movq $3, %rbx
-    decq %rcx
-    jnz start_label
-    movq $0, %rax
-    syscall
-msg: 
-    .ascii "Hello, world!"
-
-USER_FN_END:

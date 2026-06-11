@@ -887,6 +887,84 @@ fn run_sync_tests() {
     info!("=== run_sync_tests: PASSED ===");
 }
 
+// === User loader & userspace tests ===
+//
+// Test 1: basic load — single libhello.so process (exercises ELF parsing,
+//         dependency loading of libulib.so, relocations, all syscalls).
+// Test 2: warm load — two concurrent libhello.so processes share the
+//         read-only pages of both libhello.so and libulib.so.
+// Test 3: shared dep — libhello.so and libspawner.so launched concurrently,
+//         both pull in libulib.so (warm-loads the shared dependency).
+// Test 4: user-initiated spawn — libspawner.so internally spawns libhello.so
+//         via the create_process syscall.
+fn run_user_tests() {
+    info!("=== run_user_tests: BEGIN ===");
+
+    // Test 1: basic user process with dependency
+    info!("--- user test 1: basic load (libhello.so) ---");
+    let p1 = sched::create_process(
+        vec!["libhello.so".into()],
+        core::ptr::null_mut(),
+        true,
+    ).expect("user test 1: failed to create process");
+    p1.wait();
+    let code1 = p1.lock().get_exit_code();
+    info!("user test 1: libhello.so exited with code {}", code1);
+
+    // Test 2: warm load — same image in two concurrent processes
+    info!("--- user test 2: warm load (2x libhello.so) ---");
+    let p2a = sched::create_process(
+        vec!["libhello.so".into()],
+        core::ptr::null_mut(),
+        true,
+    ).expect("user test 2: failed to create process A");
+    let p2b = sched::create_process(
+        vec!["libhello.so".into()],
+        core::ptr::null_mut(),
+        true,
+    ).expect("user test 2: failed to create process B");
+    p2a.wait();
+    p2b.wait();
+    info!(
+        "user test 2: process A exited with code {}, B with code {}",
+        p2a.lock().get_exit_code(),
+        p2b.lock().get_exit_code()
+    );
+
+    drop(p1);drop(p2a);drop(p2b);
+    // Test 3: different images, shared dependency
+    info!("--- user test 3: shared dep (libhello.so + libspawner.so) ---");
+    let p3a = sched::create_process(
+        vec!["libhello.so".into()],
+        core::ptr::null_mut(),
+        true,
+    ).expect("user test 3: failed to create hello process");
+    let p3b = sched::create_process(
+        vec!["libspawner.so".into()],
+        core::ptr::null_mut(),
+        true,
+    ).expect("user test 3: failed to create spawner process");
+    p3a.wait();
+    p3b.wait();
+    info!(
+        "user test 3: hello exited with code {}, spawner with code {}",
+        p3a.lock().get_exit_code(),
+        p3b.lock().get_exit_code()
+    );
+
+    // Test 4: user-initiated process spawn
+    info!("--- user test 4: user-initiated spawn (libspawner.so) ---");
+    let p4 = sched::create_process(
+        vec!["libspawner.so".into()],
+        core::ptr::null_mut(),
+        true,
+    ).expect("user test 4: failed to create spawner process");
+    p4.wait();
+    info!("user test 4: spawner exited with code {}", p4.lock().get_exit_code());
+
+    info!("=== run_user_tests: PASSED ===");
+}
+
 fn kern_main() -> ! {
     info!("Starting main kernel init");
 
@@ -904,6 +982,7 @@ fn kern_main() -> ! {
     //run_proc_thread_tests();
     //spam_threads_test();
     //run_driver_worker_tests();
+    run_user_tests();
     info!("Main task going to sleep");
     info!("====TTY mode====");
     let kbd = open_device_handle("ps/2_port0").expect("Failed to open input device!");
@@ -924,8 +1003,6 @@ fn kern_main() -> ! {
         };
 
         if command == "shutdown\n" {
-            info!("Shutting down system in 5 seconds...");
-            sched::delay_ms(5000);
             #[cfg(feature = "acpi")]
             {
                 acpi_enter_sleep_state_prep(ACPI_SLEEP_S5);

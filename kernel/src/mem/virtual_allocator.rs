@@ -691,10 +691,22 @@ pub fn unmap_page_table(virt_addr: usize, proc_id: usize) -> Result<(), KError> 
 #[allow(dead_code)]
 pub fn reserve_virtual_memory(virt_addr: usize, layout: Layout) -> Result<(), KError> {
     assert!(IS_ADDR_SPACE_INIT.load(Ordering::Relaxed));
-    
+
     let kern_addr_space = get_kernel_addr_space();
     unsafe {
         (*kern_addr_space.as_ptr()).lock().reserve_virtual_space(virt_addr, layout)
+    }
+}
+
+// Reserve a fixed range of user virtual address space in the current process.
+// Used to map shared user modules at the same VA in every process. Fails if
+// the range is already occupied in this address space
+pub fn reserve_user_virtual_memory(virt_addr: usize, layout: Layout) -> Result<(), KError> {
+    assert!(IS_ADDR_SPACE_INIT.load(Ordering::Relaxed));
+
+    let active_addr_space = get_active_vcb();
+    unsafe {
+        (*active_addr_space.as_ptr()).lock().reserve_virtual_space(virt_addr, layout)
     }
 }
 
@@ -706,20 +718,19 @@ pub fn allocate_memory(layout: Layout, flags: u8) -> Result<*mut u8, KError> {
         if flags & PageDescriptor::USER != 0 {
             // If user memory is requested, we don't need to map it into all the address spaces
             // Hence just allocate it in the requested address space
-            assert!(!(flags & PageDescriptor::USER != 0 && flags & PageDescriptor::NO_ALLOC != 0), "USER and NO_ALLOC flag combination not supported right now");
-
             let active_addr_space = get_active_vcb();
             let virt_addr = unsafe {
                 (*active_addr_space.as_ptr()).lock().allocate(layout, true)?
             };
-
-            let phy_addr = PHY_MEM_CB.get().unwrap().lock().allocate(layout)?;
-
-            unsafe {&*active_addr_space.as_ptr()}
-            .lock().map_memory(phy_addr.addr(), virt_addr.addr(), layout.size(), flags, false)?;
             
-            //PageMapper::invalidate_other_cores(MemoryRegion{base_address: virt_addr.addr(), size: layout.size()});
+            if flags & PageDescriptor::NO_ALLOC == 0 {
+                let phy_addr = PHY_MEM_CB.get().unwrap().lock().allocate(layout)?;
 
+                unsafe {&*active_addr_space.as_ptr()}
+                .lock().map_memory(phy_addr.addr(), virt_addr.addr(), layout.size(), flags, false)?;
+            } 
+
+            
             Ok(virt_addr as *mut u8)
         }
         else {
@@ -776,11 +787,6 @@ pub fn deallocate_memory(addr: *mut u8, layout: Layout, flags: u8) -> Result<(),
         let phy_addr = if flags & PageDescriptor::USER != 0 {
             let active_addr_space = get_active_vcb();
             assert!(!(flags & PageDescriptor::USER != 0 && flags & PageDescriptor::NO_ALLOC != 0), "USER and NO_ALLOC flag combination not supported right now");
-            
-            // Zero memory before reclaiming it
-            //unsafe {
-            //    set_user_memory(addr, 0, layout.size());
-            //}
             
             let phy_addr = unsafe {
                 (*active_addr_space.as_ptr())
@@ -862,7 +868,6 @@ pub fn map_memory(phys_addr: usize, virt_addr: usize, size: usize, flags: u8) ->
         let active_addr_space = get_active_vcb();
         let kernel_addr_space = get_kernel_addr_space();
         unsafe {
-            
             // In case the current active address space is not the kernel address space
             // we first modify the control structures (alloc and free block list) which 
             // is only present in kernel address space (for kernel half of memory)

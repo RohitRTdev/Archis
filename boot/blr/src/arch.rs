@@ -36,11 +36,12 @@ impl MapRegion {
     }
 }
 
-pub struct DynamicInfo {
+struct DynamicInfo {
     pub symtab: Option<MapRegion>,
     pub strtab: Option<MapRegion>,
     pub rela: Option<MapRegion>,
-    pub relacount: usize
+    pub relacount: usize,
+    pub plt: Option<MapRegion>
 }
 
 unsafe extern "Rust" {
@@ -88,14 +89,19 @@ fn parse_dynamic_section(load_base: *const u8, dynamic: &MapRegion) -> DynamicIn
         strtab: None,
 
         rela: None,
-        relacount: 0
+        relacount: 0,
+
+        plt: None
     };
 
     let mut rela_size = 0usize;
     let mut rela_ent_size = core::mem::size_of::<Elf64Rela>();
+    let mut relacount = 0usize;
 
     let mut strsz = 0usize;
     let mut hash_vma: Option<usize> = None;
+
+    let mut plt_size = 0usize;
 
     for dynent in dynamic {
         match dynent.tag {
@@ -124,11 +130,25 @@ fn parse_dynamic_section(load_base: *const u8, dynamic: &MapRegion) -> DynamicIn
                     dest_addr: dynent.val as usize,
                     src_addr: 0,
                     src_size: 0,
-                    dest_size: core::mem::size_of::<Elf64Rela>(),
+                    dest_size: core::mem::size_of::<Elf64Rela>()
                 });
             },
             DT_RELASZ => {
                 rela_size = dynent.val as usize;
+            },
+            DT_RELACOUNT => {
+                relacount = dynent.val as usize;
+            },
+            DT_JMPREL => {
+                info.plt = Some(MapRegion {
+                    dest_addr: dynent.val as usize,
+                    src_addr: 0,
+                    src_size: 0,
+                    dest_size: core::mem::size_of::<Elf64Rela>()
+                })
+            },
+            DT_PLTRELSZ => {
+                plt_size = dynent.val as usize;
             },
             DT_RELAENT => {
                 rela_ent_size = dynent.val as usize;
@@ -151,6 +171,12 @@ fn parse_dynamic_section(load_base: *const u8, dynamic: &MapRegion) -> DynamicIn
         strtab.dest_size = strsz;
     }
 
+    if let Some(plt) = &mut info.plt {
+        plt.src_size = plt_size;
+    }
+
+    info.relacount = relacount;
+
     // Derive dynamic symbol table size from DT_HASH: the second 32-bit word
     // (nchain) holds the number of symbols.
     if let (Some(symtab), Some(hash)) = (info.symtab.as_mut(), hash_vma) {
@@ -160,22 +186,81 @@ fn parse_dynamic_section(load_base: *const u8, dynamic: &MapRegion) -> DynamicIn
         }
     }
 
-    // Instead of iterating 3 different tables, we'll just go over 3 types of entries in 1 table
-    info.relacount = rela_size / core::mem::size_of::<Elf64Rela>();
-
     info
 }
 
-
-fn apply_relocation(load_base: usize, kernel_size: usize, dynamic_shn: &DynamicInfo) {
+fn process_reloc_shn(load_base: usize, kernel_size: usize, entries: &[Elf64Rela], dyn_tab: Option<*const Elf64Sym>) {
     let info = |bitmap: u64| {
         (bitmap & 0xffffffff) as u32
     };
     
+    let mut rel_relocations = 0;
+    let mut jmp_relocations = 0;
+    let mut glob_relocations = 0;
+
+    for entry in entries {
+        let address = load_base + entry.r_offset as usize;
+        match info(entry.r_info) {
+            R_X86_64_RELATIVE => {
+                let value = load_base as i64 + entry.r_addend;
+                assert!(address < load_base + kernel_size);
+                unsafe {
+                    *(address as *mut u64) = value as u64;
+                }
+
+                rel_relocations += 1;
+            },
+            R_X86_64_64 | R_GLOB_DAT => {
+                assert!(dyn_tab.is_some());
+
+                let sym_idx = (entry.r_info >> 32) as usize;
+                let sym = unsafe {
+                    &*dyn_tab.as_ref().unwrap().add(sym_idx)
+                };
+
+                #[cfg(not(test))]
+                assert!(sym.st_shndx != SHN_UNDEF, "Undefined symbol in relocation");
+
+                let value = load_base + sym.st_value as usize + entry.r_addend as usize;
+
+                unsafe {
+                    *(address as *mut u64) = value as u64;
+                }
+
+                glob_relocations += 1;
+            },
+            R_JUMP_SLOT => {
+                assert!(dyn_tab.is_some());
+                let sym_idx = (entry.r_info >> 32) as usize;
+                let sym = unsafe {
+                    &*dyn_tab.as_ref().unwrap().add(sym_idx)
+                };
+
+                #[cfg(not(test))] 
+                if sym.st_shndx == SHN_UNDEF {
+                    panic!("Undefined symbol found during relocation");
+                }
+
+                let value = load_base + sym.st_value as usize;
+
+                unsafe {
+                    *(address as *mut u64) = value as u64;
+                }
+                jmp_relocations += 1;
+            },
+            _=> {}
+        }
+    }
+    
+    debug!("Relative relocations = {}, dynamic relocations = {}, global relocations = {}", rel_relocations, jmp_relocations, glob_relocations);
+}
+
+fn apply_relocation(load_base: usize, kernel_size: usize, dynamic_shn: &DynamicInfo) {
+    
     let reloc_shn = dynamic_shn.rela.as_ref().and_then(|f| {
         unsafe {
             let base = (f.dest_addr as *const u8).add(load_base) as *const Elf64Rela;
-            Some(core::slice::from_raw_parts(base, dynamic_shn.relacount))
+            Some(core::slice::from_raw_parts(base, f.src_size / size_of::<Elf64Rela>()))
         }
     });
 
@@ -186,67 +271,24 @@ fn apply_relocation(load_base: usize, kernel_size: usize, dynamic_shn: &DynamicI
         }
     });
 
-    let mut rel_relocations = 0;
-    let mut jmp_relocations = 0;
-    let mut glob_relocations = 0;
+    let plt_shn = dynamic_shn.plt.as_ref().and_then(|f| {
+        unsafe {
+            let base = (f.dest_addr as *const u8).add(load_base) as *const Elf64Rela;
+            Some(core::slice::from_raw_parts(base, f.src_size / size_of::<Elf64Rela>()))
+        }
+    });
 
+
+    // Any relative relocations, fix it here
     if let Some(entries) = reloc_shn {
         // Here, we are assuming that linker assigned base address of elf as 0
-        for entry in entries {
-            let address = load_base + entry.r_offset as usize;
-            match info(entry.r_info) {
-                R_X86_64_RELATIVE => {
-                    let value = load_base as i64 + entry.r_addend;
-                    assert!(address < load_base + kernel_size);
-                    unsafe {
-                        *(address as *mut u64) = value as u64;
-                    }
-
-                    rel_relocations += 1;
-                },
-                R_X86_64_64 | R_GLOB_DAT => {
-                    assert!(dyn_tab.is_some());
-
-                    let sym_idx = (entry.r_info >> 32) as usize;
-                    let sym = unsafe {
-                        &*dyn_tab.as_ref().unwrap().add(sym_idx)
-                    };
-
-                    #[cfg(not(test))]
-                    assert!(sym.st_shndx != SHN_UNDEF, "Undefined symbol in relocation");
-
-                    let value = load_base + sym.st_value as usize + entry.r_addend as usize;
-
-                    unsafe {
-                        *(address as *mut u64) = value as u64;
-                    }
-
-                    glob_relocations += 1;
-                },
-                R_JUMP_SLOT => {
-                    assert!(dyn_tab.is_some());
-                    let sym_idx = (entry.r_info >> 32) as usize;
-                    let sym = unsafe {
-                        &*dyn_tab.as_ref().unwrap().add(sym_idx)
-                    };
-
-                    #[cfg(not(test))] 
-                    if sym.st_shndx == SHN_UNDEF {
-                        panic!("Undefined symbol found during relocation");
-                    }
-
-                    let value = load_base + sym.st_value as usize;
-
-                    unsafe {
-                        *(address as *mut u64) = value as u64;
-                    }
-                    jmp_relocations += 1;
-                },
-                _=> {}
-            }
-        }
+        process_reloc_shn(load_base, kernel_size, entries, dyn_tab.clone());
     }
-    debug!("Relative relocations = {}, dynamic relocations = {}, global relocations = {}", rel_relocations, jmp_relocations, glob_relocations);
+    
+    // Fix any global/jmp_slot relocations here
+    if let Some(entries) = plt_shn {
+        process_reloc_shn(load_base, kernel_size, entries, dyn_tab.clone());
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -325,8 +367,10 @@ pub fn load_kernel_arch(kernel_base: *const u8, hdr: &Elf64Ehdr) -> ModuleInfo {
             map_regions_list.push(MapRegion {src_addr: unsafe {
                 kernel_base.add(prog_hdr.p_offset as usize) as usize
             },
-            dest_addr: prog_hdr.p_vaddr as usize, src_size: prog_hdr.p_filesz as usize, dest_size: prog_hdr.p_memsz as usize 
+            dest_addr: prog_hdr.p_vaddr as usize, src_size: prog_hdr.p_filesz as usize, dest_size: prog_hdr.p_memsz as usize
             });
+
+            assert!(prog_hdr.p_vaddr as usize % PAGE_SIZE == 0, "Loadable segment VMA {:#X} is not page-aligned", prog_hdr.p_vaddr);
 
             test_log!("src: {:#X}, dest: {:#X}, src-size: {}, dest-size: {}, aligment: {}", map_regions_list.last().unwrap().src_addr,
             map_regions_list.last().unwrap().dest_addr, map_regions_list.last().unwrap().src_size, 
@@ -446,6 +490,16 @@ pub fn load_kernel_arch(kernel_base: *const u8, hdr: &Elf64Ehdr) -> ModuleInfo {
             ArrayTable {start: load_base as usize + reloc.dest_addr, size: reloc.src_size, entry_size: reloc.dest_size }
         })
     }).flatten();
+    
+    let plt_shn_out = dyn_shn_info.as_ref().map(|f| {
+        f.plt.as_ref().map(|plt| {
+            ArrayTable {start: load_base as usize + plt.dest_addr, size: plt.src_size, entry_size: plt.dest_size }
+        })
+    }).flatten();
+
+    let reloc_count_out = dyn_shn_info.as_ref().map(|f| {
+        f.relacount
+    }).unwrap_or(0);
 
 #[cfg(debug_assertions)]
     print_exported_symbols(&dyn_sym_tab_out, &dyn_str_out);
@@ -460,6 +514,8 @@ pub fn load_kernel_arch(kernel_base: *const u8, hdr: &Elf64Ehdr) -> ModuleInfo {
         dyn_tab: dyn_sym_tab_out,
         dyn_str: dyn_str_out,
         rlc_shn: reloc_shn_out,
-        dyn_shn: dyn_shn_out
+        plt_shn: plt_shn_out,
+        dyn_shn: dyn_shn_out,
+        rlc_count: reloc_count_out
     }
 }

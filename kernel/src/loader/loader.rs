@@ -14,7 +14,8 @@ use kernel_intf::{KError, info};
 use crate::KERNEL_PATH;
 use crate::fs::{FileBuffer, open, resolve_symlink};
 use crate::infra::disable_preloader_phase;
-use crate::loader::module::ModuleDescriptor;
+use crate::loader::module::{KernelModule, ModuleDescriptor, ModuleType};
+use crate::loader::user_loader::load_user_image;
 use crate::mem::{PageDescriptor, allocate_memory, deallocate_memory};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use crate::sched::Handle::ImgHandle;
@@ -23,41 +24,53 @@ use crate::sync::{KSem, Once, Spinlock, semaphore_guard};
 use kernel_intf::list::{List, DynList};
 use super::module;
 
-pub static KERNEL_MODULES: Spinlock<DynList<Weak<Spinlock<ModuleDescriptor>, PoolAllocatorGlobal>>> = Spinlock::new(List::new());
+pub static KERNEL_MODULES: Spinlock<DynList<LoadedImageWeak>> = Spinlock::new(List::new());
 
 static LOAD_LOCK: Once<KSem> = Once::new();
 
 pub type LoadedImage = Arc<Spinlock<ModuleDescriptor>, PoolAllocatorGlobal>;
+pub type LoadedImageWeak = Weak<Spinlock<ModuleDescriptor>, PoolAllocatorGlobal>; 
 
 impl Drop for ModuleDescriptor {
     fn drop(&mut self) {
-        {
-            let mut registry = KERNEL_MODULES.lock();
-            crate::loader_log!("Dropping image {}, with registry_len={}", self.name, registry.get_nodes());
+        match &self.mod_type {
+            ModuleType::Kernel(kmod) => {
+                {
+                    let mut registry = KERNEL_MODULES.lock();
+                    crate::loader_log!("Dropping image {}, with registry_len={}", kmod.name, registry.get_nodes());
 
-            // Cleanup: Remove all weak refs from the registry
-            while registry.find_and_remove(|entry| {
-                let item = entry.upgrade();
-                item.is_none()
-            }).is_some() {}
+                    // Cleanup: Remove all weak refs from the registry
+                    while registry.find_and_remove(|entry| {
+                        let item = entry.upgrade();
+                        item.is_none()
+                    }).is_some() {}
 
-            crate::loader_log!("New registry len = {}", registry.get_nodes());
+                    crate::loader_log!("New registry len = {}", registry.get_nodes());
+                }
+
+                deallocate_memory(
+                    kmod.info.base as *mut u8,
+                    Layout::from_size_align(kmod.info.total_size, PAGE_SIZE).unwrap(),
+                    PageDescriptor::VIRTUAL
+                ).expect("Failed to deallocate backing memory for kernel module!");
+            },
+            ModuleType::User(_) => {
+                // The outer descriptor only carries this process's base/entry
+                // and a strong ref to the shared state. Dropping it simply
+                // decrements the shared Arc; the shared cleanup (registry purge
+                // + read-only phys release) lives in SharedUserModule::drop
+            }
         }
-
-        deallocate_memory(
-            self.info.base as *mut u8, 
-            Layout::from_size_align(self.info.total_size, PAGE_SIZE).unwrap(), 
-            PageDescriptor::VIRTUAL
-        ).expect("Failed to deallocate backing memory for kernel module!");
     }
 }
 
 
 pub fn init() {
     LOAD_LOCK.call_once(|| KSem::new(1, 1));
+    super::user_loader::init();
 
     let mut kernel_img = module::ARIS.get().unwrap().lock().clone();
-    kernel_img.file_handle = Some(
+    kernel_img.kernel_mut().file_handle = Some(
         open(KERNEL_PATH).expect("Failed to open kernel image!")
     );
 
@@ -80,19 +93,22 @@ pub fn init() {
 pub fn load_image(path: &str, is_user: bool) -> Result<LoadedImage, KError> {
     crate::loader_log!("Start load_image for {}", path);
 
+    // User modules go through the user loader, which has its own lock and
+    // per-process bookkeeping
+    if is_user {
+        return load_user_image(path);
+    }
+
     // Serialize the whole recursive load
     let _guard = semaphore_guard(LOAD_LOCK.get().expect("loader::init() not called before load_image()"));
 
     let mut in_progress: Vec<String> = Vec::new();
-    let result = load_image_inner(path, is_user, &mut in_progress);
-
-    result
+    load_image_inner(path, &mut in_progress)
 }
 
 
 fn do_load_image_inner(
     path: &str,
-    is_user: bool,
     in_progress: &mut Vec<String>
 ) -> Result<LoadedImage, KError> {
     if let Some(cached) = find_loaded_module(path) {
@@ -107,7 +123,6 @@ fn do_load_image_inner(
 
     let result = load_image_uncached(
         path,
-        is_user,
         in_progress
     );
 
@@ -117,23 +132,18 @@ fn do_load_image_inner(
 
 fn load_image_inner(
     path: &str,
-    is_user: bool,
     in_progress: &mut Vec<String>
 ) -> Result<LoadedImage, KError> {
-    if is_user {
-        todo!("User-mode image loading not implemented");
-    }
-
     const PREDEFINED_DIRECTORIES: [&str; 3] = ["", "/sys", "/sys/drivers"];
     // This is an absolute path
     if path.starts_with("/") {
-        return do_load_image_inner(path, false, in_progress);
+        return do_load_image_inner(path, in_progress);
     }
     else {
         // Check for the file in all the predefined directories
         for prefix in PREDEFINED_DIRECTORIES {
             let filename = format!("{}/{}", prefix, path);
-            let res = do_load_image_inner(filename.as_str(), false, in_progress);
+            let res = do_load_image_inner(filename.as_str(), in_progress);
 
             match res {
                 Err(InvalidArgument) => {
@@ -146,7 +156,7 @@ fn load_image_inner(
                     return Ok(img)
                 }
             }
-        }    
+        }
     }
 
     Err(InvalidArgument)
@@ -154,7 +164,6 @@ fn load_image_inner(
 
 fn load_image_uncached(
     path: &str,
-    is_user: bool,
     in_progress: &mut Vec<String>
 ) -> Result<LoadedImage, KError> {
     crate::loader_log!("Loading image {} from disk", path);
@@ -175,7 +184,7 @@ fn load_image_uncached(
     let bytes = buf.as_slice();
 
     let mod_info = build_image_layout(bytes)?;
-    let deps = load_dependencies(&mod_info, is_user, in_progress)?;
+    let deps = load_dependencies(&mod_info, in_progress)?;
     apply_relocations(&mod_info, &deps)?;
 
     let (module_name, driver_init_address) = configure_module(&mod_info);
@@ -186,11 +195,13 @@ fn load_image_uncached(
     })?;
 
     let descriptor = ModuleDescriptor {
-        name: module_name,
-        driver_init_address,
-        file_handle: Some(file),
-        info: mod_info,
-        _deps: Some(deps)
+        mod_type: ModuleType::Kernel(KernelModule {
+            name: module_name,
+            driver_init_address,
+            file_handle: Some(file),
+            info: mod_info,
+            _deps: Some(deps)
+        })
     };
 
     let arc = Arc::new_in(Spinlock::new(descriptor), PoolAllocatorGlobal);
@@ -208,12 +219,19 @@ fn find_loaded_module(path: &str) -> Option<LoadedImage> {
     let resolved = resolve_symlink(path);
     crate::loader_log!("Resolved symlink:{} -> {}", path, resolved);
 
-    let registry = KERNEL_MODULES.lock();
-    for node in registry.iter() {
-        let entry = match node.upgrade() { Some(e) => e, None => continue };
+    // Collect strong refs under the registry lock, but compare (and drop the
+    // non-matching Arcs) outside of it. Dropping the last strong ref runs
+    // ModuleDescriptor::drop which re-locks the registry — doing that while
+    // holding the lock would self-deadlock.
+    let candidates: Vec<LoadedImage> = {
+        let registry = KERNEL_MODULES.lock();
+        registry.iter().filter_map(|node| node.upgrade()).collect()
+    };
+
+    for entry in candidates {
         let matches = {
             let guard = entry.lock();
-            let fh = guard.file_handle.as_ref().unwrap();
+            let fh = guard.kernel().file_handle.as_ref().unwrap();
             let file_guard = fh.lock();
             file_guard.get_name() == resolved
         };
@@ -224,7 +242,7 @@ fn find_loaded_module(path: &str) -> Option<LoadedImage> {
     None
 }
 
-unsafe fn read_cstr<'a>(base: usize, idx: usize) -> &'a str {
+pub(super) unsafe fn read_cstr<'a>(base: usize, idx: usize) -> &'a str {
     let ptr = (base + idx) as *const i8;
     unsafe {
         CStr::from_ptr(ptr).to_str().unwrap()
@@ -272,8 +290,8 @@ fn configure_module(info: &ModuleInfo) -> (Option<&'static str>, Option<usize>) 
 fn resolve_import(name: &str, deps: &[LoadedImage]) -> Option<usize> {
     for arc in deps {
         let desc = arc.lock();
-        let dyn_tab = match desc.info.dyn_tab { Some(t) => t, None => continue };
-        let dyn_str = match desc.info.dyn_str { Some(s) => s, None => continue };
+        let dyn_tab = match desc.kernel().info.dyn_tab { Some(t) => t, None => continue };
+        let dyn_str = match desc.kernel().info.dyn_str { Some(s) => s, None => continue };
 
         let entries = unsafe {
             core::slice::from_raw_parts(dyn_tab.start as *const Elf64Sym, dyn_tab.size / dyn_tab.entry_size)
@@ -284,7 +302,7 @@ fn resolve_import(name: &str, deps: &[LoadedImage]) -> Option<usize> {
             }
             let sym_name = unsafe { read_cstr(dyn_str.base_address, sym.st_name as usize) };
             if sym_name == name {
-                return Some(desc.info.base + sym.st_value as usize);
+                return Some(desc.kernel().info.base + sym.st_value as usize);
             }
         }
     }
@@ -334,6 +352,7 @@ fn build_image_layout(bytes: &[u8]) -> Result<ModuleInfo, KError> {
             dest_size: phdr.p_memsz as usize,
             entry_size: 0,
         };
+        assert!(phdr.p_vaddr as usize % PAGE_SIZE == 0, "Loadable segment VMA {:#X} is not page-aligned", phdr.p_vaddr);
         if phdr.p_align != 0 && phdr.p_align != 1 {
             max_alignment = max_alignment.max(phdr.p_align as usize);
         }
@@ -445,6 +464,8 @@ fn build_image_layout(bytes: &[u8]) -> Result<ModuleInfo, KError> {
     let dyn_tab_out = dyn_info.as_ref().and_then(|i| i.dyn_tab);
     let dyn_str_out = dyn_info.as_ref().and_then(|i| i.dyn_str);
     let rlc_shn_out = dyn_info.as_ref().and_then(|i| i.rela);
+    let plt_shn_out = dyn_info.as_ref().and_then(|i| i.plt);
+    let rlc_count_out = dyn_info.as_ref().and_then(|i| Some(i.relacount)).unwrap_or(0);
 
     Ok(ModuleInfo {
         entry: ehdr.e_entry as usize + load_base_addr,
@@ -456,7 +477,9 @@ fn build_image_layout(bytes: &[u8]) -> Result<ModuleInfo, KError> {
         dyn_tab: dyn_tab_out,
         dyn_str: dyn_str_out,
         rlc_shn: rlc_shn_out,
+        plt_shn: plt_shn_out,
         dyn_shn: dyn_shn_out,
+        rlc_count: rlc_count_out
     })
 }
 
@@ -464,6 +487,8 @@ struct DynamicInfo {
     dyn_tab: Option<ArrayTable>,
     dyn_str: Option<MemoryRegion>,
     rela:    Option<ArrayTable>,
+    relacount: usize,
+    plt: Option<ArrayTable>
 }
 
 fn parse_dynamic_section(load_base: usize, dyn_shn: &ArrayTable) -> DynamicInfo {
@@ -475,10 +500,13 @@ fn parse_dynamic_section(load_base: usize, dyn_shn: &ArrayTable) -> DynamicInfo 
     let mut symtab_vma: Option<usize> = None;
     let mut strtab_vma: Option<usize> = None;
     let mut rela_vma:   Option<usize> = None;
+    let mut plt_vma: Option<usize> = None;
     let mut hash_vma:   Option<usize> = None;
     let mut strsz  = 0usize;
     let mut relasz = 0usize;
     let mut relaent = size_of::<Elf64Rela>();
+    let mut relacount = 0usize;
+    let mut pltsize = 0usize;
 
     for dynent in entries {
         match dynent.tag {
@@ -488,10 +516,13 @@ fn parse_dynamic_section(load_base: usize, dyn_shn: &ArrayTable) -> DynamicInfo 
             DT_STRSZ   => strsz      = dynent.val as usize,
             DT_RELA    => rela_vma   = Some(dynent.val as usize),
             DT_RELASZ  => relasz     = dynent.val as usize,
+            DT_JMPREL => plt_vma = Some(dynent.val as usize),
+            DT_PLTRELSZ => pltsize = dynent.val as usize,
             DT_RELAENT => {
                 relaent = dynent.val as usize;
                 assert_eq!(relaent, size_of::<Elf64Rela>());
             },
+            DT_RELACOUNT => relacount = dynent.val as usize,
             DT_HASH    => hash_vma   = Some(dynent.val as usize),
             _ => {}
         }
@@ -518,12 +549,17 @@ fn parse_dynamic_section(load_base: usize, dyn_shn: &ArrayTable) -> DynamicInfo 
             size: relasz,
             entry_size: relaent,
         }),
+        plt: plt_vma.map(|v| ArrayTable {
+            start: load_base + v,
+            size: pltsize,
+            entry_size: relaent
+        }),
+        relacount
     }
 }
 
 fn load_dependencies(
     mod_info: &ModuleInfo,
-    is_user: bool,
     in_progress: &mut Vec<String>
 ) -> Result<Vec<LoadedImage>, KError> {
     let mut deps: Vec<LoadedImage> = Vec::new();
@@ -548,7 +584,6 @@ fn load_dependencies(
         crate::loader_log!("Loading dependency {}", name);
         let res = load_image_inner(
             name,
-            is_user,
             in_progress
         )?;
         
@@ -558,23 +593,14 @@ fn load_dependencies(
     Ok(deps)
 }
 
-fn apply_relocations(
-    mod_info: &ModuleInfo,
+fn process_reloc_shn(
+    load_base:usize, 
+    dyn_tab: Option<ArrayTable>, 
+    dyn_str: Option<MemoryRegion>, 
+    entries: &[Elf64Rela],
     deps: &[LoadedImage]
 ) -> Result<(), KError> {
-    let rlc = match mod_info.rlc_shn { Some(r) => r, None => return Ok(()) };
-
-    let load_base = mod_info.base;
-    let dyn_tab = mod_info.dyn_tab;
-    let dyn_str = mod_info.dyn_str;
-
     let info_field = |bitmap: u64| (bitmap & 0xffffffff) as u32;
-
-    let num_entries = rlc.size / rlc.entry_size;
-    let entries = unsafe {
-        core::slice::from_raw_parts(rlc.start as *const Elf64Rela, num_entries)
-    };
-
     for entry in entries {
         let address = load_base + entry.r_offset as usize;
         let rtype = info_field(entry.r_info);
@@ -613,6 +639,44 @@ fn apply_relocations(
             },
             _ => {}
         }
+    }
+
+    Ok(())
+}
+
+fn apply_relocations(
+    mod_info: &ModuleInfo,
+    deps: &[LoadedImage]
+) -> Result<(), KError> {
+    if mod_info.rlc_shn.is_none() && mod_info.plt_shn.is_none() {
+        return Ok(())
+    }
+
+    let load_base = mod_info.base;
+    let dyn_tab = mod_info.dyn_tab;
+    let dyn_str = mod_info.dyn_str;
+
+
+    let num_entries_rlc = mod_info.rlc_shn.map(|r| r.size / r.entry_size).unwrap_or(0);
+    let entries_rlc = mod_info.rlc_shn.map(|r| {
+        unsafe {
+            core::slice::from_raw_parts(r.start as *const Elf64Rela, r.size / r.entry_size)
+        }
+    });
+
+    let num_entries_plt = mod_info.plt_shn.map(|r| {r.size / r.entry_size}).unwrap_or(0);
+    let entries_plt = mod_info.plt_shn.map(|r| {
+        unsafe {
+            core::slice::from_raw_parts(r.start as *const Elf64Rela, r.size / r.entry_size)
+        }
+    });
+
+    if num_entries_rlc > 0 {
+        process_reloc_shn(load_base, dyn_tab, dyn_str, entries_rlc.unwrap(), deps)?;
+    }
+    
+    if num_entries_plt > 0 {
+        process_reloc_shn(load_base, dyn_tab, dyn_str, entries_plt.unwrap(), deps)?;
     }
 
     Ok(())

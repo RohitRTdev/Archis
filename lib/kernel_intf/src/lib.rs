@@ -28,6 +28,7 @@ pub enum KError {
     InvalidArgument,
     OutOfMemory,
     ProcessTerminated,
+    ProcessInitFailed,
     WaitFailed,
     CircularDependency,
     ModuleNotDriver,
@@ -58,7 +59,8 @@ impl From<KError> for i64 {
             KError::Unsupported => E_NOT_SUPPORTED,
             KError::DeviceStopped => E_DEV_STOPPED,
             KError::ProcessTerminated | KError::WaitFailed |
-            KError::CircularDependency | KError::DriverLoadFailed | KError::ModuleNotDriver => E_INTERNAL_FAILURE
+            KError::CircularDependency | KError::DriverLoadFailed | 
+            KError::ModuleNotDriver | KError::ProcessInitFailed => E_INTERNAL_FAILURE
         }
     }
 }
@@ -70,6 +72,7 @@ impl fmt::Display for KError {
             KError::InvalidArgument => "Invalid argument",
             KError::OutOfMemory => "Out of memory",
             KError::ProcessTerminated => "Process terminated",
+            KError::ProcessInitFailed => "Process init failed",
             KError::WaitFailed => "Wait internal failure",
             KError::CircularDependency => "Circular dependency in module load",
             KError::DriverLoadFailed => "Driver load failed",

@@ -123,7 +123,7 @@ pub fn start_unwind(mod_name: &str, stack_base: usize) {
 
 }
 
-fn symbol_trace_do_work(addr: usize, module: &ModuleDescriptor) -> Option<(&'static str, &'static str, usize)> {
+fn symbol_trace_do_work(addr: usize, module: &KernelModule) -> Option<(&'static str, &'static str, usize)> {
     // Check if this symbol is part of this module
     if (addr < module.info.base) || (addr >= module.info.base + module.info.size) {
         return None;
@@ -174,7 +174,7 @@ fn symbol_trace(addr: usize) -> Option<(&'static str, &'static str, usize)> {
     // Spinlock::as_ref safety doc.
     if unlikely(PRE_LOADER_PHASE.load(Ordering::Acquire)) {
         let aris = unsafe { ARIS.get().unwrap().as_ref() };
-        symbol_trace_do_work(addr, aris)
+        symbol_trace_do_work(addr, aris.kernel())
     }
     else {
         let loaded_images = unsafe { KERNEL_MODULES.as_ref() };
@@ -186,7 +186,14 @@ fn symbol_trace(addr: usize) -> Option<(&'static str, &'static str, usize)> {
 
             let arc = entry.as_ref().unwrap();
             let module = unsafe { Spinlock::as_ref(&**arc) };
-            let res = symbol_trace_do_work(addr, module);
+
+            // Defensive: only kernel modules carry kernel-space symbol info
+            let kmod = match module.kernel_opt() {
+                Some(k) => k,
+                None => continue
+            };
+
+            let res = symbol_trace_do_work(addr, kmod);
 
             if res.is_some() {
                 return res;
