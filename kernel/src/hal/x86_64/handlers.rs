@@ -178,13 +178,22 @@ pub fn init() {
                 let con = *(fetch_context() as *const CPUContext);
                 debug!("{:?}", con);
                 debug!("gs={:#X}, kernel_gs={:#X}", get_per_cpu_kernel_base(), get_per_cpu_base());
+
                 if idx == DOUBLE_FAULT_VECTOR {
                     panic!("{} exception!\nPossible stack overflow??", EXCP_STRINGS[idx]);
                 }
-                else {
+
+                // NMI is a hardware event (memory error, watchdog) — unrelated to the
+                // faulting process, so always panic regardless of privilege level.
+                if idx == NMI_FAULT_VECTOR {
                     panic!("{} exception!", EXCP_STRINGS[idx]);
                 }
-                
+
+                // For all other exceptions originating in user space, kill the process
+                // instead of crashing the kernel.
+                try_kill_user_process(EXCP_STRINGS[idx]);
+
+                panic!("{} exception!", EXCP_STRINGS[idx]);
             };
         }
 
@@ -255,7 +264,7 @@ fn sys_handler(_vector: usize) {
 fn page_fault_handler(_vector: usize) {
     let fault_address = asm::read_cr2();
     
-    info!("{:?}", unsafe {*(fetch_context() as *const CPUContext)});
+    debug!("{:?}", unsafe {*(fetch_context() as *const CPUContext)});
 
     on_page_fault(fault_address as usize);
 }
@@ -263,6 +272,22 @@ fn page_fault_handler(_vector: usize) {
 pub fn fetch_context() -> usize {
     assert!(!crate::sched::is_in_dw_mode(), "fetch_context() called while in DW mode");
     PER_CPU_GLOBAL_CONTEXT.local().load(Ordering::Acquire)
+}
+
+pub fn is_user_fault_context() -> bool {
+    let con = unsafe { *(fetch_context() as *const CPUContext) };
+    con.cs & 3 == 3
+}
+
+// If the current fault context is user space and a user process is active,
+// kill that process with exit code -1 
+pub fn try_kill_user_process(fault_label: &str) {
+    if is_user_fault_context() {
+        if crate::sched::get_current_process_id().is_some() {
+            info!("{} in user process — killing process", fault_label);
+            crate::sched::exit_process(-1);
+        }
+    }
 }
 
 pub fn switch_context(new_context: usize) {

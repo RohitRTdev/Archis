@@ -54,13 +54,16 @@ fn setup_memory_map() -> ArrayTable {
         }
 
         let mem_type = match desc.ty {
-                MemoryType::BOOT_SERVICES_CODE | 
+                MemoryType::BOOT_SERVICES_CODE |
                 MemoryType::CONVENTIONAL | MemoryType::PERSISTENT_MEMORY => {
                     MemType::Free
-                },   
-                MemoryType::RUNTIME_SERVICES_CODE | MemoryType::RUNTIME_SERVICES_DATA 
+                },
+                MemoryType::RUNTIME_SERVICES_CODE | MemoryType::RUNTIME_SERVICES_DATA
                 | MemoryType::ACPI_NON_VOLATILE | MemoryType::ACPI_RECLAIM => {
                     MemType::Identity
+                },
+                MemoryType::BOOT_SERVICES_DATA => {
+                    MemType::BootloaderData
                 },
                 _ => {
                     MemType::Allocated
@@ -153,6 +156,10 @@ fn main() -> Status {
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    system::with_stdout(|output| {
+        output.clear().unwrap();
+    });
+
     println!("[PANIC!!!]: {}", info.message());
     loop{}
 }

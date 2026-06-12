@@ -67,7 +67,8 @@ pub struct ModuleInfo {
 pub enum MemType {
     Free,
     Allocated,
-    Identity
+    Identity,
+    BootloaderData,
 }
 
 #[repr(C)]

@@ -60,7 +60,7 @@ pub struct Task {
     term_notify: KEvent,
     process: Option<KProcess>,
     vcb: Option<VCB>,
-    pub context_ptr: *mut c_void,
+    pub(super) context_ptr: *mut c_void,
     exit_code: AtomicIsize,
 #[cfg(target_arch="x86_64")]
     per_cpu_base: u64

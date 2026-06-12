@@ -11,6 +11,7 @@ use alloc::{string::String, vec::Vec};
 use alloc::borrow::ToOwned;
 use uefi::proto::device_path::text::{AllowShortcuts, DisplayOnly};
 use uefi::proto::media::file::{Directory, File, FileAttribute, RegularFile};
+use uefi::proto::loaded_image::LoadedImage;
 use uefi::{boot, CString16, Char16, Handle};
 use uefi::boot::{ScopedProtocol, HandleBuffer};
 use uefi::proto::{device_path::{DevicePath, media::{self,HardDrive}}, media::{file::FileMode, fs::SimpleFileSystem}};
@@ -81,14 +82,48 @@ impl FileTable {
 }
 
 
+// Collect the raw bytes of all device path nodes that precede the HardDrive node.
+// This identifies the physical disk controller path, independent of partition number.
+fn disk_prefix_bytes(device_path: &DevicePath) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for node in device_path.node_iter() {
+        if <&HardDrive>::try_from(node).is_ok() {
+            break;
+        }
+        // EFI DevicePath node layout: [type(1), subtype(1), len_lo(1), len_hi(1), data...]
+        let node_ptr = node as *const _ as *const u8;
+        let len = unsafe {
+            u16::from_le_bytes([*node_ptr.add(2), *node_ptr.add(3)]) as usize
+        };
+        unsafe { bytes.extend_from_slice(core::slice::from_raw_parts(node_ptr, len)); }
+    }
+    bytes
+}
+
 pub fn list_fs(supported_handles: &HandleBuffer) -> &Handle {
+    // Determine which physical disk we booted from so that partitions on
+    // unrelated disks (even with the same GPT GUID) are ignored.
+    let boot_prefix = {
+        let image: ScopedProtocol<LoadedImage> =
+            boot::open_protocol_exclusive(boot::image_handle()).unwrap();
+        let boot_device = image.device().unwrap();
+        let boot_path: ScopedProtocol<DevicePath> =
+            boot::open_protocol_exclusive(boot_device).unwrap();
+        disk_prefix_bytes(&boot_path)
+    };
+    info!("Boot disk prefix: {} bytes", boot_prefix.len());
+
     let mut root_partition = None;
     for partition in supported_handles.iter() {
-        // For each handle, get it's devicePath
         let device_path: ScopedProtocol<DevicePath> = boot::open_protocol_exclusive(*partition).unwrap();
-        
+
         if let Ok(device_path_text) = device_path.to_string(DisplayOnly(false), AllowShortcuts(true)) {
             info!("Device path = {}", String::from(&device_path_text));
+        }
+
+        // Skip partitions that do not reside on the boot disk
+        if disk_prefix_bytes(&device_path) != boot_prefix {
+            continue;
         }
 
         // Iterate the device path and check for our root partition id
@@ -101,16 +136,12 @@ pub fn list_fs(supported_handles: &HandleBuffer) -> &Handle {
                         root_partition = Some(partition);
                         break;
                     }
-                }           
+                }
             }
         }
     }
 
-    if root_partition.is_none() {
-        panic!("Could not find root partition!!");
-    }
-
-    root_partition.unwrap()
+    root_partition.unwrap_or_else(|| panic!("Could not find root partition!!"))
 }
 
 fn parse_initfs_conf(init_conf: &str) -> Vec<String> {

@@ -5,7 +5,7 @@ IMAGE_NAME = disk-tools
 OUTPUT_DIR = output
 ENV_PLACEHOLDER = placeholder.txt
 KERN_PLACEHOLDER = kernel/placeholder_test.txt
-QEMU_CPU_ARGS_WITH_ACCEL = -M q35,accel=whpx -cpu qemu64
+QEMU_CPU_ARGS_WITH_ACCEL = -M q35,accel=whpx -cpu qemu64 -smp sockets=1,cores=6,threads=2
 QEMU_CPU_ARGS_WITHOUT_ACCEL = -smp sockets=1,cores=6,threads=2 -cpu Skylake-Client,+smap,+smep,+umip,+pge
 GEN_MSG = "Automatically generated file..\nDo not remove manually.."
 SHELL = /bin/bash

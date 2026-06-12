@@ -968,6 +968,8 @@ fn run_user_tests() {
 fn kern_main() -> ! {
     info!("Starting main kernel init");
 
+    mem::reclaim_pages();
+
     sched::init();
     loader::init();
     io::init();

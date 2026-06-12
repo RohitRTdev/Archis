@@ -29,6 +29,8 @@ pub struct PhyMemConBlk {
 
 pub static PHY_MEM_CB: Once<Spinlock<PhyMemConBlk>> = Once::new();
 
+static BOOTLOADER_REGIONS: Once<Spinlock<FixedList<PageDescriptor, {Region0 as usize}>>> = Once::new();
+
 impl PhyMemConBlk {
     fn find_best_fit(&mut self, pages: usize) -> Result<*mut u8, KError> {
         let mut smallest_blk: Option<&mut ListNode<PageDescriptor>> = None;
@@ -196,6 +198,7 @@ pub fn frame_allocator_init() {
         free_block_list: List::new(),
         alloc_block_list: List::new()
     };
+    let mut bl_list: FixedList<PageDescriptor, {Region0 as usize}> = List::new();
 
     let mem_descriptors  = unsafe {
         core::slice::from_raw_parts_mut(boot_info.memory_map_desc.start as *mut MemoryDesc, boot_info.memory_map_desc.size / boot_info.memory_map_desc.entry_size)
@@ -216,30 +219,71 @@ pub fn frame_allocator_init() {
 
         match &desc.mem_type {
             MemType::Free => {
-                init_mem_cb.free_block_list.add_node(PageDescriptor { num_pages: common::ceil_div(desc.val.size, PAGE_SIZE), 
+                init_mem_cb.free_block_list.add_node(PageDescriptor { num_pages: common::ceil_div(desc.val.size, PAGE_SIZE),
                     start_phy_address: desc.val.base_address, start_virt_address: 0, flags: 0, is_mapped: false }).unwrap();
-                
+
                 init_mem_cb.avl_memory += desc.val.size;
             },
             MemType::Allocated | MemType::Identity => {
-                init_mem_cb.alloc_block_list.add_node(PageDescriptor { num_pages: common::ceil_div(desc.val.size, PAGE_SIZE), 
+                init_mem_cb.alloc_block_list.add_node(PageDescriptor { num_pages: common::ceil_div(desc.val.size, PAGE_SIZE),
                     start_phy_address: desc.val.base_address, start_virt_address: 0, flags: 0, is_mapped: false }).unwrap();
-            
-                    if desc.mem_type == MemType::Identity {
-                        REMAP_LIST.lock().add_node(RemapEntry { 
-                            value: desc.val,
-                            map_type: IdentityMapped, flags: 0}).unwrap();
-                    }
-            }
+
+                if desc.mem_type == MemType::Identity {
+                    REMAP_LIST.lock().add_node(RemapEntry {
+                        value: desc.val,
+                        map_type: IdentityMapped, flags: 0}).unwrap();
+                }
+            },
+            MemType::BootloaderData => {
+                // Pages are not free yet; they will be reclaimed in kern_main after
+                // all firmware-provided data has been consumed.
+                bl_list.add_node(PageDescriptor { num_pages: common::ceil_div(desc.val.size, PAGE_SIZE),
+                    start_phy_address: desc.val.base_address, start_virt_address: 0, flags: 0, is_mapped: false }).unwrap();
+            },
         }
         init_mem_cb.total_memory += desc.val.size;
     }
 
     info!("Initialized Memory control block -> Total memory: {}, Available memory: {}", init_mem_cb.total_memory, init_mem_cb.avl_memory);
 
-    PHY_MEM_CB.call_once(|| {
-        Spinlock::new(init_mem_cb)
-    });
+    PHY_MEM_CB.call_once(|| Spinlock::new(init_mem_cb));
+    BOOTLOADER_REGIONS.call_once(|| Spinlock::new(bl_list));
+}
+
+pub fn reclaim_pages() {
+    let bl_regions = match BOOTLOADER_REGIONS.get() {
+        Some(r) => r,
+        None => return,
+    };
+
+    let mut bl_list = bl_regions.lock();
+    let mut phy_mem = PHY_MEM_CB.get().unwrap().lock();
+
+    loop {
+        let node_ptr = bl_list.iter().next().map(|n| NonNull::from(n));
+        let Some(ptr) = node_ptr else { break };
+
+        let (num_pages, base) = {
+            let desc = unsafe { ptr.as_ref() };
+            (desc.num_pages, desc.start_phy_address)
+        };
+        unsafe { bl_list.remove_node(ptr); }
+
+        // Temporarily add to alloc list so deallocate() can locate and coalesce it.
+        phy_mem.alloc_block_list.add_node(PageDescriptor {
+            num_pages,
+            start_phy_address: base,
+            start_virt_address: 0,
+            flags: 0,
+            is_mapped: false,
+        }).unwrap();
+
+        let layout = Layout::from_size_align(num_pages * PAGE_SIZE, PAGE_SIZE).unwrap();
+        phy_mem.deallocate(base as *mut u8, layout)
+            .expect("reclaim_pages: deallocate failed");
+    }
+
+    info!("Reclaimed bootloader data pages. Available memory: {}", phy_mem.avl_memory);
 }
 
 

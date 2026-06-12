@@ -18,6 +18,8 @@ _start:
 
     // Call ulib_hello — cross-module dependency call
     callq ulib_hello@PLT
+    movq $0, %rax
+    movq (%rax), %rax
 
     // Call ulib_get_magic and verify the return value
     callq ulib_get_magic@PLT

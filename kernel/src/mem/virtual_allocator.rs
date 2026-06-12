@@ -1,6 +1,6 @@
 use crate::{REMAP_LIST, cpu::{self, PerCpu}, mem::{KERNEL_HALF_OFFSET, KERNEL_HALF_OFFSET_RAW, PageDescriptor, fixed_allocator::Regions::*}};
 use crate::sync::{Once, Spinlock};
-use crate::hal::{self, PageMapper};
+use crate::hal::{self, PageMapper, try_kill_user_process};
 use crate::mem::FixedList;
 use kernel_intf::list::{List, ListNode};
 use crate::cpu::MAX_CPUS;
@@ -1169,5 +1169,6 @@ pub fn virtual_allocator_test() {
 }
 
 pub fn on_page_fault(fault_address: usize) {
+    try_kill_user_process("Page fault");
     panic!("Page fault exception!\nFault address:{:#X}", fault_address);
 }
