@@ -1,8 +1,9 @@
 use common::{MemoryRegion, PAGE_SIZE};
 use kernel_intf::{debug, info};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::ptr::NonNull;
 use crate::cpu::{self, MAX_CPUS, PerCpu, general_interrupt_handler};
+use crate::hal::x86_64::asm::switch_context_force;
 use crate::hal::{enable_scheduler_timer, get_core, get_per_cpu_base, get_per_cpu_kernel_base};
 use crate::infra;
 use crate::sync::Spinlock;
@@ -58,6 +59,7 @@ static PER_CPU_NESTED_CONTEXT: PerCpu<AtomicUsize> = PerCpu::new_with(
     [const {AtomicUsize::new(0)}; MAX_CPUS]
 );
 
+static IS_INTERRUPT_CONTEXT: AtomicBool = AtomicBool::new(false);
 static IPI_REQUESTS: Spinlock<FixedList<IPIRequest, {Region3 as usize}>> = Spinlock::new(List::new());
 
 static mut VECTOR_TABLE: [fn(usize); MAX_INTERRUPT_VECTORS] = [default_handler; MAX_INTERRUPT_VECTORS];
@@ -137,9 +139,18 @@ impl CPUContext {
     }
 }
 
+pub fn force_context_switch() {
+    assert!(IS_INTERRUPT_CONTEXT.load(Ordering::Acquire));
+    IS_INTERRUPT_CONTEXT.store(false, Ordering::Release);
+    let con = PER_CPU_GLOBAL_CONTEXT.local().load(Ordering::Acquire) as *const CPUContext;
+
+    unsafe { switch_context_force(con.addr() as u64); }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn global_interrupt_handler(vector: u64, cpu_context: *const CPUContext) -> *const CPUContext {
     let in_dw = crate::sched::is_in_dw_mode();
+    IS_INTERRUPT_CONTEXT.store(true, Ordering::Release);
 
     // While in DW mode the original interrupted-task context still lives in
     // PER_CPU_GLOBAL_CONTEXT and must not be touched 
@@ -158,7 +169,8 @@ extern "C" fn global_interrupt_handler(vector: u64, cpu_context: *const CPUConte
     if !in_dw {
         crate::sched::dw_handler();
     }
-
+    
+    IS_INTERRUPT_CONTEXT.store(false, Ordering::Release);
     slot.local().load(Ordering::Acquire) as *const CPUContext
 }
 
@@ -267,6 +279,10 @@ fn page_fault_handler(_vector: usize) {
     debug!("{:?}", unsafe {*(fetch_context() as *const CPUContext)});
 
     on_page_fault(fault_address as usize);
+}
+
+pub fn is_system_in_interrupt_context() -> bool {
+    IS_INTERRUPT_CONTEXT.load(Ordering::Acquire)
 }
 
 pub fn fetch_context() -> usize {

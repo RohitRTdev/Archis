@@ -9,7 +9,7 @@ use core::ffi::c_void;
 use core::ptr::null_mut;
 use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_process_info};
 use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores, get_worker_stack, set_panic_base};
-use crate::hal::{self, IPIRequestType, create_kernel_context, disable_scheduler_timer, enable_scheduler_timer, fetch_context, get_per_cpu_base, get_per_cpu_data, get_per_cpu_kernel_base, set_per_cpu_base, set_per_cpu_data, switch_context};
+use crate::hal::{self, IPIRequestType, create_kernel_context, disable_scheduler_timer, enable_scheduler_timer, fetch_context, force_context_switch, get_per_cpu_base, get_per_cpu_data, get_per_cpu_kernel_base, is_system_in_interrupt_context, set_per_cpu_base, set_per_cpu_data, switch_context};
 use crate::mem::{VCB, get_kernel_addr_space, set_address_space};
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
 use crate::io::{self, IrpPtr, deallocate_irp};
@@ -282,7 +282,13 @@ pub fn yield_cpu() {
     get_current_task()
     .expect("yield_cpu() called from idle task!").lock().quanta = 0;
 
-    hal::yield_cpu();
+    if is_system_in_interrupt_context() {
+        schedule();
+        force_context_switch();
+    }
+    else {
+        hal::yield_cpu();
+    }
 }
 
 pub fn is_preemption_enabled() -> bool {

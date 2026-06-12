@@ -11,7 +11,7 @@ MODULE_LINKER_SCRIPT = config/x86_64/module_linker.ld
 OUTPUT_IMAGE = $(OUTPUT_DIR)/archis_os.iso
 PLATFORM = acpi
 BOOTLOADER = uefi
-KERNEL_OPTIONS = --features acpi,stack_down,debug-io-logs,debug-loader-logs
+KERNEL_OPTIONS = --features acpi,stack_down,debug-scheduler-logs,debug-io-logs,debug-loader-logs
 BLR_OPTIONS = --features acpi
 
 ifeq ($(OS),Windows_NT)

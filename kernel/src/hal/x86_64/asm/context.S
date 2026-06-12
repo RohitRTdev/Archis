@@ -60,3 +60,8 @@ FUNC switch_context
 
     iretq
 ENDF switch_context
+
+FUNC switch_context_force
+    movq %rdi, %rsp
+    jmp switch_context
+ENDF switch_context_force
