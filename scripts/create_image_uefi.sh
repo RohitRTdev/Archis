@@ -42,11 +42,13 @@ install_kernel_image() {
 
   mkdir -p "$dst_kernel/sys/drivers"
   mkdir -p "$dst_blr/efi/boot"
+  mkdir -p "$dst_kernel/bin"
 
   cp "$src"/drivers/*.so "$dst_kernel/sys/drivers/" || echo "No drivers found..."
   cp "$src/drivers/boot.conf" "$dst_kernel/sys/drivers/" || echo "boot.conf not found..."
   cp "$src/aris" "$dst_kernel/sys/" || echo "Kernel file not found..."
   cp "$src"/*.so "$dst_kernel/sys/" || echo "sys lib files not found..."
+  cp "$src"/bin/* "$dst_kernel/bin/" || echo "userspace files not found..."
   cp "$src/initfs.conf" "$dst_kernel/sys/" || echo "InitFS configuration not found..."
   cp "$src/bootx64.efi" "$dst_blr/efi/boot/" || echo "Bootloader not found..."
 }

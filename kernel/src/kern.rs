@@ -903,23 +903,23 @@ fn run_user_tests() {
     // Test 1: basic user process with dependency
     info!("--- user test 1: basic load (libhello.so) ---");
     let p1 = sched::create_process(
-        vec!["libhello.so".into()],
+        vec!["cat".into()],
         core::ptr::null_mut(),
         true,
     ).expect("user test 1: failed to create process");
     p1.wait();
     let code1 = p1.lock().get_exit_code();
-    info!("user test 1: libhello.so exited with code {}", code1);
+    info!("user test 1: cat exited with code {}", code1);
 
     // Test 2: warm load — same image in two concurrent processes
-    info!("--- user test 2: warm load (2x libhello.so) ---");
+    info!("--- user test 2: warm load (2x cat) ---");
     let p2a = sched::create_process(
-        vec!["libhello.so".into()],
+        vec!["cat".into()],
         core::ptr::null_mut(),
         true,
     ).expect("user test 2: failed to create process A");
     let p2b = sched::create_process(
-        vec!["libhello.so".into()],
+        vec!["cat".into()],
         core::ptr::null_mut(),
         true,
     ).expect("user test 2: failed to create process B");
@@ -933,14 +933,14 @@ fn run_user_tests() {
 
     drop(p1);drop(p2a);drop(p2b);
     // Test 3: different images, shared dependency
-    info!("--- user test 3: shared dep (libhello.so + libspawner.so) ---");
+    info!("--- user test 3: shared dep (cat + ls) ---");
     let p3a = sched::create_process(
-        vec!["libhello.so".into()],
+        vec!["cat".into()],
         core::ptr::null_mut(),
         true,
     ).expect("user test 3: failed to create hello process");
     let p3b = sched::create_process(
-        vec!["libspawner.so".into()],
+        vec!["ls".into()],
         core::ptr::null_mut(),
         true,
     ).expect("user test 3: failed to create spawner process");
@@ -953,9 +953,9 @@ fn run_user_tests() {
     );
 
     // Test 4: user-initiated process spawn
-    info!("--- user test 4: user-initiated spawn (libspawner.so) ---");
+    info!("--- user test 4: user-initiated spawn (ls) ---");
     let p4 = sched::create_process(
-        vec!["libspawner.so".into()],
+        vec!["ls".into()],
         core::ptr::null_mut(),
         true,
     ).expect("user test 4: failed to create spawner process");

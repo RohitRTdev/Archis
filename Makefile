@@ -8,6 +8,7 @@ KERN_PLACEHOLDER = kernel/placeholder_test.txt
 QEMU_CPU_ARGS_WITH_ACCEL = -M q35,accel=whpx -cpu qemu64 -smp sockets=1,cores=6,threads=2
 QEMU_CPU_ARGS_WITHOUT_ACCEL = -smp sockets=1,cores=6,threads=2 -cpu Skylake-Client,+smap,+smep,+umip,+pge
 GEN_MSG = "Automatically generated file..\nDo not remove manually.."
+USERSPACE_FLAGS = ARCH_TARGET=$(KERNEL_TARGET_TRIPLE) USER_LINKER_SCRIPT=../$(USER_LINKER_SCRIPT) OBJDIR=../target/userspace OUTDIR=../$(OUTPUT_DIR)/bin 
 SHELL = /bin/bash
 
 ifeq ($(wildcard $(CONFIG_FILE)),)
@@ -18,11 +19,6 @@ include $(CONFIG_FILE)
 
 KERNEL_FLAGS := -C link-arg=-T$(LINKER_SCRIPT)
 MODULE_FLAGS := -C link-arg=-T$(MODULE_LINKER_SCRIPT) -C link-arg=-Ltarget/$(KERNEL_ARCH)/$(CONFIG)
-USER_LINKER_SCRIPT := config/x86_64/user_linker.ld
-USER_ASM_FLAGS := -c -fPIC -target x86_64-unknown-none -nostdlib
-USER_LLD_FLAGS := -flavor gnu --shared --hash-style=sysv -T $(USER_LINKER_SCRIPT)
-RUST_HOST := $(shell rustc -vV | grep '^host:' | cut -d' ' -f2)
-RUST_LLD  := $(shell rustc --print sysroot)/lib/rustlib/$(RUST_HOST)/bin/rust-lld
 
 ifeq ($(CONFIG),release)
     BUILD_OPTIONS := --release
@@ -67,7 +63,7 @@ build_blr: $(OUTPUT_DIR)
 	)
 	@cp $(BLR_EXE) $(BLR_TARGET_EXE) 
 
-build_kernel_template:
+build_kernel_template: config/initfs.conf
 	@echo "Building kernel..."
 	@(cd kernel && RUSTFLAGS="$(KERNEL_FLAGS)" \
 		cargo build $(BUILD_OPTIONS) $(KERNEL_OPTIONS) \
@@ -125,12 +121,7 @@ build_modules: build_kernel
 build_userspace: $(OUTPUT_DIR)
 	@echo "Building userspace programs..."
 	@mkdir -p target/userspace
-	@clang $(USER_ASM_FLAGS) userspace/ulib/ulib.S -o target/userspace/ulib.o
-	@"$(RUST_LLD)" $(USER_LLD_FLAGS) target/userspace/ulib.o -o $(OUTPUT_DIR)/libulib.so
-	@clang $(USER_ASM_FLAGS) userspace/hello/hello.S -o target/userspace/hello.o
-	@"$(RUST_LLD)" $(USER_LLD_FLAGS) target/userspace/hello.o -L $(OUTPUT_DIR) -lulib -o $(OUTPUT_DIR)/libhello.so
-	@clang $(USER_ASM_FLAGS) userspace/spawner/spawner.S -o target/userspace/spawner.o
-	@"$(RUST_LLD)" $(USER_LLD_FLAGS) target/userspace/spawner.o -L $(OUTPUT_DIR) -lulib -o $(OUTPUT_DIR)/libspawner.so
+	@cd userspace && $(MAKE) $(USERSPACE_FLAGS) all
 
 run_unit_test: build_kernel_test
 	@cargo test --manifest-path=boot/blr/Cargo.toml -- --nocapture
@@ -143,6 +134,7 @@ test:
 
 clean:
 	@echo "Cleaning all builds..."
+	@cd userspace && $(MAKE) clean $(USERSPACE_FLAGS)
 	@cargo clean
 	@rm -rf $(OUTPUT_DIR)
 

@@ -134,7 +134,7 @@ fn load_image_inner(
     path: &str,
     in_progress: &mut Vec<String>
 ) -> Result<LoadedImage, KError> {
-    const PREDEFINED_DIRECTORIES: [&str; 3] = ["", "/sys", "/sys/drivers"];
+    const PREDEFINED_DIRECTORIES: [&str; 4] = ["", "/sys", "/sys/drivers", "/bin"];
     // This is an absolute path
     if path.starts_with("/") {
         return do_load_image_inner(path, in_progress);
