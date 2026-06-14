@@ -901,7 +901,7 @@ fn run_user_tests() {
     info!("=== run_user_tests: BEGIN ===");
 
     // Test 1: basic user process with dependency
-    info!("--- user test 1: basic load (libhello.so) ---");
+    info!("--- user test 1: basic load (cat) ---");
     let p1 = sched::create_process(
         vec!["cat".into()],
         core::ptr::null_mut(),
@@ -1010,6 +1010,10 @@ fn kern_main() -> ! {
                 acpi_enter_sleep_state_prep(ACPI_SLEEP_S5);
                 acpi_enter_sleep_state(ACPI_SLEEP_S5);
             }
+        }
+        else {
+            kernel_intf::println!();
+            kernel_intf::print!("Type shutdown:");
         }
     }
 

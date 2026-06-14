@@ -8,7 +8,7 @@ KERN_PLACEHOLDER = kernel/placeholder_test.txt
 QEMU_CPU_ARGS_WITH_ACCEL = -M q35,accel=whpx -cpu qemu64 -smp sockets=1,cores=6,threads=2
 QEMU_CPU_ARGS_WITHOUT_ACCEL = -smp sockets=1,cores=6,threads=2 -cpu Skylake-Client,+smap,+smep,+umip,+pge
 GEN_MSG = "Automatically generated file..\nDo not remove manually.."
-USERSPACE_FLAGS = ARCH_TARGET=$(KERNEL_TARGET_TRIPLE) USER_LINKER_SCRIPT=../$(USER_LINKER_SCRIPT) OBJDIR=../target/userspace OUTDIR=../$(OUTPUT_DIR)/bin 
+USERSPACE_FLAGS = ARCH=$(KERNEL_ARCH) ARCH_TARGET=$(KERNEL_TARGET_TRIPLE) USER_LINKER_SCRIPT=../$(USER_LINKER_SCRIPT) OBJDIR=../target/userspace OUTDIR=../$(OUTPUT_DIR)/bin 
 SHELL = /bin/bash
 
 ifeq ($(wildcard $(CONFIG_FILE)),)

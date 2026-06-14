@@ -9,7 +9,6 @@ use kernel_intf::list::{List, DynList};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use crate::fs::FileInstance;
 use crate::loader::{LoadedImage, LoadedImageWeak, load_image};
-use crate::loader::module::UserModule;
 use crate::{KERNEL_PATH, hal};
 use crate::mem::{self, PageDescriptor, VCB, VirtMemConBlk, deallocate_memory, get_physical_address};
 use crate::sched::{self, *};

@@ -61,7 +61,7 @@ impl FileInst {
 
 impl Drop for FileInst {
     fn drop(&mut self) {
-        info!("Dropped file instance: {}", self.file_name);
+        crate::loader_log!("Dropped file instance: {}", self.file_name);
     }
 }
 

@@ -71,7 +71,7 @@ FUNC jump_to_user_code
     movq %rdi, %rcx
     movq %rsi, %r11
     movq %rdx, %rsp
-    movq %rdx, %rbp
+    movq $0, %rbp
     
     sysretq
 ENDF jump_to_user_code

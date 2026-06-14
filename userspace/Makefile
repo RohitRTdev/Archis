@@ -28,7 +28,7 @@ USER_LLD_FLAGS := -flavor gnu --hash-style=sysv -T $(LINKER_SCRIPT)
 
 COMMON_CFLAGS := -target $(TARGET) -ffreestanding -fPIC -nostdinc -Wall -Wextra -MMD -MP -I$(CURDIR)/include
 
-CRT_SRCS := crt/crt0.s
+CRT_SRCS := crt/$(ARCH)/*
 
 BINARIES := cat ls
 
@@ -44,7 +44,7 @@ ls_SRCS := ls.c string.c
 
 ls_LIBS := c
 
-c_SRCS := libc/*.c
+c_SRCS := libc/*.c libc/*.s libc/$(ARCH)/*
 
 util_SRCS := helper.c string.c
 

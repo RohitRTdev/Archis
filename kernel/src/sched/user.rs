@@ -174,13 +174,13 @@ pub fn syscall_dispatcher(syscall_number: u64, syscall_args: &[u64; MAX_ARCH_ARG
     SYSCALL_TABLE[syscall_number as usize](syscall_args)
 }
 
-fn sys_exit_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+fn sys_exit_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let id = get_current_process_id().expect("Called sys_exit_handler from idle task!");
 
-    kill_process(id, 0);
+    kill_process(id, args[0] as isize);
 
     E_SUCCESS
-}
+} 
 
 fn sys_thread_exit_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let id = get_current_task_id().expect("Called sys_thread_exit_handler from idle task!");

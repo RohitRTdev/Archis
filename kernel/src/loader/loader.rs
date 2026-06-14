@@ -25,6 +25,7 @@ use kernel_intf::list::{List, DynList};
 use super::module;
 
 pub static KERNEL_MODULES: Spinlock<DynList<LoadedImageWeak>> = Spinlock::new(List::new());
+pub(super) const PREDEFINED_DIRECTORIES: [&str; 4] = ["", "/sys", "/sys/drivers", "/bin"];
 
 static LOAD_LOCK: Once<KSem> = Once::new();
 
@@ -134,7 +135,6 @@ fn load_image_inner(
     path: &str,
     in_progress: &mut Vec<String>
 ) -> Result<LoadedImage, KError> {
-    const PREDEFINED_DIRECTORIES: [&str; 4] = ["", "/sys", "/sys/drivers", "/bin"];
     // This is an absolute path
     if path.starts_with("/") {
         return do_load_image_inner(path, in_progress);

@@ -13,11 +13,10 @@ use kernel_intf::list::{List, DynList};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use crate::fs::{FileBuffer, open, resolve_symlink};
 use crate::hal::copy_user_memory;
-use crate::loader::read_cstr;
+use crate::loader::{LoadedImage, PREDEFINED_DIRECTORIES, read_cstr};
 use crate::mem::{PageDescriptor, allocate_memory, deallocate_memory, map_memory, unmap_memory};
 use crate::sched::get_current_process;
 use crate::sync::{KSem, Once, Spinlock, semaphore_guard};
-use super::loader::LoadedImage;
 use super::module::{ModuleDescriptor, ModuleType, SharedUserModule, SharedUserModuleRef, UserModule, UserModuleSegment};
 
 pub static USER_MODULES: Spinlock<DynList<Weak<Spinlock<SharedUserModule>, PoolAllocatorGlobal>>> = Spinlock::new(List::new());
@@ -486,8 +485,6 @@ pub fn load_user_image(path: &str) -> Result<LoadedImage, KError> {
 }
 
 fn load_user_inner(path: &str, in_progress: &mut Vec<String>) -> Result<LoadedImage, KError> {
-    const PREDEFINED_DIRECTORIES: [&str; 3] = ["", "/sys", "/sys/drivers"];
-
     // This is an absolute path
     if path.starts_with("/") {
         return do_load_user_inner(path, in_progress);
