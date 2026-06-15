@@ -43,6 +43,7 @@ pub const E_OOM: i64 = -2;
 pub const E_INTERNAL_FAILURE: i64 = -3;
 pub const E_NOT_SUPPORTED: i64 = -4;
 pub const E_DEV_STOPPED: i64 = -5;
+pub const E_INVALID_MEMORY_RANGE: i64 = -6;
 
 impl<T> From<Result<T, KError>> for KError {
     fn from(e: Result<T, KError>) -> Self {

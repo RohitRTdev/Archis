@@ -26,27 +26,24 @@ LINKER_SCRIPT := $(USER_LINKER_SCRIPT)
 
 USER_LLD_FLAGS := -flavor gnu --hash-style=sysv -T $(LINKER_SCRIPT)
 
-COMMON_CFLAGS := -target $(TARGET) -ffreestanding -fPIC -nostdinc -Wall -Wextra -MMD -MP -I$(CURDIR)/include
+COMMON_CFLAGS := -target $(TARGET) -ffreestanding -fPIC -fPIE -nostdinc -Wall -Wextra -MMD -MP -I$(CURDIR)/include
 
 CRT_SRCS := crt/$(ARCH)/*
 
-BINARIES := cat ls
+BINARIES := cat ls tester
 
-STATIC_LIBS := c
+SHARED_LIBS := c
 
-SHARED_LIBS := util
+tester_SRCS := tester.c
+tester_LIBS := c
 
 cat_SRCS := cat.c string.c
-
-cat_LIBS := c util
+cat_LIBS := c
 
 ls_SRCS := ls.c string.c
-
 ls_LIBS := c
 
 c_SRCS := libc/*.c libc/*.s libc/$(ARCH)/*
-
-util_SRCS := helper.c string.c
 
 expand-srcs = $(foreach p,$1,$(wildcard $(p)))
 src-to-obj = $(OBJDIR)/$(patsubst %.c,%.o,$(patsubst %.S,%.o,$(patsubst %.s,%.o,$1)))
@@ -142,7 +139,7 @@ $(call SHARED_DEP_PATHS,$1)
 	@mkdir -p $$(@D)
 	@echo Linking binary $$(@F)
 	@$(RUST_LLD) \
-		$(USER_LLD_FLAGS) \
+		$(USER_LLD_FLAGS) -pie \
 		-o $$@ \
 		$(CRT_OBJECTS) \
 		$(foreach s,$(call expand-srcs,$($1_SRCS)),$(call src-to-obj,$(s))) \

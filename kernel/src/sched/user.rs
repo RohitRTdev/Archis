@@ -1,26 +1,86 @@
 use core::ffi::c_void;
 use core::mem::size_of;
+use core::ffi::CStr;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use common::{PAGE_SIZE, align_down, align_up};
 use kernel_intf::{KError, info};
 use crate::cpu::Stack;
 use crate::hal::{MAX_ARCH_ARGS, copy_user_memory, transfer_control_to_user};
 use crate::loader::load_user_image;
+use crate::mem::{self, is_user_range};
 use super::*;
 use kernel_intf::*;
 
-const MAX_SYSCALLS: usize = 6;
+const MAX_SYSCALLS: usize = 9;
+const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 
 static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_exit_handler,
     sys_thread_exit_handler,
+    sys_read_handler,
     sys_write_handler,
+    sys_open_file_handler,
+    sys_open_device_handler,
     sys_delay_handler,
-    sys_thread_handler,
-    sys_process_handler
+    sys_create_thread_handler,
+    sys_create_process_handler
 ];
 
+#[cfg(target_arch = "x86_64")]
+fn read_c_strlen(start: usize) -> Option<usize> {
+    let mut len = 0;
+    unsafe {
+        core::arch::asm!(
+            "stac",   
+            options(nostack)
+        );
+
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        let mut cur_ptr = start;
+        let mut cur_range = align_up(start, PAGE_SIZE) - start;
+        if cur_range == 0 {
+            // Our base ptr is already aligned to a PAGE_SIZE
+            cur_range = PAGE_SIZE;
+        }
+        
+        'outer: loop {
+            if !mem::is_user_range(cur_ptr, cur_range) {
+                debug!("User range: {:#X} with size {} invalid", cur_ptr, cur_range);
+                core::arch::asm!(
+                    "clac",      
+                    options(nostack)
+                );
+                return None;
+            }
+
+            // We can safely read this range
+            for addr in cur_ptr..cur_ptr + cur_range {
+                if (addr as *const u8).read() != 0 {
+                    len += 1;
+                }
+                else {
+                    break 'outer;
+                }
+            }
+
+            // Check if next page is user accessible
+            cur_ptr += cur_range;
+            cur_range = PAGE_SIZE;
+        }
+
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        core::arch::asm!(
+            "clac",      
+            options(nostack)
+        );
+    }
+
+    Some(len)
+}
 
 // Must be called from valid process context
 pub fn create_user_thread(user_fn_addr: usize, context: *mut c_void) -> Result<KThread, KError> {
@@ -190,10 +250,23 @@ fn sys_thread_exit_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     E_SUCCESS
 }
 
-// Arg1 = pointer to string, arg2 = length of string
+// arg0 = fd, arg1 = user buffer, arg2 = length, arg3 = ptr to bytes written
+fn sys_read_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    E_INVALID
+}
+
+// arg0 = pointer to string
 fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    let len = args[1] as usize;
-    if args[0] == 0 || len == 0 || len > 4096 {
+    if args[0] == 0 {
+        return E_INVALID;
+    }
+
+    let res = read_c_strlen(args[0] as usize);
+    if res.is_none() {
+        return E_INVALID_MEMORY_RANGE; 
+    }
+    let len = res.unwrap();
+    if len == 0 {
         return E_INVALID;
     }
 
@@ -212,40 +285,72 @@ fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-// Arg 1 = delay in ms
+fn sys_open_device_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    E_INVALID
+}
+
+fn sys_open_file_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    E_INVALID
+}
+
+// arg 1 = delay in ms
 fn sys_delay_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    debug!("Delaying thread");
     delay_ms(args[0] as usize);
 
     E_SUCCESS
 }
 
-// Arg1 = user VA of the thread function (extern "C" fn() -> !), arg2 = context pointer
-fn sys_thread_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+// arg1 = user VA of the thread function (extern "C" fn() -> !), arg2 = context pointer
+fn sys_create_thread_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     info!("Creating new user thread..");
     let stat: KError = create_user_thread(args[0] as usize, args[1] as *mut c_void).into();
 
     stat.into()
 }
 
-// Arg1 = user pointer to the module path string, arg2 = length of string
-fn sys_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+// arg0 = command list ptr, arg1 = length of command list
+// arg2 = flags
+fn sys_create_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let len = args[1] as usize;
-    if args[0] == 0 || len == 0 || len > common::PAGE_SIZE {
+    if args[0] == 0 || len == 0 {
         return E_INVALID;
     }
-
-    let mut path_buf = vec![0u8; len];
-    unsafe {
-        copy_user_memory(path_buf.as_mut_ptr(), args[0] as *const u8, len);
+    
+    if !is_user_range(args[0] as usize, len * size_of::<usize>()) {
+        debug!("Failed user range!start:{:#X}, size:{}", args[0] as usize, len);
+        return E_INVALID_MEMORY_RANGE;
     }
 
-    let path = match core::str::from_utf8(&path_buf) {
-        Ok(s) => String::from(s),
-        Err(_) => return E_INVALID
-    };
+    let mut command_args: Vec<*const i8> = vec![core::ptr::null(); len];     
+    // Copy the pointer list
+    unsafe {
+        copy_user_memory(command_args.as_mut_ptr() as *mut u8, args[0] as *const u8, len * size_of::<usize>());
+    }
 
-    let stat: KError = create_process(vec![path], core::ptr::null_mut(), true).into();
+    let mut command_args_str = Vec::new();
+    for (id, &s) in command_args.iter().enumerate() {
+        let command_c_str_res = read_c_strlen(s.addr());
+        if command_c_str_res.is_none() {
+            debug!("Failed for string idx {}", id);
+            return E_INVALID_MEMORY_RANGE;
+        }
+        let command_c_str_len = command_c_str_res.unwrap();
+        let mut command_str = vec![0u8; command_c_str_len];
+        
+        // Copy the string
+        unsafe {
+            copy_user_memory(command_str.as_mut_ptr(), s as *const u8, command_c_str_len);
+        }
+
+        let path = match String::from_utf8(command_str) {
+            Ok(s) => s,
+            Err(_) => return E_INVALID
+        };
+
+        command_args_str.push(path);
+    }
+
+    let stat: KError = create_process(command_args_str, core::ptr::null_mut(), true).into();
 
     stat.into()
 }

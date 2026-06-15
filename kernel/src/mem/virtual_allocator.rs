@@ -11,7 +11,7 @@ use core::alloc::Layout;
 use core::ptr::{null_mut, NonNull};
 use core::hint::likely;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use common::{MemoryRegion, PAGE_SIZE, ceil_div, ptr_to_ref_mut};
+use common::{MemoryRegion, PAGE_SIZE, align_down, ceil_div, ptr_to_ref_mut};
 use super::PHY_MEM_CB;
 
 const ERROR_MESSAGE: &'static str = "System in bad state. Critical memory failure";
@@ -226,11 +226,6 @@ impl VirtMemConBlk {
                 is_mapped: false
             };
 
-            // We need one free node per list
-            //if self.free_block_list.query_free_nodes() < 1 || self.alloc_block_list.query_free_nodes() < 1 {
-            //    return Err(KError::OutOfMemory);
-            //} 
-
             unsafe {
                 self.free_block_list.remove_node(NonNull::from(desc));
             }
@@ -267,10 +262,10 @@ impl VirtMemConBlk {
         let num_pages = ceil_div(layout.size(), PAGE_SIZE);
         let virt_addr = self.find_best_fit(num_pages, is_user)?;    
         self.avl_memory -= num_pages * PAGE_SIZE;
-
+        let flags = if is_user { PageDescriptor::USER } else { 0 };
         // Now we have got virtual address
         self.alloc_block_list.add_node(PageDescriptor { num_pages, start_phy_address: 0, 
-            start_virt_address: virt_addr as usize, flags: 0, is_mapped: false}).expect(ERROR_MESSAGE);
+            start_virt_address: virt_addr as usize, flags, is_mapped: false}).expect(ERROR_MESSAGE);
 
         Ok(virt_addr)
     }
@@ -916,6 +911,35 @@ pub fn unmap_memory(virt_addr: usize, size: usize, flags: u8) -> Result<(), KErr
     }
     
     Ok(())
+}
+
+pub fn is_user_range(virt_addr: usize, size: usize) -> bool {
+    assert!(size != 0);
+    let mut cur_ptr = virt_addr;
+    let end = virt_addr + size;
+
+    let active_addr_space = get_active_vcb();
+    unsafe {
+        let vcb = (*active_addr_space.as_ptr()).lock();
+        let mut is_found = true;
+        while cur_ptr < end && is_found {
+            is_found = false;
+            // Check if this range straddles any of the range mentioned in alloc block list
+            // We may need to iterate this list multiple times since the blocks are not 
+            // in any particular order
+            for allocated_node in vcb.alloc_block_list.iter() {
+                if allocated_node.is_mapped && 
+                (allocated_node.flags & PageDescriptor::USER != 0) && 
+                cur_ptr >= allocated_node.start_virt_address &&
+                cur_ptr < allocated_node.start_virt_address + allocated_node.num_pages * PAGE_SIZE {
+                    cur_ptr += allocated_node.num_pages * PAGE_SIZE;
+                    is_found = true;
+                }    
+            }
+        }
+    }
+
+    cur_ptr >= end
 }
 
 pub fn get_physical_address(virt_addr: usize, flags: u8) -> Option<usize> {
