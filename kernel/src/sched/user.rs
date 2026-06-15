@@ -1,19 +1,19 @@
 use core::ffi::c_void;
 use core::mem::size_of;
-use core::ffi::CStr;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use common::{PAGE_SIZE, align_down, align_up};
-use kernel_intf::{KError, info};
+use common::{PAGE_SIZE, align_up};
 use crate::cpu::Stack;
 use crate::hal::{MAX_ARCH_ARGS, copy_user_memory, transfer_control_to_user};
 use crate::loader::load_user_image;
 use crate::mem::{self, is_user_range};
+use crate::sched;
+use crate::sched::Handle::{ProcessHandle, ThreadHandle};
 use super::*;
 use kernel_intf::*;
 
-const MAX_SYSCALLS: usize = 9;
+const MAX_SYSCALLS: usize = 14;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 
 static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
@@ -21,11 +21,16 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_thread_exit_handler,
     sys_read_handler,
     sys_write_handler,
+    sys_close_handler,
     sys_open_file_handler,
     sys_open_device_handler,
     sys_delay_handler,
     sys_create_thread_handler,
-    sys_create_process_handler
+    sys_create_process_handler,
+    sys_resume_process_handler,
+    sys_set_session_id,
+    sys_get_pid,
+    sys_get_process_info
 ];
 
 #[cfg(target_arch = "x86_64")]
@@ -158,7 +163,7 @@ pub extern "C" fn user_init_handler() -> ! {
 
     // Everything heap-allocated must drop before transfer_control_to_user —
     // it never returns, so anything still live here leaks
-    let (entry, rsp) = {
+    let (entry, rsp, is_suspended) = {
         let args: Vec<String> = {
             let proc = get_current_process().expect("user_init_handler called outside process context!");
             let guard = proc.lock();
@@ -187,13 +192,19 @@ pub extern "C" fn user_init_handler() -> ! {
         add_new_handle(Handle::ImgHandle(load_info));
 
         // Let parent process know that user init is complete
-        {
+        let is_suspended = {
             let proc = get_current_process().expect("This shouldn't have happened??");
             proc.lock().complete_init(true);
-        }
+            proc.lock().get_status() == ProcessStatus::Suspended
+        };
 
-        (entry, rsp)
+
+        (entry, rsp, is_suspended)
     };
+    
+    if is_suspended {
+        sched::suspend_process();
+    }
 
     debug!("Transferring control to user module entry:{:#X} with stack:{:#X}", entry, rsp);
     transfer_control_to_user(entry, rsp);
@@ -208,7 +219,7 @@ pub extern "C" fn user_thread_init_handler() -> ! {
         let task = get_current_task().expect("user_thread_init_handler called outside task context!");
         let guard = task.lock();
         let user_fn = guard.get_user_fn().expect("user_thread_init_handler called without a user function!");
-        (user_fn as usize, guard.context_ptr as usize)
+        (user_fn as usize, guard.get_context_ptr() as usize)
     };
 
     // Place the context pointer as the first item on the user stack; the user
@@ -248,6 +259,16 @@ fn sys_thread_exit_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     kill_thread(id, 0);
 
     E_SUCCESS
+}
+
+// arg0 = fd
+fn sys_close_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    if !remove_handle(args[0] as usize) {
+        E_INVALID
+    }
+    else {
+        E_SUCCESS
+    }
 }
 
 // arg0 = fd, arg1 = user buffer, arg2 = length, arg3 = ptr to bytes written
@@ -303,9 +324,15 @@ fn sys_delay_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 // arg1 = user VA of the thread function (extern "C" fn() -> !), arg2 = context pointer
 fn sys_create_thread_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     info!("Creating new user thread..");
-    let stat: KError = create_user_thread(args[0] as usize, args[1] as *mut c_void).into();
-
-    stat.into()
+    let res = create_user_thread(args[0] as usize, args[1] as *mut c_void);
+    match res {
+        Ok(user_thread) => {
+            return add_new_handle(ThreadHandle(user_thread)) as i64;
+        },
+        Err(err) => {
+            return err.into();
+        }
+    }
 }
 
 // arg0 = command list ptr, arg1 = length of command list
@@ -350,7 +377,74 @@ fn sys_create_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
         command_args_str.push(path);
     }
 
-    let stat: KError = create_process(command_args_str, core::ptr::null_mut(), true).into();
+    let is_suspended = args[2] & PROCESS_SUSPENDED_FLAG != 0;
+    let res = create_process(
+        command_args_str, 
+        core::ptr::null_mut(), 
+        true,
+        is_suspended
+    );
 
-    stat.into()
+    match res {
+        Ok(user_process) => {
+            return add_new_handle(ProcessHandle(user_process)) as i64;
+        },
+        Err(err) => {
+            return err.into();
+        }
+    }
 }
+
+// arg0 = pid
+fn sys_resume_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    // We are not able to distinguish between cases where a process just got killed
+    // vs when a process never existed at all. So, we just send same error code in 
+    // both those cases
+    if resume_process(args[0] as usize) {
+        E_SUCCESS
+    }
+    else {
+        E_PROCESS_TERMINATED
+    }
+}
+
+// arg0 = pid, arg1 = new_sid
+fn sys_set_session_id(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let res = get_process_info(args[0] as usize);
+    if res.is_none() {
+        return E_PROCESS_TERMINATED;
+    }
+
+    if proc::set_sid(args[0] as usize, args[1] as usize) {
+        E_SUCCESS
+    }
+    else {
+        E_NOPERM
+    }
+}
+
+fn sys_get_pid(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let cur_proc_id = get_current_process_id().expect("syscall in idle process??");
+    cur_proc_id as i64
+}
+
+// arg0 = pid, arg1 = process info ptr
+fn sys_get_process_info(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let res = get_process_info(args[0] as usize);
+    if res.is_none() {
+        return E_PROCESS_TERMINATED;
+    }
+
+    if !is_user_range(args[1] as usize, size_of::<ProcessInfo>()) {
+        return E_INVALID_MEMORY_RANGE;
+    }
+
+    let this_proc = res.unwrap();
+    let info = this_proc.lock().get_process_info();
+    unsafe {
+        copy_user_memory(args[1] as *mut u8, &info as *const _ as *const u8, size_of::<ProcessInfo>());
+    }
+
+    E_SUCCESS
+}
+

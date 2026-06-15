@@ -44,6 +44,8 @@ pub const E_INTERNAL_FAILURE: i64 = -3;
 pub const E_NOT_SUPPORTED: i64 = -4;
 pub const E_DEV_STOPPED: i64 = -5;
 pub const E_INVALID_MEMORY_RANGE: i64 = -6;
+pub const E_PROCESS_TERMINATED: i64 = -7;
+pub const E_NOPERM: i64 = -8;
 
 impl<T> From<Result<T, KError>> for KError {
     fn from(e: Result<T, KError>) -> Self {
@@ -59,8 +61,8 @@ impl From<KError> for i64 {
             KError::OutOfMemory => E_OOM,
             KError::Unsupported => E_NOT_SUPPORTED,
             KError::DeviceStopped => E_DEV_STOPPED,
-            KError::ProcessTerminated | KError::WaitFailed |
-            KError::CircularDependency | KError::DriverLoadFailed | 
+            KError::ProcessTerminated => E_PROCESS_TERMINATED, 
+            KError::WaitFailed | KError::CircularDependency | KError::DriverLoadFailed | 
             KError::ModuleNotDriver | KError::ProcessInitFailed => E_INTERNAL_FAILURE
         }
     }

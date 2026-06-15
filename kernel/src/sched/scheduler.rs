@@ -11,6 +11,7 @@ use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_p
 use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores, get_worker_stack, set_panic_base};
 use crate::hal::{self, IPIRequestType, create_kernel_context, disable_scheduler_timer, enable_scheduler_timer, fetch_context, force_context_switch, get_per_cpu_base, get_per_cpu_data, get_per_cpu_kernel_base, is_system_in_interrupt_context, set_per_cpu_base, set_per_cpu_data, switch_context};
 use crate::mem::{VCB, get_kernel_addr_space, set_address_space};
+use crate::sched::get_current_process_id;
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
 use crate::io::{self, IrpPtr, deallocate_irp};
 use kernel_intf::mem::{PoolAllocator, PoolAllocatorGlobal};
@@ -41,7 +42,8 @@ pub enum TaskStatus {
     RUNNING,
     ACTIVE,
     WAITING,
-    TERMINATED
+    TERMINATED,
+    SUSPENDED
 }
 
 pub struct Task {
@@ -60,7 +62,7 @@ pub struct Task {
     term_notify: KEvent,
     process: Option<KProcess>,
     vcb: Option<VCB>,
-    pub(super) context_ptr: *mut c_void,
+    context_ptr: *mut c_void,
     exit_code: AtomicIsize,
 #[cfg(target_arch="x86_64")]
     per_cpu_base: u64
@@ -117,6 +119,10 @@ impl Task {
 
     pub fn get_user_fn(&self) -> Option<DispatchRoutine> {
         self.user_fn
+    }
+
+    pub fn get_context_ptr(&self) -> *mut c_void {
+        self.context_ptr
     }
 
     pub fn get_status(&self) -> TaskStatus {
@@ -212,6 +218,7 @@ pub struct TaskQueue {
     active_tasks: DynList<KThread>,
     waiting_tasks: DynList<KThread>,
     terminated_tasks: DynList<KThread>,
+    suspended_tasks: DynList<KThread>,
     notifier_list: DynList<KEvent>,
     timer_notifier_list: DynList<TimerInfo>,
     timer_list: DynList<TimerInfo>,
@@ -229,6 +236,7 @@ impl TaskQueue {
             active_tasks: List::new(),
             waiting_tasks: List::new(),
             terminated_tasks: List::new(),
+            suspended_tasks: List::new(),
             notifier_list: List::new(),
             timer_list: List::new(),
             timer_notifier_list: List::new(),
@@ -494,8 +502,8 @@ pub fn signal_waiting_task(task_id: usize, wait_semaphore: KSemInnerType, is_exp
                 skip_notify = true;
             },
 
-            TaskStatus::ACTIVE | TaskStatus::RUNNING => {
-                panic!("Signalled task {} which was in ACTIVE/RUNNING state??", task_id);
+            TaskStatus::ACTIVE | TaskStatus::RUNNING | TaskStatus::SUSPENDED => {
+                panic!("Signalled task {} which was in ACTIVE/RUNNING/SUSPENDED state??", task_id);
             }
         }
     }
@@ -525,7 +533,12 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
     let mut yield_flag = false;
     let mut drop_task  = false;
     let mut skip_notify  = false;
-    
+
+    {
+        let cur_proc_id = get_current_process_id().expect("kill_thread() called from idle process!");
+        assert!(cur_proc_id != 0, "Attempted to kill system thread!");
+    } 
+
     let this_task = get_task_info(task_id);
 
     if this_task.is_none() {
@@ -536,8 +549,6 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
     let core = this_task.lock().core;
     
     disable_preemption();
-
-    assert!(task_id != 0, "Attempted to kill init task!!!");
     let sweep_irps;
     {
         let mut sched_cb = unsafe {
@@ -556,38 +567,18 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
         // Remove task from active list and add to terminated list
         match status {
             TaskStatus::ACTIVE => {
-                let mut task_l = None;
-                for active_task in sched_cb.active_tasks.iter() {
-                    if active_task.lock().id == task_id {
-                        task_l = Some(NonNull::from(active_task));
-                        break;
-                    }
-                }
-
+                let task_l = sched_cb.active_tasks.find_and_remove(|t| {t.lock().id == task_id});
                 assert!(task_l.is_some());
-                let task_node = unsafe {
-                    ListNode::into_inner(sched_cb.active_tasks.remove_node(task_l.unwrap()))
-                };
-
+                let task_node = ListNode::into_inner(task_l.unwrap());
                 sched_cb.terminated_tasks.insert_node_at_tail(task_node);
             },
 
             TaskStatus::WAITING => {
-                let mut task_l = None;
-                for waiting_task in sched_cb.waiting_tasks.iter() {
-                    if waiting_task.lock().id == task_id {
-                        task_l = Some(NonNull::from(waiting_task));
-                        break;
-                    }
-                }
-                
+                let task_l = sched_cb.waiting_tasks.find_and_remove(|t| {t.lock().id == task_id});
                 if task_l.is_some() {
-                    let task_node = unsafe {
-                        ListNode::into_inner(sched_cb.waiting_tasks.remove_node(task_l.unwrap()))
-                    };
+                    let task_node = ListNode::into_inner(task_l.unwrap());
 
                     sched_cb.terminated_tasks.insert_node_at_tail(task_node);
-
                 }
                 else {
                     // Task might not have been scheduled out
@@ -612,6 +603,16 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
                 // Only yield if the current task is killing itself (i.e It's not just that a task from another cpu is killing the 
                 // current running task of this cpu)
                 yield_flag = hal::get_core() == core;
+            },
+
+            TaskStatus::SUSPENDED => {
+                let task_l = sched_cb.waiting_tasks.find_and_remove(|t| {t.lock().id == task_id});
+                
+                // Scheduler did not get chance to put this task into suspended queue
+                if task_l.is_some() {
+                    let task_node = ListNode::into_inner(task_l.unwrap());
+                    sched_cb.terminated_tasks.insert_node_at_tail(task_node);
+                }
             },
 
             TaskStatus::TERMINATED => {
@@ -974,7 +975,7 @@ pub fn schedule() {
 
                 // Switch to new task
                 if task_info.status == TaskStatus::WAITING || task_info.status == TaskStatus::TERMINATED ||
-                task_info.quanta == 0 {
+                task_info.status == TaskStatus::SUSPENDED || task_info.quanta == 0 {
                     // First choose new task
                     // We create NonNull here so that the node can later be removed
                     let head_task = sched_cb.active_tasks.first().and_then(|item| {
@@ -1015,6 +1016,9 @@ pub fn schedule() {
                         else if task_info.status == TaskStatus::TERMINATED {
                             sched_cb.terminated_tasks.insert_node_at_tail(current_task);
                         }
+                        else if task_info.status == TaskStatus::SUSPENDED {
+                            sched_cb.suspended_tasks.insert_node_at_tail(current_task);
+                        }
                         else {
                             sched_cb.active_tasks.insert_node_at_tail(current_task);
                         }
@@ -1044,6 +1048,10 @@ pub fn schedule() {
                             else if task_info.status == TaskStatus::TERMINATED {
                                 crate::sched_log!("Adding task {} to terminated list", task_info.id);
                                 sched_cb.terminated_tasks.insert_node_at_tail(current_task);
+                            }
+                            else if task_info.status == TaskStatus::SUSPENDED {
+                                crate::sched_log!("Adding task {} to suspended list", task_info.id);
+                                sched_cb.suspended_tasks.insert_node_at_tail(current_task);
                             }
 
                             prep_idle_task(&mut sched_cb, old_vcb);
@@ -1129,6 +1137,92 @@ fn prep_idle_task(sched_cb: &mut TaskQueue, old_vcb: VCB) {
     }
 }
 
+// This is not a general suspend mechanism
+// This allows process suspend at init. It decided whether it needs to suspend 
+// the process based on ProcessStatus
+pub fn suspend_process() {
+    // Check if process state is suspended. If so, place thread in suspended state
+    let cur_proc = get_current_process().expect("suspend_process() called from idle process!");
+    let cur_task = get_current_task().expect("suspend_process() called from idle task!");
+    
+    // Lock order: Proc -> Task
+    let proc_guard = cur_proc.lock();
+
+    // If not true, it likely means that resume_process got called before we could reach here
+    if proc_guard.get_status() == ProcessStatus::Suspended {
+        let mut task_guard = cur_task.lock();
+        match task_guard.status {
+            TaskStatus::TERMINATED => {
+                // TERMINATED > SUSPENDED
+                return;  
+            },
+            TaskStatus::RUNNING => {
+                task_guard.status = TaskStatus::SUSPENDED;
+            },
+            _ => {
+                panic!("suspend_process called on task with invalid state = {:?}!", task_guard.status);
+            }
+        }
+        drop(task_guard);
+        drop(proc_guard);
+        yield_cpu();
+    }
+}
+
+
+pub fn resume_process(pid: usize) -> bool {
+    let this_proc_res = get_process_info(pid);
+    if this_proc_res.is_none() {
+        return false;
+    }
+    
+    let this_proc = this_proc_res.unwrap();
+    let res = {
+        let mut proc_guard = this_proc.lock();
+        if proc_guard.get_status() == ProcessStatus::Suspended {
+            proc_guard.set_status(ProcessStatus::Ready);
+        }
+
+        proc_guard.get_first_task()
+    };
+    if res.is_none() {
+        return false;
+    }
+
+    let task_id = res.unwrap();
+    let this_task_res = get_task_info(task_id);
+    
+    // Task could have been killed
+    if this_task_res.is_none() {
+        return false;
+    }
+    let this_task = this_task_res.unwrap();
+    let core = this_task.lock().core;
+
+    // Lock order: Sched -> Task
+    let mut sched_cb = unsafe { SCHEDULER_CON_BLK.get(core).task_queue.lock() };
+
+    // If task was suspended, remove from suspend list
+    if this_task.lock().status == TaskStatus::SUSPENDED {
+        let id = this_task.lock().id;
+        let task = sched_cb.suspended_tasks.find_and_remove(|t| {t.lock().id == id});
+        if task.is_some() {
+            let task_inner = ListNode::into_inner(task.unwrap());
+            sched_cb.active_tasks.insert_node_at_head(task_inner);
+            this_task.lock().status = TaskStatus::ACTIVE;
+        }
+        else {
+            // Scheduler did not get chance to put the suspended task into suspended queue
+            // So just revert state back to running
+            this_task.lock().status = TaskStatus::RUNNING;
+        }
+        true
+    }
+    else {
+        false
+    }
+}
+
 extern "C" fn idle_task() -> ! {
     hal::sleep();
 }
@@ -1162,7 +1256,11 @@ fn create_thread_common(handler: DispatchRoutine, user_function: Option<Dispatch
 }
 
 // Internal API: Do not call this
-pub fn create_init_thread(handler: DispatchRoutine, process: KProcess, context_ptr: *mut c_void) -> Result<KThread, KError> {
+pub fn create_init_thread(
+    handler: DispatchRoutine, 
+    process: KProcess, 
+    context_ptr: *mut c_void
+) -> Result<KThread, KError> {
     let is_user_thread = process.lock().get_user_flag();
     let proc_id = process.lock().get_id();
 
@@ -1190,6 +1288,7 @@ pub fn start_task(thread: &KThread, core: usize, process: &KProcess, registry: &
         };
         
         let thread_id = thread.lock().get_id();
+        
         // Add to ready queue
         sched_cb.active_tasks.add_node(Arc::clone(&thread))?;
 

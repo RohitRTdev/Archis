@@ -16,7 +16,6 @@ use crate::sync::{KEvent, Spinlock};
 use crate::io::DeviceHandleK;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
-use core::ptr::NonNull;
 use core::alloc::Layout;
 
 static PROCESS_ID: AtomicUsize = AtomicUsize::new(0);
@@ -27,17 +26,22 @@ pub type KProcess = Arc<Spinlock<Process>, PoolAllocatorGlobal>;
 pub enum Handle {
     FileHandle(FileInstance),
     ImgHandle(LoadedImage),
-    DeviceHandle(DeviceHandleK)
+    DeviceHandle(DeviceHandleK),
+    ThreadHandle(KThread),
+    ProcessHandle(KProcess)
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ProcessStatus {
     Ready,
+    Suspended,
     Terminated
 }
 
 pub struct Process {
     id: usize,
+    pid: usize,
+    sid: usize,
     // In current design, we will have the process struct holding weak pointers to the tasks.
     // Intuitively it should be the other way around, however this way it makes it easier code wise.
     // When tasks are dropped, the process struct will be automatically dropped
@@ -63,8 +67,22 @@ pub struct Process {
 
 unsafe impl Send for Process {}
 
+#[repr(C)]
+pub struct ProcessInfo {
+    pub id: usize,
+    pub pid: usize,
+    pub sid: usize
+}
+
 impl Process {
-    fn new(clone_addr_space: bool, is_user: bool, args: Vec<String>) -> Result<KProcess, KError> {
+    fn new(
+        clone_addr_space: bool, 
+        is_user: bool, 
+        is_suspended: bool, 
+        pid: usize, 
+        sid: usize, 
+        args: Vec<String>
+    ) -> Result<KProcess, KError> {
         let id = PROCESS_ID.fetch_add(1, Ordering::Relaxed);
         let kernel_addr_space = mem::get_kernel_addr_space();
         let new_addr_space = if clone_addr_space {
@@ -74,11 +92,20 @@ impl Process {
             kernel_addr_space
         };
 
+        let status = if is_suspended {
+            ProcessStatus::Suspended
+        }
+        else {
+            ProcessStatus::Ready
+        };
+
         let proc = Arc::new_in(Spinlock::new(Self {
             id,
+            pid,
+            sid,
             threads: List::new(),
             addr_space: new_addr_space,
-            status: ProcessStatus::Ready,
+            status,
             is_user,
             term_notify: KEvent::new(false),
             init_notify: KEvent::new(false),
@@ -124,22 +151,9 @@ impl Process {
     }
 
     pub fn remove_thread(&mut self, thread_id: usize, exit_code: isize) -> bool {
-        let mut killed_thread = None;
-        for node in self.threads.iter() {
-            if **node == thread_id {
-                killed_thread = Some(NonNull::from(node));
-                break;
-            }
-        }
-
+        self.threads.find_and_remove(|t| {*t == thread_id});
         crate::sched_log!("Remove thread called with id {}", thread_id);
 
-        unsafe {
-            if let Some(killed_thread) = killed_thread {
-                self.threads.remove_node(killed_thread);
-            }
-        }
-        
         if self.status == ProcessStatus::Terminated {
             return self.threads.get_nodes() == 0;
         }
@@ -156,6 +170,13 @@ impl Process {
         false
     }
 
+    pub fn get_first_task(&self) -> Option<usize> {
+        // This could be none, since there is a small window
+        // where a process is killed, but the process struct
+        // is still in registry and no threads exist
+        Some(**self.threads.first()?)
+    }
+
     pub fn get_notify_sem(&self) -> KEvent {
         self.term_notify.clone()
     }
@@ -164,9 +185,21 @@ impl Process {
         self.init_notify.clone()
     }
 
+    pub fn set_status(&mut self, status: ProcessStatus) {
+        self.status = status;
+    }
+
     pub fn complete_init(&mut self, status: bool) {
         self.init_status = status;
         self.init_notify.signal();
+    }
+
+    pub fn get_process_info(&self) -> ProcessInfo {
+        ProcessInfo {
+            id: self.id,
+            pid: self.pid,
+            sid: self.sid
+        }
     }
 
     fn destroy_process(&mut self) {
@@ -192,11 +225,40 @@ impl Process {
         self.user_modules.push(Arc::downgrade(module));
     }
 
+    // This operation is only allowed by the parent process
+    // and the process must have same sid as parent
+    // or must be done by the same process
+    fn set_sid(&mut self, id: usize, sid: usize) -> bool {
+        assert!(self.id != 0, "Attempted to change session id for system process!");
+        
+        // Same process attempting to change its session id. Allow it
+        if id == self.id {
+            self.sid = sid;
+            return true;
+        } 
+        
+        let res = get_process_info(self.pid);
+        // This is not parent process or parent process got killed
+        if id != self.pid || res.is_none() {
+            return false;
+        } 
+
+        let parent = res.unwrap();
+        if parent.lock().sid == self.sid {
+            self.sid = sid;
+            true
+        }
+        else {
+            false
+        }
+    }
+
 #[cfg(debug_assertions)]
     pub fn print_handles(&self) {
         let mut file_handles = 0;
         let mut img_handles = 0;
         let mut device_handles = 0;
+        let mut misc_handles = 0;
         self.file_table.iter().for_each(|handle| {
             match handle.as_ref() {
                 Some(h) => {
@@ -209,6 +271,9 @@ impl Process {
                         },
                         Handle::DeviceHandle(_) => {
                             device_handles += 1;
+                        },
+                        _ => {
+                            misc_handles += 1;
                         }
                     }
                 },
@@ -216,7 +281,11 @@ impl Process {
             }
         });
 
-        debug!("proc_id = {}, File handles = {}, image handles = {}, device handles = {}", self.id, file_handles, img_handles, device_handles);
+        debug!("proc_id = {}, 
+        File handles = {},
+        image handles = {}, 
+        device handles = {},
+        misc handles = {}", self.id, file_handles, img_handles, device_handles, misc_handles);
     }
 }
 
@@ -238,7 +307,13 @@ impl Drop for Process {
 
 pub fn init() {
     // Create init process and attach init task (task id = 0) to it
-    let init_proc = Process::new(false, false, vec!(KERNEL_PATH.into()))
+    let init_proc = Process::new(
+        false, 
+        false, 
+        false, 
+        0, 
+        0,
+        vec!(KERNEL_PATH.into()))
     .expect("Failed to create init process");
 
     PROCESSES.lock().insert(0, Arc::clone(&init_proc));
@@ -266,6 +341,19 @@ pub fn get_process_info(proc_id: usize) -> Option<KProcess> {
     proc_map.get(&proc_id).map(|item| {
         Arc::clone(item)
     })
+}
+
+pub fn set_sid(pid: usize, sid: usize) -> bool {
+    let cur_proc_id = get_current_process_id().expect("set_sid() called from idle process!");
+    let res = get_process_info(pid);
+
+    // Process likely got killed / doesn't exist
+    if res.is_none() {
+        return false;
+    }
+
+    let this_proc = res.unwrap();
+    this_proc.lock().set_sid(cur_proc_id, sid)
 }
 
 extern "C" fn kernel_init_handler() -> ! {
@@ -304,15 +392,29 @@ pub fn get_current_process_args() -> *const Vec<String> {
     &guard.args as *const Vec<String>
 }
 
-pub fn create_process(args: Vec<String>, context_ptr: *mut c_void, is_user: bool) -> Result<KProcess, KError> {
+pub fn create_process(args: Vec<String>, context_ptr: *mut c_void, is_user: bool, is_suspended: bool) -> Result<KProcess, KError> {
     // args[0] must name the module to load (kernel and user alike)
     if args.is_empty() {
         return Err(KError::InvalidArgument);
     }
 
+    let (pid, sid) = {
+        let proc = get_current_process().expect("create_process() called from idle process!");
+        let guard = proc.lock();
+        
+        // Inherit parent's sid (session id)
+        (guard.id, guard.sid)
+    };
+
     disable_preemption();
 
-    let process = match Process::new(true, is_user, args) {
+    let process = match Process::new(
+        true, 
+        is_user, 
+        is_suspended, 
+        pid,
+        sid,
+        args) {
         Ok(p) => p,
         Err(e) => {
             enable_preemption();
@@ -328,7 +430,9 @@ pub fn create_process(args: Vec<String>, context_ptr: *mut c_void, is_user: bool
         kernel_init_handler
     };
 
-    let thread = match sched::create_init_thread(init_handler, Arc::clone(&process), context_ptr) {
+    let thread = match sched::create_init_thread(
+        init_handler, 
+        Arc::clone(&process), context_ptr) {
         Ok(t) => t,
         Err(e) => {
             enable_preemption();
@@ -371,7 +475,7 @@ pub fn kill_process(proc_id: usize, exit_code: isize) {
     // We clone the list here in order to release the process lock
     let threads = {
         let mut guard = proc.lock();
-        if guard.status != ProcessStatus::Ready {
+        if guard.status == ProcessStatus::Terminated {
             drop(guard);
             enable_preemption();
             return;
@@ -446,6 +550,20 @@ pub fn add_memory_range_to_cur_process(virtual_base: usize, size: usize, is_user
     .expect("Failed to add node to process memory list!");
 }
 
+pub fn remove_handle(fd: usize) -> bool {
+    let proc = get_current_process()
+    .expect("add_new_handle() called in idle task!");
+
+    let mut guard = proc.lock();
+
+    if guard.file_table.len() > fd && guard.file_table[fd].is_some() {
+        guard.file_table[fd] = None;
+        return true;
+    }
+
+    false
+}
+
 pub fn add_new_handle(handle: Handle) -> usize {
     let proc = get_current_process()
     .expect("add_new_handle() called in idle task!");
@@ -491,7 +609,7 @@ extern "C" fn sched_get_cur_process_arg_ffi(num: usize) -> StrRef {
 extern "C" fn sched_create_process_ffi(
     args: *const StrRef,
     args_len: usize,
-    context_ptr: *mut c_void,
+    context_ptr: *mut c_void
 ) -> usize {
     let args_vec: Vec<String> = unsafe {
         core::slice::from_raw_parts(args, args_len)
@@ -499,7 +617,7 @@ extern "C" fn sched_create_process_ffi(
             .map(|s| String::from(s.as_str()))
             .collect()
     };
-    match create_process(args_vec, context_ptr, false) {
+    match create_process(args_vec, context_ptr, false, false) {
         Ok(proc) => proc.lock().get_id(),
         Err(_) => usize::MAX,
     }

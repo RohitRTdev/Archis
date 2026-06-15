@@ -104,6 +104,7 @@ fn run_proc_thread_tests() {
         vec!["libtest1.so".into(), "hello_from_test1".into()],
         &mut ctx as *mut TestCtx as *mut c_void,
         false,
+        false
     )
     .expect("proc/thread test 1: failed to create process");
 
@@ -122,6 +123,7 @@ fn run_proc_thread_tests() {
             vec!["libtest1.so".into(), alloc::format!("concurrent_proc_{}", i)],
             core::ptr::null_mut(),
             false,
+            false
         )
         .expect("proc/thread test 2: failed to create process");
         info!("proc/thread test 2: launched process {} (id={})", i, p.lock().get_id());
@@ -906,6 +908,7 @@ fn run_user_tests() {
         vec!["cat".into()],
         core::ptr::null_mut(),
         true,
+        false
     ).expect("user test 1: failed to create process");
     p1.wait();
     let code1 = p1.lock().get_exit_code();
@@ -917,11 +920,13 @@ fn run_user_tests() {
         vec!["cat".into()],
         core::ptr::null_mut(),
         true,
+        false
     ).expect("user test 2: failed to create process A");
     let p2b = sched::create_process(
         vec!["cat".into()],
         core::ptr::null_mut(),
         true,
+        false
     ).expect("user test 2: failed to create process B");
     p2a.wait();
     p2b.wait();
@@ -938,11 +943,13 @@ fn run_user_tests() {
         vec!["cat".into()],
         core::ptr::null_mut(),
         true,
+        false
     ).expect("user test 3: failed to create hello process");
     let p3b = sched::create_process(
         vec!["ls".into()],
         core::ptr::null_mut(),
         true,
+        false
     ).expect("user test 3: failed to create spawner process");
     p3a.wait();
     p3b.wait();
@@ -958,6 +965,7 @@ fn run_user_tests() {
         vec!["ls".into()],
         core::ptr::null_mut(),
         true,
+        false
     ).expect("user test 4: failed to create spawner process");
     p4.wait();
     info!("user test 4: spawner exited with code {}", p4.lock().get_exit_code());

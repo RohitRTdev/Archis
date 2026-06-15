@@ -4,7 +4,7 @@ int main(void) {
     sys_print("Hello from cat");
 
     char *const args[] = {"tester", "arg1", "arg2"};
-    if (sys_create_process(args, 3) < 0) {
+    if (sys_create_process(args, 3, PROCESS_SUSPEND_FLAG) < 0) {
         sys_print("Process creation failed!");
     }
 
