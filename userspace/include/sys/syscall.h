@@ -14,9 +14,11 @@ enum syscall_t {
     SYSCALL_CREATE_THREAD,
     SYSCALL_CREATE_PROCESS,
     SYSCALL_RESUME_PROCESS,
-    SYSCALL_SET_SESSION_ID,
+    SYSCALL_SET_SESSION_LEADER,
     SYSCALL_GET_PID,
-    SYSCALL_GET_PROCESS_INFO
+    SYSCALL_GET_PROCESS_INFO,
+    SYSCALL_ALLOCATE_MEMORY,
+    SYSCALL_DEALLOCATE_MEMORY
 };
 
 typedef enum {
@@ -31,7 +33,7 @@ typedef enum {
     E_NOPERM = -8
 } syscall_status_t;
 
-const uint64_t PROCESS_SUSPEND_FLAG = 1 << 0;
+#define PROCESS_SUSPEND_FLAG ((uint64_t)1 << 0)
 
 
 typedef struct {
@@ -42,11 +44,13 @@ typedef struct {
 
 syscall_status_t sys_close(uint64_t fd);
 syscall_status_t sys_print(const char* msg);
-syscall_status_t sys_delay_ms(uint64_t ms);
-syscall_status_t sys_create_process(char *const args[], uint64_t len, uint64_t flags);
+syscall_status_t sys_delay_ms(size_t ms);
+syscall_status_t sys_create_process(char *const args[], size_t len, uint64_t flags);
 syscall_status_t sys_create_thread(const void *context);
 syscall_status_t sys_resume_process(uint64_t pid);
-syscall_status_t sys_set_session_id(uint64_t pid, uint64_t sid);
+syscall_status_t sys_set_session_leader(uint64_t pid);
 syscall_status_t sys_get_pid();
 syscall_status_t sys_get_process_info(uint64_t pid, process_info_t *const buf);
+syscall_status_t sys_allocate_memory(size_t size, void **out);
+syscall_status_t sys_deallocate_memory(void *addr, size_t size);
 

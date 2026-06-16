@@ -913,32 +913,55 @@ pub fn unmap_memory(virt_addr: usize, size: usize, flags: u8) -> Result<(), KErr
     Ok(())
 }
 
-pub fn is_user_range(virt_addr: usize, size: usize) -> bool {
-    assert!(size != 0);
-    let mut cur_ptr = virt_addr;
-    let end = virt_addr + size;
+
+pub fn copy_from_user(kernel_dest: *mut u8, user_src: usize, len: usize) -> Result<(), KError> {
+    if len == 0 {
+        return Ok(());
+    }
 
     let active_addr_space = get_active_vcb();
     unsafe {
         let vcb = (*active_addr_space.as_ptr()).lock();
-        let mut is_found = true;
-        while cur_ptr < end && is_found {
-            is_found = false;
-            // Check if this range straddles any of the range mentioned in alloc block list
-            // We may need to iterate this list multiple times since the blocks are not 
-            // in any particular order
-            for allocated_node in vcb.alloc_block_list.iter() {
-                if allocated_node.is_mapped && 
-                (allocated_node.flags & PageDescriptor::USER != 0) && 
-                cur_ptr >= allocated_node.start_virt_address &&
-                cur_ptr < allocated_node.start_virt_address + allocated_node.num_pages * PAGE_SIZE {
-                    cur_ptr += allocated_node.num_pages * PAGE_SIZE;
-                    is_found = true;
-                }    
+        if !check_user_range_locked(&vcb, user_src, len) {
+            return Err(KError::InvalidArgument);
+        }
+        hal::copy_user_memory(kernel_dest, user_src as *const u8, len);
+    }
+    Ok(())
+}
+
+pub fn copy_to_user(user_dest: usize, kernel_src: *const u8, len: usize) -> Result<(), KError> {
+    if len == 0 {
+        return Ok(());
+    }
+
+    let active_addr_space = get_active_vcb();
+    unsafe {
+        let vcb = (*active_addr_space.as_ptr()).lock();
+        if !check_user_range_locked(&vcb, user_dest, len) {
+            return Err(KError::InvalidArgument);
+        }
+        hal::copy_user_memory(user_dest as *mut u8, kernel_src, len);
+    }
+    Ok(())
+}
+
+fn check_user_range_locked(vcb: &crate::sync::SpinlockGuard<'_, VirtMemConBlk>, virt_addr: usize, size: usize) -> bool {
+    let mut cur_ptr = virt_addr;
+    let end = virt_addr + size;
+    let mut is_found = true;
+    while cur_ptr < end && is_found {
+        is_found = false;
+        for allocated_node in vcb.alloc_block_list.iter() {
+            if allocated_node.is_mapped &&
+            (allocated_node.flags & PageDescriptor::USER != 0) &&
+            cur_ptr >= allocated_node.start_virt_address &&
+            cur_ptr < allocated_node.start_virt_address + allocated_node.num_pages * PAGE_SIZE {
+                cur_ptr += allocated_node.num_pages * PAGE_SIZE;
+                is_found = true;
             }
         }
     }
-
     cur_ptr >= end
 }
 

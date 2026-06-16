@@ -23,17 +23,22 @@ RUST_HOST := $(shell rustc -vV | grep '^host:' | cut -d' ' -f2)
 RUST_LLD := $(shell rustc --print sysroot)/lib/rustlib/$(RUST_HOST)/bin/rust-lld
 
 LINKER_SCRIPT := $(USER_LINKER_SCRIPT)
-
 USER_LLD_FLAGS := -flavor gnu --hash-style=sysv -T $(LINKER_SCRIPT)
-
 COMMON_CFLAGS := -target $(TARGET) -ffreestanding -fPIC -fPIE -nostdinc -Wall -Wextra -MMD -MP -I$(CURDIR)/include
 
+# crt object files will be compiled into every binary that is generated
 CRT_SRCS := crt/$(ARCH)/*
 
+# Mention the binaries to be compiled in this list 
+# (The names of these binaries don't correspond to the actual program you're used to)
 BINARIES := cat ls tester
 
+# Shared libraries (dynamically loaded) and static libraries(.a archives) are to be mentioned here
 SHARED_LIBS := c
+STATIC_LIBS :=
 
+# Write down the src files and lib dependencies of each binary
+# in following format -> <bin_name>_SRCS := <src_list>, <bin_name>_LIBS := <static_and_shared_lib_list>
 tester_SRCS := tester.c
 tester_LIBS := c
 
@@ -48,6 +53,12 @@ c_SRCS := libc/*.c libc/*.s libc/$(ARCH)/*
 expand-srcs = $(foreach p,$1,$(wildcard $(p)))
 src-to-obj = $(OBJDIR)/$(patsubst %.c,%.o,$(patsubst %.S,%.o,$(patsubst %.s,%.o,$1)))
 src-to-dep = $(OBJDIR)/$(patsubst %.c,%.d,$1)
+
+
+# The makefile follows a design where all recipes are generated dynamically instead of 
+# using a bash script to compile them in a for loop
+# This allows us to use all existing features of makefile such as dependency resolution
+# and compiling only what is needed
 
 ALL_DEPS :=
 

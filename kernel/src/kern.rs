@@ -891,14 +891,14 @@ fn run_sync_tests() {
 
 // === User loader & userspace tests ===
 //
-// Test 1: basic load — single libhello.so process (exercises ELF parsing,
-//         dependency loading of libulib.so, relocations, all syscalls).
-// Test 2: warm load — two concurrent libhello.so processes share the
-//         read-only pages of both libhello.so and libulib.so.
-// Test 3: shared dep — libhello.so and libspawner.so launched concurrently,
-//         both pull in libulib.so (warm-loads the shared dependency).
-// Test 4: user-initiated spawn — libspawner.so internally spawns libhello.so
-//         via the create_process syscall.
+// Test 1: basic load — single cat process (exercises ELF parsing,
+//         dependency loading of libc.so, relocations, all syscalls).
+//         spawns tester process internally.
+// Test 2: warm load — two concurrent cat processes share the
+//         read-only pages of libc.so.
+// Test 3: shared dep — cat and ls launched concurrently,
+//         both pull in libc.so (warm-loads the shared dependency).
+// Test 4: ls test — spawn ls internally only.
 fn run_user_tests() {
     info!("=== run_user_tests: BEGIN ===");
 
@@ -944,31 +944,31 @@ fn run_user_tests() {
         core::ptr::null_mut(),
         true,
         false
-    ).expect("user test 3: failed to create hello process");
+    ).expect("user test 3: failed to create cat process");
     let p3b = sched::create_process(
         vec!["ls".into()],
         core::ptr::null_mut(),
         true,
         false
-    ).expect("user test 3: failed to create spawner process");
+    ).expect("user test 3: failed to create ls process");
     p3a.wait();
     p3b.wait();
     info!(
-        "user test 3: hello exited with code {}, spawner with code {}",
+        "user test 3: cat exited with code {}, cat with code {}",
         p3a.lock().get_exit_code(),
         p3b.lock().get_exit_code()
     );
 
     // Test 4: user-initiated process spawn
-    info!("--- user test 4: user-initiated spawn (ls) ---");
+    info!("--- user test 4: ls test ---");
     let p4 = sched::create_process(
         vec!["ls".into()],
         core::ptr::null_mut(),
         true,
         false
-    ).expect("user test 4: failed to create spawner process");
+    ).expect("user test 4: failed to create ls process");
     p4.wait();
-    info!("user test 4: spawner exited with code {}", p4.lock().get_exit_code());
+    info!("user test 4: ls exited with code {}", p4.lock().get_exit_code());
 
     info!("=== run_user_tests: PASSED ===");
 }

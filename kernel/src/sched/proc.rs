@@ -23,6 +23,7 @@ static PROCESSES: Spinlock<BTreeMap<usize, KProcess>> = Spinlock::new(BTreeMap::
 
 pub type KProcess = Arc<Spinlock<Process>, PoolAllocatorGlobal>;
 
+#[derive(Clone)]
 pub enum Handle {
     FileHandle(FileInstance),
     ImgHandle(LoadedImage),
@@ -194,7 +195,7 @@ impl Process {
         self.init_notify.signal();
     }
 
-    pub fn get_process_info(&self) -> ProcessInfo {
+    pub fn get_process_header(&self) -> ProcessInfo {
         ProcessInfo {
             id: self.id,
             pid: self.pid,
@@ -228,12 +229,13 @@ impl Process {
     // This operation is only allowed by the parent process
     // and the process must have same sid as parent
     // or must be done by the same process
-    fn set_sid(&mut self, id: usize, sid: usize) -> bool {
+    fn set_session_leader(&mut self, id: usize) -> bool {
         assert!(self.id != 0, "Attempted to change session id for system process!");
         
         // Same process attempting to change its session id. Allow it
         if id == self.id {
-            self.sid = sid;
+            // New session leader (Session leader has pid = sid)
+            self.sid = self.id;
             return true;
         } 
         
@@ -245,7 +247,7 @@ impl Process {
 
         let parent = res.unwrap();
         if parent.lock().sid == self.sid {
-            self.sid = sid;
+            self.sid = self.id;
             true
         }
         else {
@@ -343,7 +345,7 @@ pub fn get_process_info(proc_id: usize) -> Option<KProcess> {
     })
 }
 
-pub fn set_sid(pid: usize, sid: usize) -> bool {
+pub fn set_session_leader(pid: usize) -> bool {
     let cur_proc_id = get_current_process_id().expect("set_sid() called from idle process!");
     let res = get_process_info(pid);
 
@@ -353,7 +355,7 @@ pub fn set_sid(pid: usize, sid: usize) -> bool {
     }
 
     let this_proc = res.unwrap();
-    this_proc.lock().set_sid(cur_proc_id, sid)
+    this_proc.lock().set_session_leader(cur_proc_id)
 }
 
 extern "C" fn kernel_init_handler() -> ! {
@@ -548,6 +550,21 @@ pub fn add_memory_range_to_cur_process(virtual_base: usize, size: usize, is_user
 
     process.lock().memory_list.add_node(range)
     .expect("Failed to add node to process memory list!");
+}
+
+pub fn get_handle(fd: usize) -> Option<Handle> {
+    let proc = get_current_process()
+    .expect("add_new_handle() called in idle task!");
+
+    let guard = proc.lock();
+    if guard.file_table.len() > fd {
+        guard.file_table[fd].as_ref().map(|t| {
+            (*t).clone()
+        })
+    }
+    else {
+        None
+    }
 }
 
 pub fn remove_handle(fd: usize) -> bool {

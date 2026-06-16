@@ -606,7 +606,7 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
             },
 
             TaskStatus::SUSPENDED => {
-                let task_l = sched_cb.waiting_tasks.find_and_remove(|t| {t.lock().id == task_id});
+                let task_l = sched_cb.suspended_tasks.find_and_remove(|t| {t.lock().id == task_id});
                 
                 // Scheduler did not get chance to put this task into suspended queue
                 if task_l.is_some() {
@@ -1014,9 +1014,11 @@ pub fn schedule() {
                             sched_cb.waiting_tasks.insert_node_at_tail(current_task);
                         }
                         else if task_info.status == TaskStatus::TERMINATED {
+                            crate::sched_log!("Adding task {} to terminated list", task_info.id);
                             sched_cb.terminated_tasks.insert_node_at_tail(current_task);
                         }
                         else if task_info.status == TaskStatus::SUSPENDED {
+                            crate::sched_log!("Adding task {} to suspended list", task_info.id);
                             sched_cb.suspended_tasks.insert_node_at_tail(current_task);
                         }
                         else {
@@ -1154,9 +1156,11 @@ pub fn suspend_process() {
         match task_guard.status {
             TaskStatus::TERMINATED => {
                 // TERMINATED > SUSPENDED
+                crate::sched_log!("Suspend process {} failed since task is terminated", proc_guard.get_id());
                 return;  
             },
             TaskStatus::RUNNING => {
+                crate::sched_log!("Suspend process {} suspended task {}", proc_guard.get_id(), task_guard.id);
                 task_guard.status = TaskStatus::SUSPENDED;
             },
             _ => {
@@ -1180,6 +1184,7 @@ pub fn resume_process(pid: usize) -> bool {
     let res = {
         let mut proc_guard = this_proc.lock();
         if proc_guard.get_status() == ProcessStatus::Suspended {
+            crate::sched_log!("Resuming process {}", proc_guard.get_id());
             proc_guard.set_status(ProcessStatus::Ready);
         }
 
@@ -1209,13 +1214,16 @@ pub fn resume_process(pid: usize) -> bool {
         if task.is_some() {
             let task_inner = ListNode::into_inner(task.unwrap());
             sched_cb.active_tasks.insert_node_at_head(task_inner);
+            crate::sched_log!("Resumed task {} from suspend list", id);
             this_task.lock().status = TaskStatus::ACTIVE;
         }
         else {
             // Scheduler did not get chance to put the suspended task into suspended queue
             // So just revert state back to running
+            crate::sched_log!("Resumed task {} directly", id);
             this_task.lock().status = TaskStatus::RUNNING;
         }
+        notify_other_cpu(core);
         true
     }
     else {

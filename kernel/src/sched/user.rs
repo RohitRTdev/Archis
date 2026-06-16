@@ -1,5 +1,6 @@
 use core::ffi::c_void;
 use core::mem::size_of;
+use core::alloc::Layout;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -7,13 +8,13 @@ use common::{PAGE_SIZE, align_up};
 use crate::cpu::Stack;
 use crate::hal::{MAX_ARCH_ARGS, copy_user_memory, transfer_control_to_user};
 use crate::loader::load_user_image;
-use crate::mem::{self, is_user_range};
+use crate::mem::{self, PageDescriptor};
 use crate::sched;
 use crate::sched::Handle::{ProcessHandle, ThreadHandle};
 use super::*;
 use kernel_intf::*;
 
-const MAX_SYSCALLS: usize = 14;
+const MAX_SYSCALLS: usize = 16;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 
 static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
@@ -28,63 +29,44 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_create_thread_handler,
     sys_create_process_handler,
     sys_resume_process_handler,
-    sys_set_session_id,
-    sys_get_pid,
-    sys_get_process_info
+    sys_set_session_leader_handler,
+    sys_get_pid_handler,
+    sys_get_process_info_handler,
+    sys_allocate_memory_handler,
+    sys_deallocate_memory_handler
 ];
 
-#[cfg(target_arch = "x86_64")]
 fn read_c_strlen(start: usize) -> Option<usize> {
     let mut len = 0;
-    unsafe {
-        core::arch::asm!(
-            "stac",   
-            options(nostack)
-        );
-
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-        let mut cur_ptr = start;
-        let mut cur_range = align_up(start, PAGE_SIZE) - start;
-        if cur_range == 0 {
-            // Our base ptr is already aligned to a PAGE_SIZE
-            cur_range = PAGE_SIZE;
-        }
-        
-        'outer: loop {
-            if !mem::is_user_range(cur_ptr, cur_range) {
-                debug!("User range: {:#X} with size {} invalid", cur_ptr, cur_range);
-                core::arch::asm!(
-                    "clac",      
-                    options(nostack)
-                );
-                return None;
-            }
-
-            // We can safely read this range
-            for addr in cur_ptr..cur_ptr + cur_range {
-                if (addr as *const u8).read() != 0 {
-                    len += 1;
-                }
-                else {
-                    break 'outer;
-                }
-            }
-
-            // Check if next page is user accessible
-            cur_ptr += cur_range;
-            cur_range = PAGE_SIZE;
-        }
-
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
-        core::arch::asm!(
-            "clac",      
-            options(nostack)
-        );
+    let mut cur_ptr = start;
+    let mut cur_range = align_up(start, PAGE_SIZE) - start;
+    if cur_range == 0 {
+        cur_range = PAGE_SIZE;
     }
 
-    Some(len)
+    let mut pages_checked = 0;
+    loop {
+        let mut buf = vec![0u8; cur_range];
+        if mem::copy_from_user(buf.as_mut_ptr(), cur_ptr, cur_range).is_err() {
+            debug!("User range: {:#X} with size {} invalid", cur_ptr, cur_range);
+            return None;
+        }
+
+        for &b in buf.iter() {
+            if b == 0 {
+                return Some(len);
+            }
+            len += 1;
+        }
+
+        pages_checked += 1;
+        if pages_checked >= 2 {
+            return None;
+        }
+
+        cur_ptr += cur_range;
+        cur_range = PAGE_SIZE;
+    }
 }
 
 // Must be called from valid process context
@@ -292,8 +274,8 @@ fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 
     let mut str_buf = vec![0u8; len];
-    unsafe {
-        copy_user_memory(str_buf.as_mut_ptr(), args[0] as *const u8, len);
+    if mem::copy_from_user(str_buf.as_mut_ptr(), args[0] as usize, len).is_err() {
+        return E_INVALID_MEMORY_RANGE;
     }
 
     let user_str_raw = core::str::from_utf8(&str_buf);
@@ -343,15 +325,11 @@ fn sys_create_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
         return E_INVALID;
     }
     
-    if !is_user_range(args[0] as usize, len * size_of::<usize>()) {
+    let mut command_args: Vec<*const i8> = vec![core::ptr::null(); len];
+    // Validate and copy the pointer list
+    if mem::copy_from_user(command_args.as_mut_ptr() as *mut u8, args[0] as usize, len * size_of::<usize>()).is_err() {
         debug!("Failed user range!start:{:#X}, size:{}", args[0] as usize, len);
         return E_INVALID_MEMORY_RANGE;
-    }
-
-    let mut command_args: Vec<*const i8> = vec![core::ptr::null(); len];     
-    // Copy the pointer list
-    unsafe {
-        copy_user_memory(command_args.as_mut_ptr() as *mut u8, args[0] as *const u8, len * size_of::<usize>());
     }
 
     let mut command_args_str = Vec::new();
@@ -363,10 +341,11 @@ fn sys_create_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
         }
         let command_c_str_len = command_c_str_res.unwrap();
         let mut command_str = vec![0u8; command_c_str_len];
-        
+
         // Copy the string
-        unsafe {
-            copy_user_memory(command_str.as_mut_ptr(), s as *const u8, command_c_str_len);
+        if mem::copy_from_user(command_str.as_mut_ptr(), s.addr(), command_c_str_len).is_err() {
+            debug!("Failed to copy string idx {}", id);
+            return E_INVALID_MEMORY_RANGE;
         }
 
         let path = match String::from_utf8(command_str) {
@@ -408,14 +387,14 @@ fn sys_resume_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-// arg0 = pid, arg1 = new_sid
-fn sys_set_session_id(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+// arg0 = pid
+fn sys_set_session_leader_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let res = get_process_info(args[0] as usize);
     if res.is_none() {
         return E_PROCESS_TERMINATED;
     }
 
-    if proc::set_sid(args[0] as usize, args[1] as usize) {
+    if proc::set_session_leader(args[0] as usize) {
         E_SUCCESS
     }
     else {
@@ -423,28 +402,72 @@ fn sys_set_session_id(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-fn sys_get_pid(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+fn sys_get_pid_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let cur_proc_id = get_current_process_id().expect("syscall in idle process??");
     cur_proc_id as i64
 }
 
-// arg0 = pid, arg1 = process info ptr
-fn sys_get_process_info(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    let res = get_process_info(args[0] as usize);
+// arg0 = proc_fd, arg1 = process info ptr
+fn sys_get_process_info_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let res = get_handle(args[0] as usize);
     if res.is_none() {
-        return E_PROCESS_TERMINATED;
+        return E_INVALID;
     }
 
-    if !is_user_range(args[1] as usize, size_of::<ProcessInfo>()) {
-        return E_INVALID_MEMORY_RANGE;
-    }
+    if let ProcessHandle(this_proc) = res.unwrap() {
+        let info = this_proc.lock().get_process_header();
+        if mem::copy_to_user(args[1] as usize, &info as *const _ as *const u8, size_of::<ProcessInfo>()).is_err() {
+            return E_INVALID_MEMORY_RANGE;
+        }
 
-    let this_proc = res.unwrap();
-    let info = this_proc.lock().get_process_info();
-    unsafe {
-        copy_user_memory(args[1] as *mut u8, &info as *const _ as *const u8, size_of::<ProcessInfo>());
+        E_SUCCESS
     }
-
-    E_SUCCESS
+    else {
+        E_PROCESS_TERMINATED
+    }
 }
 
+// arg0 = size, arg1 = ptr to result
+fn sys_allocate_memory_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let layout = match Layout::from_size_align(args[0] as usize, PAGE_SIZE) {
+        Ok(l) => l,
+        Err(_) => return E_INVALID,
+    };
+    let res = mem::allocate_memory(layout, PageDescriptor::VIRTUAL | PageDescriptor::USER);
+
+    match res {
+        Ok(virt_addr) => {
+            if mem::copy_to_user(args[1] as usize, &virt_addr as *const _ as *const u8, size_of::<usize>()).is_err() {
+                return E_INVALID_MEMORY_RANGE;
+            }
+
+            E_SUCCESS
+        },
+        _ => {
+            E_OOM
+        }
+    }
+}
+
+// arg0 = addr, arg1 = size
+fn sys_deallocate_memory_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let size = args[1] as usize;
+    if size == 0 {
+        return E_INVALID;
+    }
+
+    let layout = match Layout::from_size_align(size, PAGE_SIZE) {
+        Ok(l) => l,
+        Err(_) => return E_INVALID,
+    };
+
+    let res = mem::deallocate_memory(args[0] as *mut u8, layout, PageDescriptor::VIRTUAL | PageDescriptor::USER);
+    match res {
+        Ok(..) => {
+            E_SUCCESS
+        },
+        _ => {
+            E_INVALID
+        }
+    }
+}
