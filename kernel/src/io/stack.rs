@@ -432,6 +432,7 @@ fn continue_stack(stack: &Arc<DeviceStack>, from_level: usize) {
             Some(fdo) => fdo,
             None => return
         };
+        assert!(!fdo.is_class_device(), "driver bug: add_device created a class device in the PnP stack");
         fdo.set_stack(stack.clone(), level);
         stack.set_level_device(level, fdo_id);
 
@@ -486,7 +487,7 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
     };
     let buffer = MemoryRegion { base_address: buf_ptr.as_ptr() as usize, size: buf_size };
 
-    let irp = match io_request_sync(&fdo, IrpMajor::Pnp, IrpMinor::Enumerate, buffer, 0) {
+    let irp = match io_request_sync(&fdo, IrpMajor::Pnp, IrpMinor::Enumerate, buffer, 0, None) {
         Ok(irp) => irp,
         Err(e) => {
             info!("enumerate on '{}' failed: {}", fdo.name(), e);
@@ -529,6 +530,7 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
             Some(pdo) => pdo,
             None => continue
         };
+        assert!(!pdo.is_class_device(), "driver bug: enumerate returned a class device as a PDO");
         fdo.attach_child(id);
         pdo.mark_started_pdo();
 
@@ -554,7 +556,7 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
 fn query_id(dev: &DeviceHandleK) -> Option<String> {
     let irp = {
         let _g = dev.config_guard();
-        io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Query, EMPTY_REGION, 0).ok()?
+        io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Query, EMPTY_REGION, 0, None).ok()?
     };
     if irp.status != Status::Success {
         return None;

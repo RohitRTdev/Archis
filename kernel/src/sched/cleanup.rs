@@ -1,0 +1,78 @@
+use core::alloc::Layout;
+use core::ptr::NonNull;
+
+use alloc::vec::Vec;
+use kernel_intf::list::{DynList, List, ListNodeGuard};
+use kernel_intf::mem::PoolAllocator;
+use common::{MemoryRegion, PAGE_SIZE};
+
+use crate::mem::{VCB, VirtMemConBlk, deallocate_memory};
+use crate::sync::{KEvent, Once, Spinlock};
+use crate::sched::{self, DispatchRoutine};
+use super::proc::Handle;
+
+pub struct ProcessCleanupWork {
+    pub addr_space:  VCB,
+    pub memory_list: DynList<MemoryRegion>,
+    pub handles:     Vec<Option<Handle>>,
+}
+
+unsafe impl Send for ProcessCleanupWork {}
+unsafe impl Sync for ProcessCleanupWork {}
+
+static CLEANUP_QUEUE: Spinlock<DynList<ProcessCleanupWork>> = Spinlock::new(List::new());
+static CLEANUP_EVENT: Once<KEvent> = Once::new();
+
+pub fn enqueue_cleanup(work: ProcessCleanupWork) {
+    CLEANUP_QUEUE.lock().add_node(work).expect("cleanup queue: enqueue failed");
+    CLEANUP_EVENT.get().expect("cleanup::init() not called before enqueue_cleanup").signal();
+}
+
+fn pop_one() -> Option<ListNodeGuard<ProcessCleanupWork, PoolAllocator>> {
+    let mut q = CLEANUP_QUEUE.lock();
+    if q.get_nodes() == 0 {
+        return None;
+    }
+    let head = NonNull::from(q.first().unwrap());
+    Some(unsafe { q.remove_node(head) })
+}
+
+extern "C" fn cleanup_worker() -> ! {
+    kernel_intf::info!("Started cleanup worker thread");
+    loop {
+        CLEANUP_EVENT.get().unwrap().wait();
+        loop {
+            let mut guard = match pop_one() {
+                Some(g) => g,
+                None => break,
+            };
+
+            // Take handles out first so we control when Close IRPs fire.
+            let handles = core::mem::take(&mut guard.handles);
+            drop(handles);
+
+            unsafe { VirtMemConBlk::destroy_address_space(guard.addr_space); }
+
+            // Deallocate every physical memory region.
+            for range in guard.memory_list.iter() {
+                kernel_intf::debug!(
+                    "cleanup worker: deallocating base={:#X} size={}",
+                    range.base_address, range.size
+                );
+                deallocate_memory(
+                    range.base_address as *mut u8,
+                    Layout::from_size_align(range.size, PAGE_SIZE).unwrap(),
+                    0,
+                ).expect("cleanup worker: dealloc failed");
+            }
+        }
+    }
+}
+
+pub fn init() {
+    CLEANUP_EVENT.call_once(|| KEvent::new(false));
+    sched::create_system_thread(
+        cleanup_worker as DispatchRoutine,
+        core::ptr::null_mut(),
+    ).expect("Failed to create process cleanup worker");
+}

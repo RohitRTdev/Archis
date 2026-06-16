@@ -8,6 +8,7 @@ pub use framebuffer_logger::relocate_framebuffer;
 
 static PANIC_MODE: AtomicBool = AtomicBool::new(false);
 static PANIC_CORE: AtomicU8 = AtomicU8::new(0);
+static IS_TTY_MODE: AtomicBool = AtomicBool::new(false);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn clear_screen() {
@@ -29,19 +30,55 @@ pub fn set_panic_mode(core: u8) {
 #[unsafe(no_mangle)]
 extern "C" fn serial_print_ffi(s: *const u8, len: usize) {
     let s = unsafe {
-        let slice = core::slice::from_raw_parts(s , len);
+        let slice = core::slice::from_raw_parts(s, len);
         core::str::from_utf8_unchecked(slice)
-    }; 
+    };
 
-    // During kernel panic, only allow the panicking core to log
-    if !PANIC_MODE.load(Ordering::Acquire) || PANIC_CORE.load(Ordering::Acquire) == hal::get_core() as u8 {
-        // Write to serial
-        uart::SERIAL.lock().write(s);
-        
-        // Write to framebuffer
-        FRAMEBUFFER_LOGGER.lock().write(s);
-        flush_log();
+    let panicking = PANIC_MODE.load(Ordering::Acquire);
+    let is_panic_core = PANIC_CORE.load(Ordering::Acquire) == hal::get_core() as u8;
+    let tty = IS_TTY_MODE.load(Ordering::Acquire);
+
+    // Suppress output when in TTY mode, except for the panicking core during a panic.
+    if tty && !(panicking && is_panic_core) {
+        return;
     }
+
+    // During kernel panic, only the panicking core logs.
+    if panicking && !is_panic_core {
+        return;
+    }
+
+    uart::SERIAL.lock().write(s);
+    FRAMEBUFFER_LOGGER.lock().write(s);
+    flush_log();
+}
+
+// Write to framebuffer only when TTY mode is active and there is no ongoing panic.
+#[unsafe(no_mangle)]
+extern "C" fn tty_print_ffi(s: *const u8, len: usize) {
+    if PANIC_MODE.load(Ordering::Acquire) || !IS_TTY_MODE.load(Ordering::Acquire) {
+        return;
+    }
+    let s = unsafe {
+        let slice = core::slice::from_raw_parts(s, len);
+        core::str::from_utf8_unchecked(slice)
+    };
+    FRAMEBUFFER_LOGGER.lock().write(s);
+    flush_log();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn enable_tty_mode_ffi() {
+    if PANIC_MODE.load(Ordering::Acquire) { return; }
+    IS_TTY_MODE.store(true, Ordering::Release);
+    FRAMEBUFFER_LOGGER.lock().clear_screen();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn disable_tty_mode_ffi() {
+    if PANIC_MODE.load(Ordering::Acquire) { return; }
+    IS_TTY_MODE.store(false, Ordering::Release);
+    FRAMEBUFFER_LOGGER.lock().clear_screen();
 }
 
 pub fn init() {

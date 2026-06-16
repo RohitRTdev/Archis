@@ -675,7 +675,7 @@ extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
     let dev_ptr = unsafe { (*irp).device };
     if !dev_ptr.is_null() {
         if let Some(dev) = io::resolve_device(dev_ptr) {
-            dev.pending_irps.lock().find_and_remove(|&p| p == irp);
+            dev.get_pending_irps().lock().find_and_remove(|&p| p == irp);
         }
     }
 
@@ -750,7 +750,7 @@ pub fn allocate_irp(
 
     if !device.is_null() {
         if let Some(dev) = io::resolve_device(device) {
-            dev.pending_irps.lock().add_node(irp_raw)
+            dev.get_pending_irps().lock().add_node(irp_raw)
                 .expect("Failed to register IRP with device pending list");
         }
     }

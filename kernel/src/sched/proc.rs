@@ -3,20 +3,19 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use common::{MemoryRegion, PAGE_SIZE, StrRef};
+use common::{MemoryRegion, StrRef};
 use kernel_intf::{KError, info, debug};
 use kernel_intf::list::{List, DynList};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use crate::fs::FileInstance;
 use crate::loader::{LoadedImage, LoadedImageWeak, load_image};
 use crate::{KERNEL_PATH, hal};
-use crate::mem::{self, PageDescriptor, VCB, VirtMemConBlk, deallocate_memory, get_physical_address};
+use crate::mem::{self, PageDescriptor, VCB, VirtMemConBlk, get_physical_address};
 use crate::sched::{self, *};
 use crate::sync::{KEvent, Spinlock};
-use crate::io::DeviceHandleK;
+use crate::io::OpenDeviceHandle;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
-use core::alloc::Layout;
 
 static PROCESS_ID: AtomicUsize = AtomicUsize::new(0);
 static PROCESSES: Spinlock<BTreeMap<usize, KProcess>> = Spinlock::new(BTreeMap::new());
@@ -27,7 +26,7 @@ pub type KProcess = Arc<Spinlock<Process>, PoolAllocatorGlobal>;
 pub enum Handle {
     FileHandle(FileInstance),
     ImgHandle(LoadedImage),
-    DeviceHandle(DeviceHandleK),
+    DeviceHandle(OpenDeviceHandle),
     ThreadHandle(KThread),
     ProcessHandle(KProcess)
 }
@@ -294,16 +293,13 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         crate::sched_log!("Dropping process {}", self.id);
-        unsafe {
-            VirtMemConBlk::destroy_address_space(self.addr_space);
-        }
 
-        crate::sched_log!("Deallocating regions from process {} memory list", self.id);
-        for range in self.memory_list.iter() {
-            debug!("Deallocating memory region base={:#X} of size={}", range.base_address, range.size);
-            deallocate_memory(range.base_address as *mut u8, Layout::from_size_align(range.size, PAGE_SIZE).unwrap(), 0)
-            .expect("Failed to deallocate physical memory from process");
-        }
+        let work = ProcessCleanupWork {
+            addr_space:  self.addr_space,
+            memory_list: core::mem::take(&mut self.memory_list),
+            handles:     core::mem::take(&mut self.file_table)
+        };
+        enqueue_cleanup(work);
     }
 }
 

@@ -25,7 +25,7 @@ use acpi_intf::{ACPI_SLEEP_S5, acpi_enter_sleep_state, acpi_enter_sleep_state_pr
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::sync::atomic::AtomicUsize;
 use core::ffi::c_void;
-use io::DeviceHandleK;
+use io::OpenDeviceHandle;
 
 use kernel_intf::{info, debug};
 use common::*;
@@ -212,6 +212,7 @@ extern "C" fn self_cancel_runner() -> ! {
         IrpMinor::None,
         MemoryRegion { base_address: 0, size: 0 },
         0,
+        None,
         cancel_test_completion,
         core::ptr::null_mut(),
     );
@@ -226,7 +227,7 @@ extern "C" fn self_cancel_runner() -> ! {
     sched::delay_ms(2000);
     info!(
         "self_cancel_runner: pending_irps on test1 = {}",
-        handle.pending_irps.lock().get_nodes()
+        handle.get_pending_irps().lock().get_nodes()
     );
     sched::exit_thread(0);
 }
@@ -257,19 +258,19 @@ fn run_cancel_tests() {
         }
     };
     let driver_id = unsafe { (*probe.device_ptr()).get_driver_id() };
-    let dup = create_device_by_id(driver_id, Some("test1"), core::ptr::null_mut(), None);
+    let dup = create_device_by_id(driver_id, Some("test1"), core::ptr::null_mut(), None, false);
     info!("cancel test (c): duplicate create returned {:#X}", dup.addr());
     assert!(dup.is_null(), "duplicate device name 'test1' must be rejected");
     info!("cancel test (c): PASSED");
 }
 
-static STATE_TEST_DEV: Once<DeviceHandleK> = Once::new();
+static STATE_TEST_DEV: Once<OpenDeviceHandle> = Once::new();
 static STATE_TEST_RUN: AtomicBool = AtomicBool::new(false);
 static REJECTED_DURING_STOPPED: AtomicUsize = AtomicUsize::new(0);
 static SUCCESS_AFTER_START: AtomicUsize = AtomicUsize::new(0);
 static REJECTED_AFTER_REMOVE: AtomicUsize = AtomicUsize::new(0);
 
-fn state_test_handle() -> DeviceHandleK {
+fn state_test_handle() -> OpenDeviceHandle {
     STATE_TEST_DEV.get().expect("state test device handle not initialised").clone()
 }
 

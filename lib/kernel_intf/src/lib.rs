@@ -142,11 +142,12 @@ unsafe extern "C" {
     pub fn heap_dealloc_ffi(ptr: *mut u8, size: usize, align: usize) -> KError;
     pub fn panic_router(mod_name: StrRef, info: StrRef) -> !;
     pub fn io_create_device(
-        driver_id: usize, 
-        name: StrRef, 
-        ctx: *mut core::ffi::c_void, 
-        parent: *const driver::DeviceObject) 
-    -> *mut driver::DeviceObject;
+        driver_id: usize,
+        name: StrRef,
+        ctx: *mut core::ffi::c_void,
+        parent: *const driver::DeviceObject,
+        is_class: bool,
+    ) -> *mut driver::DeviceObject;
 
     fn io_send_request_ffi(
         device: *const driver::DeviceObject,
@@ -155,12 +156,20 @@ unsafe extern "C" {
         buf_base: usize,
         buf_size: usize,
         offset: usize,
+        req_info_ptr: *const driver::ReqInfo,
         completion: Option<extern "C" fn(*const driver::IrpResult, *mut core::ffi::c_void)>,
         completion_ctx: *mut core::ffi::c_void
     ) -> driver::Status;
-    
+
+    fn tty_print_ffi(s: *const u8, len: usize);
+    fn enable_tty_mode_ffi();
+    fn disable_tty_mode_ffi();
+
     fn io_complete_irp_ffi(irp: *mut driver::Irp, status: driver::Status);
     pub fn io_get_driver_id(device: *const driver::DeviceObject) -> usize;
+    fn io_start_device_ffi(device: *const driver::DeviceObject) -> driver::Status;
+    fn io_stop_device_ffi(device: *const driver::DeviceObject) -> driver::Status;
+    fn io_remove_device_ffi(device: *const driver::DeviceObject) -> driver::Status;
     pub fn io_invalidate_device(device: *const driver::DeviceObject) -> driver::Status;
     fn io_set_cancel_routine_ffi(
         irp: *mut driver::Irp,
@@ -317,8 +326,33 @@ pub fn io_send_request(
     buf_base: usize,
     buf_size: usize,
     offset: usize,
+    req_info_ptr: *const driver::ReqInfo,
     completion: Option<extern "C" fn(*const driver::IrpResult, *mut core::ffi::c_void)>,
     completion_ctx: *mut core::ffi::c_void
 ) -> driver::Status {
-    unsafe { io_send_request_ffi(device, major, minor, buf_base, buf_size, offset, completion, completion_ctx) }
+    unsafe { io_send_request_ffi(device, major, minor, buf_base, buf_size, offset, req_info_ptr, completion, completion_ctx) }
+}
+
+pub fn io_start_device(device: *const driver::DeviceObject) -> driver::Status {
+    unsafe { io_start_device_ffi(device) }
+}
+
+pub fn io_stop_device(device: *const driver::DeviceObject) -> driver::Status {
+    unsafe { io_stop_device_ffi(device) }
+}
+
+pub fn io_remove_device(device: *const driver::DeviceObject) -> driver::Status {
+    unsafe { io_remove_device_ffi(device) }
+}
+
+pub fn enable_tty_mode() {
+    unsafe { enable_tty_mode_ffi(); }
+}
+
+pub fn disable_tty_mode() {
+    unsafe { disable_tty_mode_ffi(); }
+}
+
+pub fn tty_print(s: &str) {
+    unsafe { tty_print_ffi(s.as_ptr(), s.len()); }
 }

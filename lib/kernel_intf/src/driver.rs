@@ -8,9 +8,12 @@ pub const EMPTY_REGION: MemoryRegion = MemoryRegion { base_address: 0, size: 0 }
 #[repr(usize)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IrpMajor {
-    Read = 0,
-    Write = 1,
-    Pnp = 2
+    Read    = 0,
+    Write   = 1,
+    Pnp     = 2,
+    Control = 3,
+    Open    = 4,
+    Close   = 5,
 }
 
 impl IrpMajor {
@@ -19,6 +22,9 @@ impl IrpMajor {
             0 => Some(Self::Read),
             1 => Some(Self::Write),
             2 => Some(Self::Pnp),
+            3 => Some(Self::Control),
+            4 => Some(Self::Open),
+            5 => Some(Self::Close),
             _ => None
         }
     }
@@ -27,12 +33,13 @@ impl IrpMajor {
 #[repr(usize)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IrpMinor {
-    None = 0,
-    Enumerate = 1,
-    Query = 2,
-    Start = 3,
-    Stop = 4,
-    Remove = 5
+    None                    = 0,
+    Enumerate               = 1,
+    Query                   = 2,
+    Start                   = 3,
+    Stop                    = 4,
+    Remove                  = 5,
+    RegisterKeyboardHandler = 6,
 }
 
 impl IrpMinor {
@@ -44,6 +51,7 @@ impl IrpMinor {
             3 => Some(Self::Start),
             4 => Some(Self::Stop),
             5 => Some(Self::Remove),
+            6 => Some(Self::RegisterKeyboardHandler),
             _ => None
         }
     }
@@ -52,11 +60,41 @@ impl IrpMinor {
 #[repr(isize)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Status {
-    Success = 0,
-    Pending = 1,
-    Failed = -1,
+    Success     =  0,
+    Pending     =  1,
+    Failed      = -1,
     Unsupported = -2,
-    Cancelled = -3
+    Cancelled   = -3
+}
+
+// Raw keystroke produced by i8042 and forwarded to the input driver.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Keystroke {
+    pub scancode: u8,
+    pub ascii:    u8,   // 0 if modifier / unmapped key
+    pub flags:    u8,   // bit 0 = key-release
+}
+
+pub type KeystrokeHandler =
+    unsafe extern "C" fn(*const Keystroke, count: usize, ctx: *mut c_void);
+
+// Carried in req_info for Control / RegisterKeyboardHandler IRPs.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RegisterHandlerInfo {
+    pub handler: KeystrokeHandler,
+    pub context: *mut c_void,
+}
+
+// Request-specific parameters placed on the IRP before dispatch.
+// Drivers read the relevant variant based on the major/minor code they handle.
+// Must remain FFI-safe: all variants are #[repr(C)] and Copy.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union ReqInfo {
+    pub _unused:          [usize; 2],
+    pub register_handler: RegisterHandlerInfo,
 }
 
 #[repr(C)]
@@ -65,6 +103,7 @@ pub struct Irp {
     pub minor_code: IrpMinor,
     pub buffer: MemoryRegion,
     pub offset: usize,
+    pub req_info: ReqInfo,
     pub status: Status,
     pub bytes_completed: usize,
     pub completion_routine: extern "C" fn(*mut Irp, *mut c_void),
@@ -119,6 +158,7 @@ impl Irp {
             minor_code: IrpMinor::None,
             buffer,
             offset,
+            req_info: unsafe { core::mem::zeroed() },
             status: Status::Pending,
             bytes_completed: 0,
             completion_routine,
@@ -152,19 +192,25 @@ pub type AddDispatch = unsafe extern "C" fn(*const DriverObject, *const DeviceOb
 
 #[repr(C)]
 pub struct DispatchTable {
-    pub dispatch_add: Option<AddDispatch>,
-    pub dispatch_read: Option<DeviceDispatch>,
-    pub dispatch_write: Option<DeviceDispatch>,
-    pub dispatch_pnp: Option<DeviceDispatch>
+    pub dispatch_add:     Option<AddDispatch>,
+    pub dispatch_read:    Option<DeviceDispatch>,
+    pub dispatch_write:   Option<DeviceDispatch>,
+    pub dispatch_pnp:     Option<DeviceDispatch>,
+    pub dispatch_control: Option<DeviceDispatch>,
+    pub dispatch_open:    Option<DeviceDispatch>,
+    pub dispatch_close:   Option<DeviceDispatch>,
 }
 
 impl DispatchTable {
     pub const fn new() -> Self {
         Self {
-            dispatch_add: None,
-            dispatch_read: None,
-            dispatch_write: None,
-            dispatch_pnp: None
+            dispatch_add:     None,
+            dispatch_read:    None,
+            dispatch_write:   None,
+            dispatch_pnp:     None,
+            dispatch_control: None,
+            dispatch_open:    None,
+            dispatch_close:   None,
         }
     }
 
@@ -189,6 +235,18 @@ impl DispatchTable {
 
     pub fn invoke_pnp(&self, device: *const DeviceObject, irp: *mut Irp) -> Status {
         Self::invoke_device(self.dispatch_pnp, device, irp)
+    }
+
+    pub fn invoke_control(&self, device: *const DeviceObject, irp: *mut Irp) -> Status {
+        Self::invoke_device(self.dispatch_control, device, irp)
+    }
+
+    pub fn invoke_open(&self, device: *const DeviceObject, irp: *mut Irp) -> Status {
+        Self::invoke_device(self.dispatch_open, device, irp)
+    }
+
+    pub fn invoke_close(&self, device: *const DeviceObject, irp: *mut Irp) -> Status {
+        Self::invoke_device(self.dispatch_close, device, irp)
     }
 
     pub fn invoke_add(&self, driver: *const DriverObject, pdo: *const DeviceObject) -> Status {
@@ -240,21 +298,24 @@ pub fn create_device_by_id(
     driver_id: usize,
     name: Option<&'static str>,
     ctx: *mut c_void,
-    parent: Option<&DeviceObject>
+    parent: Option<&DeviceObject>,
+    is_class: bool,
 ) -> *mut DeviceObject {
     let name = name.map_or(StrRef::from_str(""), StrRef::from_str);
     let parent = parent.map(|p| p as *const DeviceObject).unwrap_or(core::ptr::null());
-    unsafe { super::io_create_device(driver_id, name, ctx, parent) }
+    unsafe { super::io_create_device(driver_id, name, ctx, parent, is_class) }
 }
 
 pub fn create_device(
     driver: &DriverObject,
     name: Option<&'static str>,
     ctx: *mut c_void,
-    parent: Option<&DeviceObject>
+    parent: Option<&DeviceObject>,
+    is_class: bool,
 ) -> *mut DeviceObject {
-    create_device_by_id(driver.id, name, ctx, parent)
+    create_device_by_id(driver.id, name, ctx, parent, is_class)
 }
+
 
 #[repr(C)]
 pub struct DriverObject {

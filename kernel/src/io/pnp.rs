@@ -144,5 +144,8 @@ extern "C" fn pnp_worker() -> ! {
 
 pub fn start_worker() {
     PNP_SIGNAL.call_once(|| KEvent::new(true));
-    sched::create_thread(pnp_worker, core::ptr::null_mut()).expect("Failed to spawn PnP worker thread");
+    sched::create_system_thread(
+        pnp_worker, 
+        core::ptr::null_mut()
+    ).expect("Failed to spawn PnP worker thread");
 }

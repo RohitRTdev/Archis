@@ -137,10 +137,13 @@ pub fn dispatch_handler(
     _attr: TokenStream,
     item: TokenStream
 ) -> TokenStream {
-    const DEVICE_HANDLERS: [&str; 3] = [
+    const DEVICE_HANDLERS: [&str; 6] = [
         "dispatch_read",
         "dispatch_write",
-        "dispatch_pnp"
+        "dispatch_pnp",
+        "dispatch_control",
+        "dispatch_open",
+        "dispatch_close",
     ];
 
     let func = parse_macro_input!(item as ItemFn);
@@ -171,7 +174,7 @@ pub fn dispatch_handler(
     if !DEVICE_HANDLERS.contains(&name.as_str()) {
         return syn::Error::new_spanned(
             &func.sig.ident,
-            "Handler name must be one of: dispatch_add, dispatch_read, dispatch_write, dispatch_pnp"
+            "Handler name must be one of: dispatch_add, dispatch_read, dispatch_write, dispatch_pnp, dispatch_control, dispatch_open, dispatch_close"
         )
         .to_compile_error()
         .into();
