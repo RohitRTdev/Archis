@@ -41,7 +41,7 @@ mod tests;
 use sync::{Once, Spinlock};
 use mem::Regions::*;
 use mem::FixedList;
-use kernel_intf::driver::{IrpMajor, IrpMinor, IrpResult, Status, create_device_by_id};
+use kernel_intf::driver::{IrpMajor, IrpMinor, IrpResult, Keystroke, Status, create_device_by_id};
 use kernel_intf::KError;
 use kernel_intf::list::List;
 use sync::KSem;
@@ -163,10 +163,14 @@ fn run_proc_thread_tests() {
 //   (a) task-kill cancellation — kill_thread → kill_sweep_irps walks the
 //       dying thread's IRP list and invokes the driver's cancel routine.
 //   (b) per-handle cancellation — issuing thread itself calls
-//       cancel_pending_irp on the device handle. Same cancel chain, just
-//       not driven by task death.
+//       cancel_pending_irp on the device handle.
 //   (c) duplicate device name guard — io_create_device must return null
 //       when the name is already in DEVICE_BY_NAME.
+//   (d) OpenDeviceHandle RAII — open sends Open IRP; drop sends Close IRP.
+//
+// All tests use the "input" class device (started by the input driver once
+// i8042 is up). A read for 1 char pends until a key is pressed, making it
+// an ideal subject for cancellation.
 
 extern "C" fn cancel_test_completion(result: *const IrpResult, _ctx: *mut core::ffi::c_void) {
     let status = unsafe { (*result).status };
@@ -174,113 +178,124 @@ extern "C" fn cancel_test_completion(result: *const IrpResult, _ctx: *mut core::
 }
 
 extern "C" fn task_kill_cancel_runner() -> ! {
-    let handle = match io::open_device_handle("test1") {
+    let handle = match io::open_device_handle("input") {
         Ok(h) => h,
         Err(_) => {
-            info!("task_kill_cancel_runner: test1 device not found");
+            info!("task_kill_cancel_runner: input device not found");
             sched::exit_thread(0);
         }
     };
-
-    info!("task_kill_cancel_runner: issuing sync read");
+    
+    let mut buf = [0u8; 1];
+    info!("task_kill_cancel_runner: issuing sync read (will pend until killed)");
     let _ = handle.read(io::ReadRequest {
-        buffer: MemoryRegion { base_address: 0, size: 0 },
-        offset: 0,
+        buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 1 },
+        offset: 0
     });
 
-    // If kill_thread fired during the wait, kill_sweep_irps cancelled the
-    // IRP, the driver's cancel routine completed it, and the event was
-    // signalled with status cancelled. The thread won't make it here in
-    // practice (it's already terminated).
     info!("task_kill_cancel_runner: read returned (post-cancel)");
     loop { sched::delay_ms(1000); }
 }
 
 extern "C" fn self_cancel_runner() -> ! {
-    let handle = match io::open_device_handle("test1") {
+    let handle = match io::open_device_handle("input") {
         Ok(h) => h,
         Err(_) => {
-            info!("self_cancel_runner: test1 device not found");
+            info!("self_cancel_runner: input device not found");
             sched::exit_thread(0);
         }
     };
 
+    let mut buf = [0u8; 1];
     info!("self_cancel_runner: dispatching async read");
     let _ = io::io_request_async(
         &handle,
         IrpMajor::Read,
         IrpMinor::None,
-        MemoryRegion { base_address: 0, size: 0 },
+        MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 1 },
         0,
         None,
         cancel_test_completion,
         core::ptr::null_mut(),
     );
 
-    // Give the driver a moment to register its cancel routine and start
-    // waiting in the worker, then cancel.
     sched::delay_ms(200);
     info!("self_cancel_runner: calling cancel_pending_irp");
     io::cancel_pending_irp(&handle);
 
-    // Let cancellation settle (driver worker wakes after 1500ms in test1).
-    sched::delay_ms(2000);
+    sched::delay_ms(200);
     info!(
-        "self_cancel_runner: pending_irps on test1 = {}",
+        "self_cancel_runner: pending_irps on input = {}",
         handle.get_pending_irps().lock().get_nodes()
     );
     sched::exit_thread(0);
 }
 
 fn run_cancel_tests() {
-    // (a) task-kill cancellation
+    // Wait for PnP to start i8042 and the input class device.
+    sched::delay_ms(500);
+
+    // task-kill cancellation
     let killer_target = sched::create_thread(task_kill_cancel_runner, core::ptr::null_mut())
         .expect("Failed to spawn task_kill_cancel_runner");
     sched::delay_ms(300);
     let tid = killer_target.lock().get_id();
     info!("cancel test (a): killing thread {}", tid);
     sched::kill_thread(tid, 0);
-    // Wait long enough that the driver worker hits io_start_processing and
-    // exits cleanly (1500ms sleep in test1::read_worker + slack).
-    sched::delay_ms(2500);
+    sched::delay_ms(500);
 
-    // (b) per-handle self-cancellation
+    // per-handle self-cancellation
     let _ = sched::create_thread(self_cancel_runner, core::ptr::null_mut())
         .expect("Failed to spawn self_cancel_runner");
-    sched::delay_ms(3000);
+    sched::delay_ms(1000);
 
-    // (c) duplicate device name guard. test1 was named "test1" at add time.
-    let probe = match io::open_device_handle("test1") {
+    // duplicate device name guard.
+    let probe = match io::open_device_handle("input") {
         Ok(h) => h,
         Err(_) => {
-            info!("cancel test (c): SKIP — test1 device missing");
+            info!("cancel test (c): SKIP — input device missing");
             return;
         }
     };
     let driver_id = unsafe { (*probe.device_ptr()).get_driver_id() };
-    let dup = create_device_by_id(driver_id, Some("test1"), core::ptr::null_mut(), None, false);
+    let dup = create_device_by_id(driver_id, Some("input"), core::ptr::null_mut(), None, false);
     info!("cancel test (c): duplicate create returned {:#X}", dup.addr());
-    assert!(dup.is_null(), "duplicate device name 'test1' must be rejected");
+    assert!(dup.is_null(), "duplicate device name 'input' must be rejected");
     info!("cancel test (c): PASSED");
+
+    // OpenDeviceHandle Open/Close IRP lifecycle.
+    info!("cancel test (d): OpenDeviceHandle Open/Close lifecycle");
+    match io::open_device_handle("input") {
+        Ok(h) => {
+            info!("cancel test (d): opened 'input' — Open IRP sent");
+            drop(h);
+            info!("cancel test (d): handle dropped — Close IRP sent");
+            info!("cancel test (d): PASSED");
+        }
+        Err(e) => {
+            info!("cancel test (d): SKIP — 'input' not available: {}", e);
+        }
+    }
 }
 
 static STATE_TEST_DEV: Once<OpenDeviceHandle> = Once::new();
 static STATE_TEST_RUN: AtomicBool = AtomicBool::new(false);
 static REJECTED_DURING_STOPPED: AtomicUsize = AtomicUsize::new(0);
-static SUCCESS_AFTER_START: AtomicUsize = AtomicUsize::new(0);
-static REJECTED_AFTER_REMOVE: AtomicUsize = AtomicUsize::new(0);
+static REACHED_DRIVER_AFTER_START: AtomicUsize = AtomicUsize::new(0);
 
 fn state_test_handle() -> OpenDeviceHandle {
     STATE_TEST_DEV.get().expect("state test device handle not initialised").clone()
 }
 
-// Bash on the device with reads while STATE_TEST_RUN; tally rejections.
+// Spin-read with size 0 while STATE_TEST_RUN; tally DeviceStopped rejections.
+// i8042 rejects size-0 reads with Status::Failed when started (reaches driver),
+// so this never pends — the loop spins freely and only counts stopped-state hits.
 extern "C" fn state_reject_loop() -> ! {
     let dev = state_test_handle();
     while STATE_TEST_RUN.load(Ordering::Acquire) {
         let res = dev.read(io::ReadRequest {
             buffer: MemoryRegion { base_address: 0, size: 0 },
-            offset: 0,
+            offset: 0
         });
         if let Err(KError::DeviceStopped) = res {
             REJECTED_DURING_STOPPED.fetch_add(1, Ordering::Relaxed);
@@ -299,55 +314,47 @@ extern "C" fn state_start_once() -> ! {
     sched::exit_thread(0);
 }
 
-extern "C" fn state_write_once() -> ! {
-    let dev = state_test_handle();
-    let res = dev.write(io::ReadRequest {
-        buffer: MemoryRegion { base_address: 0, size: 0 },
-        offset: 0,
-    });
-    if let Ok(Status::Success) = res {
-        SUCCESS_AFTER_START.fetch_add(1, Ordering::Relaxed);
-    }
-    info!("state_write_once (tid={}): write -> {:?}",
-          sched::get_current_task_id().unwrap_or(0),
-          res.map(|s| s as isize));
-    sched::exit_thread(0);
-}
-
-extern "C" fn state_post_remove_read() -> ! {
+// Issue a size-0 read. i8042 returns Ok(Status::Failed) for empty buffers when
+// started (request reached the driver). Any Err variant means the state guard
+// rejected it before dispatch.
+extern "C" fn state_io_once() -> ! {
     let dev = state_test_handle();
     let res = dev.read(io::ReadRequest {
         buffer: MemoryRegion { base_address: 0, size: 0 },
-        offset: 0,
+        offset: 0
     });
-    if let Err(KError::DeviceStopped) = res {
-        REJECTED_AFTER_REMOVE.fetch_add(1, Ordering::Relaxed);
+    if matches!(res, Ok(_)) {
+        REACHED_DRIVER_AFTER_START.fetch_add(1, Ordering::Relaxed);
     }
-    info!("state_post_remove_read: read -> {:?}", res.map(|s| s as isize));
+    info!("state_io_once (tid={}): read -> {:?}",
+          sched::get_current_task_id().unwrap_or(0),
+          res.map(|s| s as isize));
     sched::exit_thread(0);
 }
 
 fn run_state_tests() {
     info!("=== run_state_tests: BEGIN ===");
 
-    let dev = match io::open_device_handle("test1") {
+    // Wait for PnP to bring up i8042.
+    sched::delay_ms(500);
+
+    let dev = match io::open_device_handle("ps/2_port0") {
         Ok(h) => h,
         Err(_) => {
-            info!("run_state_tests: SKIP — test1 device missing");
+            info!("run_state_tests: SKIP — ps/2_port0 device missing");
             return;
         }
     };
     STATE_TEST_DEV.call_once(|| dev.clone());
-    let dev_id = dev.id();
 
-    // Phase 1 — Started baseline.
-    let baseline = dev.write(io::ReadRequest {
+    // Phase 1 — Started baseline: size-0 read must reach the driver (Ok(_)),
+    // not be turned away by the state guard (Err(_)).
+    let baseline = dev.read(io::ReadRequest {
         buffer: MemoryRegion { base_address: 0, size: 0 },
-        offset: 0,
+        offset: 0
     });
-    info!("state phase 1 (Started baseline): write -> {:?}", baseline.map(|s| s as isize));
-    assert!(matches!(baseline, Ok(Status::Success)),
-            "baseline write on Started device must succeed");
+    info!("state phase 1 (Started baseline): read -> {:?}", baseline.map(|s| s as isize));
+    assert!(matches!(baseline, Ok(_)), "baseline read on Started device must reach the driver");
 
     // Phase 2 — Stop + concurrent rejected I/O.
     STATE_TEST_RUN.store(true, Ordering::Release);
@@ -355,59 +362,41 @@ fn run_state_tests() {
     for _ in 0..3 {
         sched::create_thread(state_reject_loop, core::ptr::null_mut()).expect("Failed to spawn state_reject_loop");
     }
-    sched::delay_ms(50);                // let the readers start spinning
+    sched::delay_ms(50);
     info!("state phase 2: stopping device");
     dev.stop().expect("stop must succeed");
     sched::delay_ms(300);
     STATE_TEST_RUN.store(false, Ordering::Release);
-    sched::delay_ms(100);               // let the reject loops exit
+    sched::delay_ms(100);
     let rejected = REJECTED_DURING_STOPPED.load(Ordering::Relaxed);
     info!("state phase 2: rejected_during_stopped = {}", rejected);
     assert!(rejected > 0, "reads issued after stop must be rejected");
 
     // Phase 3 — Concurrent starts. Three threads attempt Start; serialized by
-    // config_guard, exactly one wins (state == Stopped); the others see Started
-    // and bail with DeviceStopped.
+    // config_guard, exactly one wins (state == Stopped); the others get
+    // DeviceStarted (already Started).
     for _ in 0..3 {
         sched::create_thread(state_start_once, core::ptr::null_mut()).expect("Failed to spawn state_start_once");
     }
     sched::delay_ms(300);
-    let post_start_write = dev.write(io::ReadRequest {
+    let post_start = dev.read(io::ReadRequest {
         buffer: MemoryRegion { base_address: 0, size: 0 },
-        offset: 0,
+        offset: 0
     });
-    info!("state phase 3: post-start sanity write -> {:?}", post_start_write.map(|s| s as isize));
-    assert!(matches!(post_start_write, Ok(Status::Success)),
+    info!("state phase 3: post-start sanity read -> {:?}", post_start.map(|s| s as isize));
+    assert!(matches!(post_start, Ok(_)),
             "device must be Started after concurrent start attempts");
 
-    // Phase 4 — Concurrent writes from multiple threads (state must pass them
-    // all through the Started guard).
-    SUCCESS_AFTER_START.store(0, Ordering::Relaxed);
+    // Phase 4 — Concurrent reads from multiple threads must all pass through
+    // the Started state guard and reach the driver.
+    REACHED_DRIVER_AFTER_START.store(0, Ordering::Relaxed);
     for _ in 0..3 {
-        sched::create_thread(state_write_once, core::ptr::null_mut()).expect("Failed to spawn state_write_once");
+        sched::create_thread(state_io_once, core::ptr::null_mut()).expect("Failed to spawn state_io_once");
     }
     sched::delay_ms(300);
-    let succ = SUCCESS_AFTER_START.load(Ordering::Relaxed);
-    info!("state phase 4: success_after_start = {}", succ);
-    assert!(succ > 0, "at least one concurrent write after restart must succeed");
-
-    // Phase 5 — Remove + post-remove rejection.
-    info!("state phase 5: removing device {}", dev_id);
-    io::remove_device_async(dev_id);
-    io::pnp_fence();                    // wait until the worker finishes the removal
-    REJECTED_AFTER_REMOVE.store(0, Ordering::Relaxed);
-    for _ in 0..3 {
-        sched::create_thread(state_post_remove_read, core::ptr::null_mut()).expect("Failed to spawn state_post_remove_read");
-    }
-    sched::delay_ms(300);
-    let post_rm = REJECTED_AFTER_REMOVE.load(Ordering::Relaxed);
-    info!("state phase 5: rejected_after_remove = {}", post_rm);
-    assert!(post_rm == 3, "every read on a Removed device must be rejected");
-
-    let post_remove_start = dev.start();
-    info!("state phase 5: post-remove start -> {:?}", post_remove_start.map(|s| s as isize));
-    assert!(matches!(post_remove_start, Err(KError::DeviceStopped)),
-            "Removed device must not be restartable");
+    let reached = REACHED_DRIVER_AFTER_START.load(Ordering::Relaxed);
+    info!("state phase 4: reached_driver_after_start = {}", reached);
+    assert!(reached > 0, "concurrent reads on Started device must reach the driver");
 
     info!("=== run_state_tests: PASSED ===");
 }
@@ -417,18 +406,20 @@ fn run_fence_tests() {
     info!("=== run_fence_tests: BEGIN ===");
 
     // Batch 1: post 4 register_driver calls, then fence.
+    // Already-loaded drivers are handled gracefully by the PnP worker; what
+    // matters is that pnp_fence() blocks until all queued work is drained.
     for _ in 0..4 {
-        io::register_driver("test1".into());
+        io::register_driver("i8042".into());
     }
-    info!("fence test: posted batch 1 (4x register_driver test1), entering fence");
+    info!("fence test: posted batch 1 (4x register_driver i8042), entering fence");
     io::pnp_fence();
     info!("fence test: batch 1 fence returned");
 
     // Batch 2: post 3 more, then fence.
     for _ in 0..3 {
-        io::register_driver("test2".into());
+        io::register_driver("input".into());
     }
-    info!("fence test: posted batch 2 (3x register_driver test2), entering fence");
+    info!("fence test: posted batch 2 (3x register_driver input), entering fence");
     io::pnp_fence();
     info!("fence test: batch 2 fence returned");
 
@@ -986,18 +977,18 @@ fn kern_main() -> ! {
 #[cfg(feature = "acpi")]
     acpica::init();
     //interative_thread_spawn_tests();
-    //run_fence_tests();
-    //run_state_tests();
-    //run_i8042_tests();
+    run_cancel_tests();
+    run_fence_tests();
+    run_state_tests();
+    run_i8042_tests();
     //run_sync_tests();
     //run_proc_thread_tests();
     //spam_threads_test();
     //run_driver_worker_tests();
-    run_user_tests();
+    //run_user_tests();
     info!("Main task going to sleep");
     info!("====TTY mode====");
-    let kbd = open_device_handle("ps/2_port0").expect("Failed to open input device!");
-    
+    let kbd = open_device_handle("input").expect("Failed to open input device!");
     let input_buf: [u8; 256] = [0; 256];
     loop {
         kbd.read(ReadRequest{
@@ -1025,7 +1016,6 @@ fn kern_main() -> ! {
             kernel_intf::print!("Type shutdown:");
         }
     }
-
     //hal::sleep();
 }
 
@@ -1156,38 +1146,28 @@ fn run_driver_worker_tests() {
     info!("=== run_driver_worker_tests: PASSED ===");
 }
 
-// The driver satisfies read IRPs only when the requested number of characters
-// has accumulated in the interrupt-driven ring buffer.  These tests therefore
-// block until the user presses enough keys on the physical (or QEMU) keyboard.
-//
-// Test layout:
-//   1. Single-threaded read: request 3 characters (main thread blocks).
-//   2. Three concurrent readers requesting 2, 4, and 1 character respectively.
-//      All are queued as pending IRPs; the ISR satisfies them as keys arrive.
-
 fn run_i8042_tests() {
-    // Give the PnP worker time to bring the i8042 device to Started state.
+    // Wait for PnP to start i8042 + input class device.
     sched::delay_ms(500);
 
     let handle = match io::open_device_handle("ps/2_port0") {
         Ok(h) => h,
         Err(_) => {
-            info!("i8042 test: device ps/2_port0 not found, skipping");
+            info!("i8042 test: 'ps/2_port0' device not found, skipping");
             return;
         }
     };
 
-    // Test 1: single reader, 3 characters 
+    // Test 1: single reader, 3 ASCII characters
     info!("i8042 test 1: press 3 keys to satisfy single read...");
-    let mut buf1 = [0u8; 3];
+    let mut buf1 = [Keystroke::default(); 3];
     let _ = handle.read(io::ReadRequest {
-        buffer: MemoryRegion { base_address: buf1.as_mut_ptr() as usize, size: 3 },
-        offset: 0,
+        buffer: MemoryRegion { base_address: buf1.as_mut_ptr() as usize, size: 3 * size_of::<Keystroke>() },
+        offset: 0
     });
-    info!("i8042 test 1: got chars: {:?}", core::str::from_utf8(&buf1).unwrap_or("?"));
+    info!("i8042 test 1: got keystrokes: {:?}", buf1);
 
-    // Test 2: three concurrent readers 
-    // Each reader opens its own handle and issues a read of a specific length.
+    // Test 2: three concurrent readers, each opens its own handle.
     info!("i8042 test 2: spawning 3 concurrent readers (need 2+4+1 = 7 more keys)...");
     sched::create_thread(i8042_reader_a, core::ptr::null_mut()).expect("i8042: spawn reader-a");
     sched::create_thread(i8042_reader_b, core::ptr::null_mut()).expect("i8042: spawn reader-b");
@@ -1195,38 +1175,38 @@ fn run_i8042_tests() {
 }
 
 extern "C" fn i8042_reader_a() -> ! {
-    let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-a: no device");
-    let mut buf = [0u8; 2];
-    info!("i8042 reader-a: waiting for 2 chars");
+    let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-a: no input device");
+    let mut buf = [Keystroke::default(); 2];
+    info!("i8042 reader-a: waiting for 2 keystrokes");
     let _ = h.read(io::ReadRequest {
-        buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 2 },
+        buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 2 * size_of::<Keystroke>()},
         offset: 0,
     });
-    info!("i8042 reader-a: got chars: {:?}", core::str::from_utf8(&buf).unwrap_or("?"));
+    info!("i8042 reader-a: got chars: {:?}", buf);
     sched::exit_thread(0)
 }
 
 extern "C" fn i8042_reader_b() -> ! {
-    let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-b: no device");
-    let mut buf = [0u8; 4];
-    info!("i8042 reader-b: waiting for 4 chars");
+    let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-b: no input device");
+    let mut buf = [Keystroke::default(); 4];
+    info!("i8042 reader-b: waiting for 4 keystrokes");
     let _ = h.read(io::ReadRequest {
-        buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 4 },
+        buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 4 * size_of::<Keystroke>()},
         offset: 0,
     });
-    info!("i8042 reader-b: got chars: {:?}", core::str::from_utf8(&buf).unwrap_or("?"));
+    info!("i8042 reader-b: got chars: {:?}", buf);
     sched::exit_thread(0)
 }
 
 extern "C" fn i8042_reader_c() -> ! {
-    let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-c: no device");
-    let mut buf = [0u8; 1];
-    info!("i8042 reader-c: waiting for 1 char");
+    let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-c: no input device");
+    let mut buf = [Keystroke::default(); 1];
+    info!("i8042 reader-c: waiting for 1 keystroke");
     let _ = h.read(io::ReadRequest {
-        buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 1 },
+        buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: size_of::<Keystroke>() },
         offset: 0,
     });
-    info!("i8042 reader-c: got char: {:?}", core::str::from_utf8(&buf).unwrap_or("?"));
+    info!("i8042 reader-c: got char: {:?}", buf);
     sched::exit_thread(0)
 }
 

@@ -214,7 +214,7 @@ impl<T, A: Allocator<ListNode<T>>> List<T, A> {
     pub fn insert_node_at_head(&mut self, this: NonNull<ListNode<T>>) {
         self.insert_node(this, false);
     }
-    
+
     pub fn pop_head(&mut self) {
         if let Some(node) = self.head {
             unsafe {

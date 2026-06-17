@@ -150,24 +150,18 @@ impl Process {
         self.threads.add_node(thread_id)
     }
 
-    pub fn remove_thread(&mut self, thread_id: usize, exit_code: isize) -> bool {
+    // Returns cleanup_work if this was last thread that removed itself from this process
+    pub fn remove_thread(&mut self, thread_id: usize, exit_code: isize) -> Option<ProcessCleanupWork> {
         self.threads.find_and_remove(|t| {*t == thread_id});
         crate::sched_log!("Remove thread called with id {}", thread_id);
 
-        if self.status == ProcessStatus::Terminated {
-            return self.threads.get_nodes() == 0;
-        }
-
-        // This happens when all the threads in the process via 
-        // individual kill_thread calls instead of calling
-        // kill_process directly
+        // Run the cleanup for this process once the last thread dies 
         if self.threads.get_nodes() == 0 {
-            self.exit_code.store(exit_code, Ordering::Relaxed);
-            self.destroy_process();
-            return true;
+            Some(self.destroy_process(exit_code))
         }
-
-        false
+        else {
+            None
+        }
     }
 
     pub fn get_first_task(&self) -> Option<usize> {
@@ -202,10 +196,33 @@ impl Process {
         }
     }
 
-    fn destroy_process(&mut self) {
-        self.status = ProcessStatus::Terminated;
+    fn destroy_process(&mut self, exit_code: isize) -> ProcessCleanupWork {
+        // If kill/exit_process wasn't called, the 
+        // exit code will be same as exit code passed
+        // to the last killed thread
+        if self.status != ProcessStatus::Terminated {
+            self.exit_code.store(exit_code, Ordering::Relaxed);
+            self.status = ProcessStatus::Terminated;
+        }
         PROCESSES.lock().remove(&self.id);
+        
+        // This function is called in critical section
+        // We want the cleanup code to execute in lock free code
+        // So we submit to dedicated reaper system thread
+        let work = ProcessCleanupWork::new(
+            self.id,
+            self.addr_space,
+            core::mem::take(&mut self.memory_list),
+            core::mem::take(&mut self.file_table)
+        );
+
+        // Its fine to clear this here since these are just weak pointers
+        // It will only decrement the weak ref count and not run any destructor code
+        self.user_modules.clear();
         crate::sched_log!("Called destroy process {}", self.id);
+
+        // We will tell scheduler to enqueue this work item (no deadlock risk)
+        work
     }
 
     pub fn get_num_handles(&self) -> usize {
@@ -293,13 +310,6 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         crate::sched_log!("Dropping process {}", self.id);
-
-        let work = ProcessCleanupWork {
-            addr_space:  self.addr_space,
-            memory_list: core::mem::take(&mut self.memory_list),
-            handles:     core::mem::take(&mut self.file_table)
-        };
-        enqueue_cleanup(work);
     }
 }
 
@@ -484,6 +494,7 @@ pub fn kill_process(proc_id: usize, exit_code: isize) {
         guard.threads.clone()
     };
 
+    drop(proc);
     crate::sched_log!("Killing process {}", proc_id);
 
     let is_idle_task = cur_task_id.is_none();
@@ -504,14 +515,10 @@ pub fn kill_process(proc_id: usize, exit_code: isize) {
         }
     }
 
-    proc.lock().destroy_process();
-
     enable_preemption();
 
     // Kill the current thread last
     if is_exit {
-        // Drop it explicitly since we are not going to return from this call
-        drop(proc);
         sched::kill_thread(cur_task_id, exit_code);
     }
 }

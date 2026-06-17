@@ -6,7 +6,8 @@ extern crate alloc;
 mod log;
 pub use log::*;
 pub mod mem;
-pub mod list;
+pub mod ds;
+pub use ds::list;
 pub mod driver;
 use core::{ffi::c_void, fmt};
 use common::StrRef;
@@ -34,7 +35,9 @@ pub enum KError {
     ModuleNotDriver,
     DriverLoadFailed,
     Unsupported,
-    DeviceStopped
+    DeviceStopped,
+    DeviceRemoved,
+    DeviceStarted
 }
 
 pub const E_SUCCESS: i64 = 0;
@@ -46,6 +49,8 @@ pub const E_DEV_STOPPED: i64 = -5;
 pub const E_INVALID_MEMORY_RANGE: i64 = -6;
 pub const E_PROCESS_TERMINATED: i64 = -7;
 pub const E_NOPERM: i64 = -8;
+pub const E_DEV_REMOVED: i64 = -9;
+pub const E_DEV_STARTED: i64 = -10;
 
 impl<T> From<Result<T, KError>> for KError {
     fn from(e: Result<T, KError>) -> Self {
@@ -61,8 +66,10 @@ impl From<KError> for i64 {
             KError::OutOfMemory => E_OOM,
             KError::Unsupported => E_NOT_SUPPORTED,
             KError::DeviceStopped => E_DEV_STOPPED,
-            KError::ProcessTerminated => E_PROCESS_TERMINATED, 
-            KError::WaitFailed | KError::CircularDependency | KError::DriverLoadFailed | 
+            KError::DeviceRemoved => E_DEV_REMOVED,
+            KError::DeviceStarted => E_DEV_STARTED,
+            KError::ProcessTerminated => E_PROCESS_TERMINATED,
+            KError::WaitFailed | KError::CircularDependency | KError::DriverLoadFailed |
             KError::ModuleNotDriver | KError::ProcessInitFailed => E_INTERNAL_FAILURE
         }
     }
@@ -82,6 +89,8 @@ impl fmt::Display for KError {
             KError::Unsupported => "Operation not supported",
             KError::ModuleNotDriver => "Loaded module is not a driver",
             KError::DeviceStopped => "Device is stopped",
+            KError::DeviceRemoved => "Device has been removed",
+            KError::DeviceStarted => "Device is already started",
             KError::Success => "Success"
         };
         write!(f, "{}", description)
@@ -146,7 +155,7 @@ unsafe extern "C" {
         name: StrRef,
         ctx: *mut core::ffi::c_void,
         parent: *const driver::DeviceObject,
-        is_class: bool,
+        is_class: bool
     ) -> *mut driver::DeviceObject;
 
     fn io_send_request_ffi(
@@ -183,7 +192,7 @@ unsafe extern "C" {
         context: *mut core::ffi::c_void,
         handler: InterruptRoutine,
         active_high: bool,
-        is_edge_triggered: bool,
+        is_edge_triggered: bool
     ) -> InterruptHandle;
 
     fn io_remove_interrupt_handler_ffi(handle: InterruptHandle);

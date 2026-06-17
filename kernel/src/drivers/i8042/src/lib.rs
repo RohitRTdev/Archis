@@ -13,8 +13,9 @@ use kernel_intf::{
     io_install_interrupt_handler, io_remove_interrupt_handler,
     io_create_driver_worker
 };
+use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
-    DeviceObject, DriverObject, Irp, IrpMajor, IrpMinor, Keystroke, RegisterHandlerInfo, Status,
+    DeviceObject, DriverObject, Irp, IrpMinor, Keystroke, RegisterHandlerInfo, Status,
     create_device,
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
@@ -133,20 +134,12 @@ struct PendingEntry {
 
 struct I8042Ctx {
     lock:             Lock,
-    // Decoded keystroke ring — consumer is dispatch_read.
-    ks_ring:          [Keystroke; KS_BUF_SIZE],
-    ks_head:          usize,
-    ks_tail:          usize,
-    ks_len:           usize,
-    // Keystrokes decoded by the ISR but not yet processed by the driver worker.
-    sc_pending:       [Keystroke; SC_PENDING_SIZE],
-    sc_head:          usize,
-    sc_tail:          usize,
-    sc_len:           usize,
+    ks_ring:          RingBuffer<Keystroke, KS_BUF_SIZE>,
+    sc_pending:       RingBuffer<Keystroke, SC_PENDING_SIZE>,
     pending:          [PendingEntry; MAX_PENDING],
     pending_len:      usize,
     keystroke_handler: Option<RegisterHandlerInfo>,
-    interrupt_handle: InterruptHandle,
+    interrupt_handle: InterruptHandle
 }
 
 unsafe impl Send for I8042Ctx {}
@@ -156,34 +149,12 @@ impl I8042Ctx {
     const fn zeroed() -> Self {
         Self {
             lock:             Lock { lock: 0, int_status: false },
-            ks_ring:          [Keystroke { scancode: 0, ascii: 0, flags: 0 }; KS_BUF_SIZE],
-            ks_head:          0,
-            ks_tail:          0,
-            ks_len:           0,
-            sc_pending:       [Keystroke { scancode: 0, ascii: 0, flags: 0 }; SC_PENDING_SIZE],
-            sc_head:          0,
-            sc_tail:          0,
-            sc_len:           0,
+            ks_ring:          RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 }),
+            sc_pending:       RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 }),
             pending:          [PendingEntry { irp: core::ptr::null_mut(), requested: 0 }; MAX_PENDING],
             pending_len:      0,
             keystroke_handler: None,
             interrupt_handle: InterruptHandle { irq: 0, node_ptr: 0 },
-        }
-    }
-
-    fn push_keystroke(&mut self, ks: Keystroke) {
-        if self.ks_len < KS_BUF_SIZE {
-            self.ks_ring[self.ks_tail] = ks;
-            self.ks_tail = (self.ks_tail + 1) % KS_BUF_SIZE;
-            self.ks_len += 1;
-        }
-    }
-
-    unsafe fn dequeue_into(&mut self, dst: *mut Keystroke, n: usize) {
-        for i in 0..n {
-            unsafe { dst.add(i).write(self.ks_ring[self.ks_head]); }
-            self.ks_head = (self.ks_head + 1) % KS_BUF_SIZE;
-            self.ks_len -= 1;
         }
     }
 
@@ -219,7 +190,6 @@ fn driver_init(driver: &mut DriverObject) -> Status {
 #[kmod::dispatch_handler]
 fn dispatch_add(driver: &DriverObject, pdo: Option<&DeviceObject>) -> Status {
     let idx = DEVICE_COUNT.fetch_add(1, Ordering::Relaxed);
-    // Generate names dynamically so we're not limited to 2 ports.
     let name: &'static str = alloc::boxed::Box::leak(
         alloc::format!("ps/2_port{}", idx).into_boxed_str()
     );
@@ -254,12 +224,8 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
     let ctx = unsafe { &mut *(device.ctx as *mut I8042Ctx) };
 
     create_spinlock(&mut ctx.lock);
-    ctx.ks_head    = 0;
-    ctx.ks_tail    = 0;
-    ctx.ks_len     = 0;
-    ctx.sc_head    = 0;
-    ctx.sc_tail    = 0;
-    ctx.sc_len     = 0;
+    ctx.ks_ring    = RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 });
+    ctx.sc_pending = RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 });
     ctx.pending_len = 0;
 
     #[cfg(target_arch = "x86_64")]
@@ -302,6 +268,7 @@ fn do_stop(device: &DeviceObject, request: &mut Irp) -> Status {
     release_spinlock(&mut ctx.lock);
 
     for i in 0..to_fail_len {
+        info!("Cancelling {} irp(s) as part of device stop", to_fail_len);
         io_complete_irp(to_fail[i], Status::Failed);
     }
 
@@ -316,7 +283,7 @@ fn do_remove(device: &DeviceObject, request: &mut Irp) -> Status {
         unsafe {
             drop(alloc::boxed::Box::from_raw_in(
                 device.ctx as *mut I8042Ctx,
-                PoolAllocatorGlobal,
+                PoolAllocatorGlobal
             ));
         }
     }
@@ -329,6 +296,7 @@ fn do_remove(device: &DeviceObject, request: &mut Irp) -> Status {
 fn dispatch_control(device: &DeviceObject, request: &mut Irp) -> Status {
     match request.minor_code {
         IrpMinor::RegisterKeyboardHandler => {
+            info!("Received register keyboard handler request from class driver");
             let handler_info = unsafe { request.req_info.register_handler };
             let ctx = unsafe { &mut *(device.ctx as *mut I8042Ctx) };
             acquire_spinlock(&mut ctx.lock);
@@ -337,7 +305,7 @@ fn dispatch_control(device: &DeviceObject, request: &mut Irp) -> Status {
             request.complete_irp(Status::Success);
             Status::Success
         }
-        _ => Status::Unsupported,
+        _ => Status::Unsupported
     }
 }
 
@@ -347,12 +315,19 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
     let buf_size = request.buffer.size;
 
     if buf_size == 0 || buf_size % ks_size != 0 {
+        if buf_size == 0 {
+            info!("Buffer size of 0 not allowed");
+        }
+        else {
+            info!("Buffer size not multiple of Keystroke struct size!");
+        }
         request.complete_irp(Status::Failed);
         return Status::Failed;
     }
 
     let requested = buf_size / ks_size;
     if requested > KS_BUF_SIZE {
+        info!("Number of keystroke packets requested > MAX({})", KS_BUF_SIZE);
         request.complete_irp(Status::Failed);
         return Status::Failed;
     }
@@ -361,9 +336,9 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
 
     acquire_spinlock(&mut ctx.lock);
 
-    if ctx.ks_len >= requested {
+    if ctx.ks_ring.len() >= requested {
         let dst = request.buffer.base_address as *mut Keystroke;
-        unsafe { ctx.dequeue_into(dst, requested); }
+        unsafe { ctx.ks_ring.dequeue_into(dst, requested); }
         request.bytes_completed = requested * ks_size;
         release_spinlock(&mut ctx.lock);
         request.complete_irp(Status::Success);
@@ -372,6 +347,7 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
 
     if ctx.pending_len == MAX_PENDING {
         release_spinlock(&mut ctx.lock);
+        info!("Too many irq's pending. Cancelling this one..");
         request.complete_irp(Status::Failed);
         return Status::Failed;
     }
@@ -408,21 +384,12 @@ extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
         let idx = scancode as usize;
         let ascii = if idx < SCANCODE_MAP.len() { SCANCODE_MAP[idx] } else { 0 };
 
-        // Only forward key-presses with a mapped ASCII character; skip the rest.
-        if is_release || ascii == 0 {
-            return true;
-        }
-
-        let ks = Keystroke { scancode, ascii, flags: 0 };
+        let ks = Keystroke { scancode, ascii, flags: if is_release {1} else {0} };
 
         let ctx = unsafe { &mut *(ctx_ptr as *mut I8042Ctx) };
 
         acquire_spinlock(&mut ctx.lock);
-        if ctx.sc_len < SC_PENDING_SIZE {
-            ctx.sc_pending[ctx.sc_tail] = ks;
-            ctx.sc_tail = (ctx.sc_tail + 1) % SC_PENDING_SIZE;
-            ctx.sc_len += 1;
-        }
+        ctx.sc_pending.push(ks);
         release_spinlock(&mut ctx.lock);
 
         let _ = io_create_driver_worker(keyboard_dw, ctx_ptr);
@@ -437,35 +404,39 @@ extern "C" fn keyboard_dw(ctx_ptr: *mut c_void) {
     let ctx = unsafe { &mut *(ctx_ptr as *mut I8042Ctx) };
     let ks_size = size_of::<Keystroke>();
 
-    // --- Drain all staged keystrokes ---
     let mut batch = [Keystroke::default(); SC_PENDING_SIZE];
-    let mut batch_len = 0;
 
     acquire_spinlock(&mut ctx.lock);
 
-    while ctx.sc_len > 0 {
-        batch[batch_len] = ctx.sc_pending[ctx.sc_head];
-        ctx.sc_head = (ctx.sc_head + 1) % SC_PENDING_SIZE;
-        ctx.sc_len -= 1;
-        batch_len += 1;
-    }
+    let batch_len = ctx.sc_pending.len();
+    unsafe { ctx.sc_pending.dequeue_into(batch.as_mut_ptr(), batch_len); }
 
-    // Push all to ring (tail advances).
     for i in 0..batch_len {
-        ctx.push_keystroke(batch[i]);
+        ctx.ks_ring.push(batch[i]);
     }
 
-    // Collect satisfiable pending read IRPs (head advances per IRP satisfied).
+    let avail = ctx.ks_ring.len();
+    let mut max_consumed = 0usize;
     let mut collected     = [core::ptr::null_mut::<Irp>(); MAX_PENDING];
     let mut collected_len = 0;
     let mut i = 0;
 
     while i < ctx.pending_len {
         let entry = ctx.pending[i];
-        if ctx.ks_len >= entry.requested {
-            let dst = unsafe { (*entry.irp).buffer.base_address as *mut Keystroke };
-            unsafe { ctx.dequeue_into(dst, entry.requested); }
-            unsafe { (*entry.irp).bytes_completed = entry.requested * ks_size; }
+        let already_given = unsafe { (*entry.irp).bytes_completed } / ks_size;
+        let remaining = entry.requested - already_given;
+        let give = avail.min(remaining);
+
+        if give > 0 {
+            let dst = unsafe {
+                ((*entry.irp).buffer.base_address as *mut Keystroke).add(already_given)
+            };
+            unsafe { ctx.ks_ring.peek_into(dst, give); }
+            unsafe { (*entry.irp).bytes_completed += give * ks_size; }
+            if give > max_consumed { max_consumed = give; }
+        }
+
+        if unsafe { (*entry.irp).bytes_completed } == entry.requested * ks_size {
             ctx.pending[i] = ctx.pending[ctx.pending_len - 1];
             ctx.pending_len -= 1;
             collected[collected_len] = entry.irp;
@@ -474,6 +445,8 @@ extern "C" fn keyboard_dw(ctx_ptr: *mut c_void) {
             i += 1;
         }
     }
+
+    ctx.ks_ring.advance(max_consumed);
 
     let maybe_handler = ctx.keystroke_handler;
 

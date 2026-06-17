@@ -67,19 +67,17 @@ pub enum Status {
     Cancelled   = -3
 }
 
-// Raw keystroke produced by i8042 and forwarded to the input driver.
+// Raw keystroke produced by port drivers and forwarded to the input driver.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Keystroke {
     pub scancode: u8,
-    pub ascii:    u8,   // 0 if modifier / unmapped key
-    pub flags:    u8,   // bit 0 = key-release
+    pub ascii:    u8,  // 0 if modifier / unmapped key
+    pub flags:    u8   // bit 0 = key-release
 }
 
-pub type KeystrokeHandler =
-    unsafe extern "C" fn(*const Keystroke, count: usize, ctx: *mut c_void);
+pub type KeystrokeHandler = unsafe extern "C" fn(*const Keystroke, count: usize, ctx: *mut c_void);
 
-// Carried in req_info for Control / RegisterKeyboardHandler IRPs.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RegisterHandlerInfo {
@@ -89,7 +87,6 @@ pub struct RegisterHandlerInfo {
 
 // Request-specific parameters placed on the IRP before dispatch.
 // Drivers read the relevant variant based on the major/minor code they handle.
-// Must remain FFI-safe: all variants are #[repr(C)] and Copy.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union ReqInfo {
@@ -299,7 +296,7 @@ pub fn create_device_by_id(
     name: Option<&'static str>,
     ctx: *mut c_void,
     parent: Option<&DeviceObject>,
-    is_class: bool,
+    is_class: bool
 ) -> *mut DeviceObject {
     let name = name.map_or(StrRef::from_str(""), StrRef::from_str);
     let parent = parent.map(|p| p as *const DeviceObject).unwrap_or(core::ptr::null());
@@ -311,7 +308,7 @@ pub fn create_device(
     name: Option<&'static str>,
     ctx: *mut c_void,
     parent: Option<&DeviceObject>,
-    is_class: bool,
+    is_class: bool
 ) -> *mut DeviceObject {
     create_device_by_id(driver.id, name, ctx, parent, is_class)
 }

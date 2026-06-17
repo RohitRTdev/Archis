@@ -2,6 +2,7 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 
 use alloc::vec::Vec;
+use kernel_intf::debug;
 use kernel_intf::list::{DynList, List, ListNodeGuard};
 use kernel_intf::mem::PoolAllocator;
 use common::{MemoryRegion, PAGE_SIZE};
@@ -12,9 +13,37 @@ use crate::sched::{self, DispatchRoutine};
 use super::proc::Handle;
 
 pub struct ProcessCleanupWork {
-    pub addr_space:  VCB,
-    pub memory_list: DynList<MemoryRegion>,
-    pub handles:     Vec<Option<Handle>>,
+    proc_id:     usize, 
+    addr_space:  VCB,
+    memory_list: DynList<MemoryRegion>,
+    handles:     Vec<Option<Handle>>
+}
+
+impl Default for ProcessCleanupWork {
+    fn default() -> Self {
+        ProcessCleanupWork {
+            proc_id: 0, 
+            addr_space: NonNull::dangling(), 
+            memory_list: List::new(), 
+            handles: Vec::new() 
+        }
+    }
+}
+
+impl ProcessCleanupWork {
+    pub fn new(
+        proc_id: usize,
+        addr_space: VCB,
+        memory_list: DynList<MemoryRegion>,
+        handles: Vec<Option<Handle>>
+    ) -> Self {
+        Self {
+            proc_id,
+            addr_space,
+            memory_list,
+            handles
+        }
+    }
 }
 
 unsafe impl Send for ProcessCleanupWork {}
@@ -46,6 +75,8 @@ extern "C" fn cleanup_worker() -> ! {
                 Some(g) => g,
                 None => break,
             };
+
+            debug!("Destroying resources for process {}", guard.proc_id);
 
             // Take handles out first so we control when Close IRPs fire.
             let handles = core::mem::take(&mut guard.handles);

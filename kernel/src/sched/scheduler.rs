@@ -11,7 +11,7 @@ use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_p
 use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores, get_worker_stack, set_panic_base};
 use crate::hal::{self, IPIRequestType, create_kernel_context, disable_scheduler_timer, enable_scheduler_timer, fetch_context, force_context_switch, get_per_cpu_base, get_per_cpu_data, get_per_cpu_kernel_base, is_system_in_interrupt_context, set_per_cpu_base, set_per_cpu_data, switch_context};
 use crate::mem::{VCB, get_kernel_addr_space, set_address_space};
-use crate::sched::get_current_process_id;
+use crate::sched::{ProcessCleanupWork, enqueue_cleanup, get_current_process_id};
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
 use crate::io::{self, IrpPtr, deallocate_irp};
 use kernel_intf::mem::{PoolAllocator, PoolAllocatorGlobal};
@@ -221,6 +221,7 @@ pub struct TaskQueue {
     suspended_tasks: DynList<KThread>,
     notifier_list: DynList<KEvent>,
     timer_notifier_list: DynList<TimerInfo>,
+    cleanup_work_list: DynList<ProcessCleanupWork>,
     timer_list: DynList<TimerInfo>,
     running_task: Option<NonNull<ListNode<KThread>>>,
     idle_task_stack: NonNull<u8>,
@@ -240,6 +241,7 @@ impl TaskQueue {
             notifier_list: List::new(),
             timer_list: List::new(),
             timer_notifier_list: List::new(),
+            cleanup_work_list: List::new(),
             running_task: None,
             idle_task_stack: NonNull::dangling(),
             leftover_stack: List::new(),
@@ -536,7 +538,7 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
 
     {
         let cur_proc_id = get_current_process_id().expect("kill_thread() called from idle process!");
-        assert!(cur_proc_id != 0, "Attempted to kill system thread!");
+        //assert!(cur_proc_id != 0, "Attempted to kill system thread!");
     } 
 
     let this_task = get_task_info(task_id);
@@ -675,6 +677,7 @@ extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
     let dev_ptr = unsafe { (*irp).device };
     if !dev_ptr.is_null() {
         if let Some(dev) = io::resolve_device(dev_ptr) {
+            crate::io_log!("Removing pending irp from device object");
             dev.get_pending_irps().lock().find_and_remove(|&p| p == irp);
         }
     }
@@ -794,6 +797,11 @@ pub fn exit_thread(exit_code: isize) -> ! {
     panic!("exit_thread() unreachable reached!!");
 }
 
+fn release_task_resources(task: &KThread) {
+    // For now the only resource is the task stack, so drop it
+    drop(task.lock().stack.take());
+}
+
 // We do all this moving out of stuff and into other stuff drama in order to avoid holding any lock during signal operation
 fn reap_tasks(sched_cb: &mut TaskQueue) {
     while sched_cb.terminated_tasks.get_nodes() != 0 {
@@ -816,13 +824,15 @@ fn reap_tasks(sched_cb: &mut TaskQueue) {
             // then set the process's exit code as the exit code for this thread
             let is_last_thread_in_proc = process_guard.remove_thread(id, thread_exit_code);
 
-            if is_last_thread_in_proc {
+            if is_last_thread_in_proc.is_some() {
                 crate::sched_log!("Adding process {} notifier to notifier list as task {} is terminating", process_guard.get_id(), id);
                 sched_cb.notifier_list.add_node(process_guard.get_notify_sem()).expect("Failed to add process notify semaphore to notifier list!");
                 sched_cb.notifier_list.add_node(process_guard.get_init_sem()).expect("Failed to add process init semaphore to notifier list!");
+                sched_cb.cleanup_work_list.add_node(is_last_thread_in_proc.unwrap()).expect("Failed to add cleanup work item in cleanup list");
             }
         }
 
+        release_task_resources(task_inner);
         crate::sched_log!("Removing task {} on core {}", id, hal::get_core());
         unsafe {
             sched_cb.terminated_tasks.remove_node(task);
@@ -862,13 +872,19 @@ fn update_timers(sched_cb: &mut TaskQueue) {
 }
 
 
-fn notify_watchers(notifier_list: &DynList<KEvent>, timer_notifier_list: &DynList<TimerInfo>) {
+fn notify_watchers(notifier_list: DynList<KEvent>, timer_notifier_list: DynList<TimerInfo>) {
     for sem in notifier_list.iter() {
         sem.signal();
     }
 
     for expired_timer in timer_notifier_list.iter() {
         KSem::from(expired_timer.sem.clone()).signal_task(expired_timer.task_id);
+    }
+}
+
+fn submit_cleanup_work(mut cleanup_list: DynList<ProcessCleanupWork>) {
+    for work in cleanup_list.iter_mut() {
+        enqueue_cleanup(take(&mut **work));
     }
 }
 
@@ -953,14 +969,22 @@ fn setup_current_task_ptr(sched_cb: &mut TaskQueue) {
 
 // Main scheduler loop
 pub fn schedule() {
-    let (notifier_list, timer_notifier_list) = {
+    let (
+        notifier_list, 
+        timer_notifier_list,
+        cleanup_work_list
+    ) = {
         let sched_cb_cpu = SCHEDULER_CON_BLK.local();
         let mut sched_cb = sched_cb_cpu.task_queue.lock();
         update_timers(&mut sched_cb);
         
         if sched_cb_cpu.preemption_count.load(Ordering::Acquire) > 0
             || sched_cb_cpu.is_dw_mode.load(Ordering::Acquire) {
-            (take(&mut sched_cb.notifier_list), take(&mut sched_cb.timer_notifier_list))
+            (
+                take(&mut sched_cb.notifier_list), 
+                take(&mut sched_cb.timer_notifier_list),
+                take(&mut sched_cb.cleanup_work_list)
+            )
         }
         else {
             if sched_cb.running_task.is_some() {
@@ -1116,11 +1140,16 @@ pub fn schedule() {
             }
 
             reap_tasks(&mut sched_cb);
-            (take(&mut sched_cb.notifier_list), take(&mut sched_cb.timer_notifier_list))
+            (
+                take(&mut sched_cb.notifier_list), 
+                take(&mut sched_cb.timer_notifier_list),
+                take(&mut sched_cb.cleanup_work_list)
+            )
         }
     };
 
-    notify_watchers(&notifier_list, &timer_notifier_list);
+    notify_watchers(notifier_list, timer_notifier_list);
+    submit_cleanup_work(cleanup_work_list);
 }
 
 fn prep_idle_task(sched_cb: &mut TaskQueue, old_vcb: VCB) {

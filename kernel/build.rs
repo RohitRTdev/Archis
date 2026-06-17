@@ -533,10 +533,12 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
         description_contents.push_str("[description]\n");
         description_contents.push_str(description.join("\n").as_str());
         description_contents.push_str("\n\n");
-        
-        description_contents.push_str("[DeviceStack]\n");
-        description_contents.push_str(device_stack.join("\n").as_str());
-        description_contents.push_str("\n\n");
+
+        if !device_stack.is_empty() {
+            description_contents.push_str("[DeviceStack]\n");
+            description_contents.push_str(device_stack.join("\n").as_str());
+            description_contents.push_str("\n\n");
+        } 
     }
 
     fs::write(
