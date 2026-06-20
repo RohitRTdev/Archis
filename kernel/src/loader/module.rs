@@ -1,6 +1,5 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use core::alloc::Layout;
-
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use common::{elf::*, PAGE_SIZE};
@@ -108,6 +107,7 @@ impl ModuleDescriptor {
 pub static ARIS: Once<Spinlock<ModuleDescriptor>> = Once::new(); 
 
 static FILE_INDEX: AtomicUsize = AtomicUsize::new(0);
+static KERNEL_OFFSET: AtomicIsize = AtomicIsize::new(0);
 
 pub fn early_init() {
     let info = BOOT_INFO.get().unwrap();
@@ -134,6 +134,7 @@ pub fn early_init() {
             let mut mod_cb = ARIS.get().unwrap().lock();
             let kmod = mod_cb.kernel_mut();
             let offset = kern_base as isize - kmod.info.base as isize;
+            KERNEL_OFFSET.store(offset, Ordering::Release);
             let add_offset = |a: usize| {
                 (a as isize + offset) as usize
             };
@@ -235,6 +236,7 @@ pub fn complete_handoff() {
     info!("Reapplying relocations to switch to new address space");
     let mut mod_cb = ARIS.get().unwrap().lock();
     let boot_info = BOOT_INFO.get().unwrap();
+    let koffset = KERNEL_OFFSET.load(Ordering::Acquire);
     
     // This is the old unmapped kernel address
     let load_base = mod_cb.kernel().info.base;
@@ -269,46 +271,16 @@ pub fn complete_handoff() {
         for entry in entries {
             let address = load_base + entry.r_offset as usize;
             match info(entry.r_info) {
-                R_X86_64_RELATIVE => {
+                R_X86_64_RELATIVE | R_X86_64_64 | 
+                R_GLOB_DAT | R_JUMP_SLOT => {
+                    // This is not normal relocation. We might have made changes
+                    // to various relocation pointers at runtime.
+                    // So we just need to add the offset that we have moved the kernel into it
                     unsafe {
-                        *(address as *mut u64) = (load_base + entry.r_addend as usize) as u64;
-                    }
-                },
-                R_X86_64_64 | R_GLOB_DAT => {
-                    assert!(dyn_tab.is_some());
-                    let sym_idx = (entry.r_info >> 32) as usize;
-                    let sym = unsafe {
-                        &*(dyn_tab.as_ref().unwrap().start as *const Elf64Sym).add(sym_idx)
+                        let cur_address = *(address as *mut u64);
+                        *(address as *mut u64) = (koffset + cur_address as isize) as u64;
                     };
-
-                    if sym.st_shndx == SHN_UNDEF {
-                        panic!("Could not find definition for symbol: {} during absolute relocation", stringizer(sym.st_name as usize));
-                    }
-
-                    let value = load_base + sym.st_value as usize + entry.r_addend as usize;
-
-                    unsafe {
-                        *(address as *mut u64) = value as u64;
-                    }
-                }
-                R_JUMP_SLOT => {
-                    assert!(dyn_tab.is_some());
-                    let sym_idx = (entry.r_info >> 32) as usize;
-                    let sym = unsafe {
-                        &*(dyn_tab.as_ref().unwrap().start as *const Elf64Sym).add(sym_idx)
-                    };
-
-                    if sym.st_shndx == SHN_UNDEF {
-                        panic!("Could not find definition for symbol: {}", stringizer(sym.st_name as usize));
-                    }
-
-                    let value = load_base + sym.st_value as usize;
-
-                    unsafe {
-                        *(address as *mut u64) = value as u64;
-                    }
                 },
-
                 _ => {} 
             }
         }

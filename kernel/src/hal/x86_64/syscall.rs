@@ -1,7 +1,7 @@
 use kernel_intf::debug;
 use crate::hal::{disable_interrupts, enable_interrupts, get_per_cpu_base, get_per_cpu_kernel_base, set_per_cpu_base, set_tss_stack};
 use crate::hal::x86_64::cpu_regs::INIT_RFLAGS;
-use crate::sched::{get_current_task, syscall_dispatcher, toggle_cur_task_kernel_mode};
+use crate::sched::{get_current_task, set_kernel_mode_and_syscall_params, syscall_dispatcher, toggle_cur_task_kernel_mode};
 use crate::hal::x86_64::asm;
 
 const STAR: u32 = 0xc000_0081;
@@ -21,7 +21,7 @@ pub const MAX_ARCH_ARGS: usize = 6;
 
 #[repr(C)]
 struct SyscallContext {
-    pad: u64,
+    user_rsp: u64,
     syscall_number: u64,
     args: [u64; MAX_ARCH_ARGS],
     user_gs: u64
@@ -32,12 +32,13 @@ extern "C" fn arch_syscall_handler(context: *mut SyscallContext) -> i64 {
     // With current design, we need to preserve the invariant that under kernel mode execution
     // a thread shall always have kernel_gs_base = user_gs_base
     let per_cpu_base = get_per_cpu_base();
-    unsafe {
+    let user_rsp = unsafe {
         (*context).user_gs = per_cpu_base;
-    }
+        (*context).user_rsp
+    };
 
     set_per_cpu_base(get_per_cpu_kernel_base());
-    toggle_cur_task_kernel_mode();
+    set_kernel_mode_and_syscall_params(true, true, per_cpu_base, user_rsp);
 
     enable_interrupts(true);
 
@@ -47,7 +48,7 @@ extern "C" fn arch_syscall_handler(context: *mut SyscallContext) -> i64 {
 
     let stat = syscall_dispatcher(syscall_number, args);
 
-    toggle_cur_task_kernel_mode();
+    set_kernel_mode_and_syscall_params(false, false, per_cpu_base, user_rsp);
     disable_interrupts();
     
     // Restore user gs
@@ -82,7 +83,6 @@ pub fn init() {
 }
 
 pub fn transfer_control_to_user(user_start_addr: usize, user_stack_base: usize) {
-    // This will be reenabled once switched to user land
     toggle_cur_task_kernel_mode();
     set_tss_stack(get_current_task()
         .expect("transfer_control_to_user() called in idle task!")
@@ -90,6 +90,8 @@ pub fn transfer_control_to_user(user_start_addr: usize, user_stack_base: usize) 
         .get_stack()
         .expect("User thread expected to have non-empty kernel stack!") as u64
     );
+    
+    // This will be reenabled once switched to user land
     disable_interrupts();
     unsafe {
         let rflags = INIT_RFLAGS;

@@ -35,6 +35,16 @@ pub fn usize_to_ptr<A>(r: usize) ->  *mut A {
     r as *mut A
 }
 
+#[inline(always)]
+pub fn get_highest_set_bit(r: u8) -> isize {
+    if r != 0 {
+        (7 - r.leading_zeros()) as isize
+    }
+    else {
+        -1
+    }
+}
+
 #[macro_export]
 macro_rules! en_flag {
     ($cond:expr, $($flags:expr),+) => {

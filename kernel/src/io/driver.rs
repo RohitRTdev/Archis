@@ -38,7 +38,7 @@ pub struct OpenDeviceHandleInner {
 
 impl Drop for OpenDeviceHandleInner {
     fn drop(&mut self) {
-        let _ = io_request_sync(&self.dev, IrpMajor::Close, IrpMinor::None, EMPTY_REGION, 0, None);
+        let _ = io_request_sync(&self.dev, IrpMajor::Close, IrpMinor::None, EMPTY_REGION, 0, None, false);
     }
 }
 
@@ -174,12 +174,12 @@ impl DeviceObjectK {
         }
     }
 
-    pub fn read(&self, req: ReadRequest) -> Result<Status, KError> {
-        Ok(io_request_sync(self, IrpMajor::Read, IrpMinor::None, req.buffer, req.offset, None)?.status)
+    pub fn read(&self, req: ReadRequest, is_interruptible: bool) -> Result<Status, KError> {
+        Ok(io_request_sync(self, IrpMajor::Read, IrpMinor::None, req.buffer, req.offset, None, is_interruptible)?.status)
     }
 
-    pub fn write(&self, req: ReadRequest) -> Result<Status, KError> {
-        Ok(io_request_sync(self, IrpMajor::Write, IrpMinor::None, req.buffer, req.offset, None)?.status)
+    pub fn write(&self, req: ReadRequest, is_interruptible: bool) -> Result<Status, KError> {
+        Ok(io_request_sync(self, IrpMajor::Write, IrpMinor::None, req.buffer, req.offset, None, is_interruptible)?.status)
     }
 
     pub fn attach_child(&self, child_id: usize) {
@@ -214,7 +214,7 @@ impl DeviceObjectK {
 
         // PDO's are implicitly started
         let status = if !self.is_pdo() {
-            let irp = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Start, EMPTY_REGION, 0, None)?;
+            let irp = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Start, EMPTY_REGION, 0, None, false)?;
             if irp.status == Status::Success {
                 self.set_state(DeviceState::Started);
                 self.update_stack_state(LevelState::Started);
@@ -270,7 +270,7 @@ impl DeviceObjectK {
             return Status::Success;
         }
         self.set_state(DeviceState::Stopping);
-        let status = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Stop, EMPTY_REGION, 0, None)
+        let status = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Stop, EMPTY_REGION, 0, None, false)
             .map(|irp| irp.status)
             .unwrap_or(Status::Failed);
         self.set_state(DeviceState::Stopped);
@@ -351,7 +351,8 @@ pub fn io_request_sync(
     minor: IrpMinor,
     buffer: MemoryRegion,
     offset: usize,
-    req_info: Option<ReqInfo>
+    req_info: Option<ReqInfo>,
+    is_interruptible: bool
 ) -> Result<IrpResult, KError> {
     if !allowed_in_state(dev.state(), major, minor, dev.is_class_device) {
         return Err(state_rejection_error(dev.state(), major, minor));
@@ -379,7 +380,7 @@ pub fn io_request_sync(
 
     let status = dispatch(driver, major, dev.device_ptr(), irp);
     if status == Status::Pending {
-        event.wait();
+        event.wait(is_interruptible);
     }
     else if status == Status::Unsupported {
         io_complete_irp(irp, status);
@@ -585,7 +586,7 @@ pub fn resolve_device(ptr: *const DeviceObject) -> Option<DeviceHandleK> {
 
 pub fn open_device_handle(name: &str) -> Result<OpenDeviceHandle, KError> {
     let dev = DEVICE_BY_NAME.lock().get(name).cloned().ok_or(KError::InvalidArgument)?;
-    let _ = io_request_sync(&dev, IrpMajor::Open, IrpMinor::None, EMPTY_REGION, 0, None);
+    let _ = io_request_sync(&dev, IrpMajor::Open, IrpMinor::None, EMPTY_REGION, 0, None, false);
     Ok(Arc::new_in(OpenDeviceHandleInner { dev }, PoolAllocatorGlobal))
 }
 
@@ -631,7 +632,7 @@ pub fn remove_device(dev: &DeviceObjectK) {
     let cur = dev.state();
     if cur != DeviceState::Removing && cur != DeviceState::Removed {
         dev.set_state(DeviceState::Removing);
-        let _ = io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Remove, EMPTY_REGION, 0, None);
+        let _ = io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Remove, EMPTY_REGION, 0, None, false);
         dev.set_state(DeviceState::Removed);
     } else {
         return;
@@ -743,7 +744,7 @@ pub extern "C" fn io_send_request_ffi(
     };
 
     let result = match completion {
-        None    => io_request_sync(&dev, major, minor, buffer, offset, req_info).map(|r| r.status),
+        None    => io_request_sync(&dev, major, minor, buffer, offset, req_info, false).map(|r| r.status),
         Some(r) => io_request_async(&dev, major, minor, buffer, offset, req_info, r, completion_ctx)
     };
 

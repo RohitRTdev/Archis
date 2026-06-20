@@ -8,7 +8,8 @@ pub struct CpuData {
     logical_id: u64,
     apic_id: u64,   
     current_worker_stack: u64,
-    current_task_ptr: u64
+    current_task_ptr: u64,
+    vcb: u64
 }
 
 const GS_BASE: u32 = 0xC0000101;
@@ -24,7 +25,8 @@ static CPU_LIST: PerCpu<Spinlock<CpuData>> = PerCpu::new_with(
         CpuData {logical_id: 0,
             apic_id: 0,
             current_worker_stack: 0,
-            current_task_ptr: 0
+            current_task_ptr: 0,
+            vcb: 0
         })}; MAX_CPUS]
     );
 
@@ -84,6 +86,7 @@ pub fn init_per_cpu_data(core: usize) {
     cpu_desc.current_worker_stack = 0;
     cpu_desc.logical_id = core as u64;
     cpu_desc.apic_id = apic_id as u64;
+    cpu_desc.vcb = 0;
     
     let desc = &*cpu_desc as *const _ as u64;
 

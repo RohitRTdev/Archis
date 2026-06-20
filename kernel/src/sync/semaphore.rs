@@ -1,10 +1,11 @@
 use core::ptr::NonNull;
 use alloc::sync::Arc;
+use kernel_intf::KError;
 use super::Spinlock;
 use crate::hal;
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::list::{List, DynList};
-use crate::sched::{self, KThread, is_preemption_enabled};
+use crate::sched::{self, KThread, SignalCause, is_preemption_enabled};
 
 pub type KSemInnerType = Arc<Spinlock<KSemInner>, PoolAllocatorGlobal>;
 
@@ -21,18 +22,19 @@ pub struct KSemInner {
 enum Wake {
     None,
     One,
-    All,
-    AutoEvent
+    All
 }
 
 // True indicates that the lock was signalled
 // False means that semaphore got signalled due to timeout
-fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>) -> bool {
+fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>, is_interruptible: bool) -> Result<(), KError> {
     let int_enabled = hal::are_interrupts_enabled();
     let preemption_enabled = is_preemption_enabled();
     let in_dw = sched::is_in_dw_mode();
 
     let mut yield_flag = false;
+    let mut wait_failed = false;
+    let mut wait_failed_interrupt = false;
     {
         let mut inner = inner_arc.lock();
         let mut zero_timeout = false; 
@@ -47,7 +49,8 @@ fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>) -> bool {
         let cur_task = sched::get_current_task()
         .expect("wait() called from idle task!!");
 
-        cur_task.lock().reset_expired_timer_status();
+        // Reset to normal state
+        cur_task.lock().set_signal_cause(SignalCause::Normal);
 
         let should_block = match &mut inner.state {
             SemState::Semaphore { counter, .. } => {
@@ -55,10 +58,10 @@ fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>) -> bool {
                     // Consume on success
                     if *counter >= 1 {
                         *counter -= 1;
-                        return true;
+                        return Ok(());
                     }
                     else {
-                        return false;
+                        return Err(KError::WaitTimedOut);
                     }
                 }
 
@@ -72,7 +75,12 @@ fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>) -> bool {
                     if success && *is_auto_reset {
                         *signalled = false;
                     }
-                    return success;
+                    if success {
+                        return Ok(());
+                    }
+                    else {
+                        return Err(KError::WaitTimedOut);
+                    }
                 }
 
                 if *signalled {
@@ -95,7 +103,8 @@ fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>) -> bool {
 
             let inner_wrap = Arc::clone(inner_arc);
 
-            if sched::add_cur_task_to_wait_queue(inner_wrap, timeout) {
+            let res = sched::add_cur_task_to_wait_queue(inner_wrap, timeout, is_interruptible);
+            if res.is_none() {
                 inner.blocked_list.add_node(cur_task).expect("Failed to add semaphore to blocked list!");
                 yield_flag = true;
             }
@@ -107,6 +116,11 @@ fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>) -> bool {
                     },
                     _ => {}
                 };
+                match res.unwrap() {
+                    SignalCause::Interruption => { wait_failed_interrupt = true },
+                    SignalCause::Normal => { wait_failed = true },
+                    _ => {}
+                }
             }
         }
     }
@@ -117,15 +131,27 @@ fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>) -> bool {
     }
 
     let task = sched::get_current_task().expect("wait() called in idle task!");
-    !task.lock().get_expired_timer_status()
+    if wait_failed {
+        Err(KError::WaitFailed)
+    }
+    else if wait_failed_interrupt {
+        Err(KError::WaitInterrupted)
+    }
+    else {
+        match task.lock().get_signal_cause() {
+            SignalCause::Normal => {
+                Ok(())
+            },
+            SignalCause::TimerExpiry => {
+                Err(KError::WaitTimedOut)
+            },
+            SignalCause::Interruption => {
+                Err(KError::WaitInterrupted)
+            }
+        }
+    }
 }
 
-// Shared signal route:
-// Wake exactly one waiter if the counter is still non-positive after the bump
-// Manual-reset event: raise signalled and wake every blocked waiter.
-// Auto-reset event: if a waiter is blocked, wake exactly one and leave
-// signalled false (the signal is "transferred" to the waker). Otherwise
-// raise signalled so the next waiter consumes it on entry.
 fn do_signal(inner_arc: &KSemInnerType) {
     let mut inner = inner_arc.lock();
 
@@ -136,10 +162,8 @@ fn do_signal(inner_arc: &KSemInnerType) {
         },
         SemState::Event { signalled, is_auto_reset } => {
             if *is_auto_reset {
-                Wake::AutoEvent
+                Wake::One
             } else {
-                // Manual-reset stays raised forever (until explicit reset()).
-                *signalled = true;
                 Wake::All
             }
         }
@@ -148,31 +172,26 @@ fn do_signal(inner_arc: &KSemInnerType) {
     match wake {
         Wake::None => {},
         Wake::One => {
-            if inner.blocked_list.get_nodes() > 0 {
-                wake_task(&mut inner, inner_arc, None);
+            if !wake_task(&mut inner, inner_arc, None, false) {
+                if let SemState::Event { signalled, is_auto_reset } = &mut inner.state {
+                    if *is_auto_reset {
+                        *signalled = true;
+                    }
+                }
             }
         },
         Wake::All => {
-            while inner.blocked_list.get_nodes() > 0 {
-                wake_task(&mut inner, inner_arc, None);
-            }
-        },
-        Wake::AutoEvent => {
-            if inner.blocked_list.get_nodes() > 0 {
-                // Wake exactly one — signal is consumed by transfer to the waker
-                wake_task(&mut inner, inner_arc, None);
-            } else if let SemState::Event { signalled, .. } = &mut inner.state {
-                // No waiter — raise the flag for the next wait to consume.
+            while wake_task(&mut inner, inner_arc, None, false) {}
+            if let SemState::Event { signalled, .. } = &mut inner.state {
                 *signalled = true;
             }
         }
-    }
+    };
 }
 
-fn do_signal_on_timer_expire(inner_arc: &KSemInnerType, task_id: usize) {
+fn do_signal_on_task(inner_arc: &KSemInnerType, task_id: usize, is_interruptible: bool) {
     let mut inner = inner_arc.lock();
-
-    if wake_task(&mut inner, inner_arc, Some(task_id)) {
+    if wake_task(&mut inner, inner_arc, Some(task_id), is_interruptible) {
         // The timer expiry caused this semaphore to be signalled.
         // Restore the unit the semaphore wait decremented at entry
         if let SemState::Semaphore { max_count, counter } = &mut inner.state {
@@ -181,7 +200,10 @@ fn do_signal_on_timer_expire(inner_arc: &KSemInnerType, task_id: usize) {
     }
 }
 
-fn wake_task(inner: &mut KSemInner, inner_arc: &KSemInnerType, task_id: Option<usize>) -> bool {
+fn wake_task(inner: &mut KSemInner, inner_arc: &KSemInnerType, task_id: Option<usize>, is_interruptible: bool) -> bool {
+    if is_interruptible {
+        assert!(task_id.is_some());
+    }
     let wait_task_ptr = if let Some(id) = &task_id {
         inner.blocked_list.iter().find(|t| {
             t.lock().get_id() == *id
@@ -190,18 +212,39 @@ fn wake_task(inner: &mut KSemInner, inner_arc: &KSemInnerType, task_id: Option<u
         })
     }
     else {
-        // If there is no specific task id, then just return the head of the queue
-        Some(NonNull::from(inner.blocked_list.first().unwrap()))
+        // If there is no specific task id, then just return the head of the queue (if it exists)
+        let res = inner.blocked_list.first();
+        if res.is_none() {
+            None
+        }
+        else {
+            Some(NonNull::from(res.unwrap()))
+        }
     };
     
     if let Some(waiting_task) = wait_task_ptr {
         let node = unsafe {
-            inner.blocked_list.remove_node(waiting_task)
+            &*waiting_task.as_ptr()
         };
         
+        
         let id = node.lock().get_id();
-        sched::signal_waiting_task(id, Arc::clone(inner_arc), task_id.is_some());
-        return true;
+        let cause = if is_interruptible {
+            SignalCause::Interruption
+        }
+        else if task_id.is_some() {
+            SignalCause::TimerExpiry
+        }
+        else {
+            SignalCause::Normal
+        };
+
+        if sched::signal_waiting_task(id, Arc::clone(inner_arc), cause) {
+            unsafe {
+                inner.blocked_list.remove_node(waiting_task)
+            };
+            return true;
+        }
     }
 
     false
@@ -230,20 +273,24 @@ impl KSem {
         }
     }
 
-    pub fn wait(&self) -> bool {
-        do_wait(&self.inner, None)
+    pub fn wait(&self, is_interruptible: bool) -> Result<(), KError> {
+        do_wait(&self.inner, None, is_interruptible)
     }
 
-    pub fn wait_with_timeout(&self, timeout: usize) -> bool {
-        do_wait(&self.inner, Some(timeout))
+    pub fn wait_with_timeout(&self, timeout: usize, is_interruptible: bool) -> Result<(), KError> {
+        do_wait(&self.inner, Some(timeout), is_interruptible)
     }
 
     pub fn signal(&self) {
         do_signal(&self.inner);
     }
 
-    pub fn signal_task(&self, task_id: usize) {
-        do_signal_on_timer_expire(&self.inner, task_id);
+    pub fn signal_task_on_timeout(&self, task_id: usize) {
+        do_signal_on_task(&self.inner, task_id, false);
+    }
+
+    pub fn signal_task_interrupted(&self, task_id: usize) {
+        do_signal_on_task(&self.inner, task_id, true);
     }
 
     pub fn drop_task(inner_arc: KSemInnerType, task_id: usize) {
@@ -271,7 +318,7 @@ impl KSem {
         // The list might not contain the waiting task
         // This might happen if another task called signal on this semaphore before drop_task got a chance to run
         if blocked_task.is_some() {
-            kernel_intf::debug!("Dropping semaphore for task {}", task_id);
+            crate::sched_log!("Dropping semaphore for task {}", task_id);
             unsafe {
                 inner.blocked_list.remove_node(blocked_task.unwrap());
             }
@@ -304,12 +351,12 @@ impl KEvent {
         }
     }
 
-    pub fn wait(&self) -> bool {
-        do_wait(&self.inner, None)
+    pub fn wait(&self, is_interruptible: bool) -> Result<(), KError> {
+        do_wait(&self.inner, None, is_interruptible)
     }
     
-    pub fn wait_with_timeout(&self, timeout: usize) -> bool {
-        do_wait(&self.inner, Some(timeout))
+    pub fn wait_with_timeout(&self, timeout: usize, is_interruptible: bool) -> Result<(), KError> {
+        do_wait(&self.inner, Some(timeout), is_interruptible)
     }
 
     pub fn signal(&self) {
@@ -349,6 +396,6 @@ impl Drop for ConfigGuard<'_> {
 }
 
 pub fn semaphore_guard(sem: &KSem) -> ConfigGuard<'_> {
-    sem.wait();
+    sem.wait(false);
     ConfigGuard { sem }
 }

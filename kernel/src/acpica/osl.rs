@@ -97,7 +97,7 @@ fn dequeue_work(q: &mut DynList<WorkItem>) -> Option<ListNodeGuard<WorkItem, Poo
 extern "C" fn work_queue_worker() -> ! {
     let wq = WORK_QUEUE.get().expect("ACPICA work queue not initialised");
     loop {
-        wq.signal.wait();
+        wq.signal.wait(false);
         // Drain everything currently visible. With auto-reset we only get
         // one wake per signal, but ACPICA may submit several items before
         // we get scheduled — drain to empty before sleeping again.
@@ -508,7 +508,7 @@ extern "C" fn AcpiOsWaitEventsComplete() {
         return;
     }
     wq.signal.signal();
-    event.wait();
+    event.wait(false);
 }
 
 #[unsafe(no_mangle)]
@@ -516,7 +516,7 @@ extern "C" fn AcpiOsSleep(milliseconds: u64) -> ACPI_STATUS {
     if milliseconds == 0 {
         return AE_OK;
     }
-    sched::delay_ms(milliseconds as usize);
+    sched::delay_ms(milliseconds as usize, false);
     AE_OK
 }
 
@@ -560,11 +560,11 @@ extern "C" fn AcpiOsAcquireMutex(handle: *mut c_void, timeout: u16) -> ACPI_STAT
     }
     let m = unsafe { &*(handle as *const AcpiMutex) };
     let ok = if timeout == ACPI_WAIT_FOREVER {
-        m.sem.wait()
+        m.sem.wait(false)
     } else {
-        m.sem.wait_with_timeout(timeout as usize)
+        m.sem.wait_with_timeout(timeout as usize, false)
     };
-    if ok { AE_OK } else { AE_TIME }
+    if ok.is_ok() { AE_OK } else { AE_TIME }
 }
 
 #[unsafe(no_mangle)]
@@ -618,11 +618,11 @@ extern "C" fn AcpiOsWaitSemaphore(handle: *mut c_void, units: u32, timeout: u16)
     // loop. ACPICA almost always asks for 1; rare exceptions tolerate this.
     for _ in 0..units {
         let ok = if timeout == ACPI_WAIT_FOREVER {
-            s.sem.wait()
+            s.sem.wait(false)
         } else {
-            s.sem.wait_with_timeout(timeout as usize)
+            s.sem.wait_with_timeout(timeout as usize, false)
         };
-        if !ok {
+        if ok.is_err() {
             return AE_TIME;
         }
     }

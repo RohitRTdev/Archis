@@ -19,6 +19,7 @@ debug-io-logs = []
 debug-loader-logs = []
 debug-mem-logs = []
 debug-allocator-logs = []
+kunit-test = []
 
 [dependencies]
 kernel_intf = {workspace = true, features = ["link-kernel"]}

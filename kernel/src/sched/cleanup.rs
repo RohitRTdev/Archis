@@ -69,14 +69,14 @@ fn pop_one() -> Option<ListNodeGuard<ProcessCleanupWork, PoolAllocator>> {
 extern "C" fn cleanup_worker() -> ! {
     kernel_intf::info!("Started cleanup worker thread");
     loop {
-        CLEANUP_EVENT.get().unwrap().wait();
+        CLEANUP_EVENT.get().unwrap().wait(false);
         loop {
             let mut guard = match pop_one() {
                 Some(g) => g,
                 None => break,
             };
 
-            debug!("Destroying resources for process {}", guard.proc_id);
+            crate::sched_log!("Destroying resources for process {}", guard.proc_id);
 
             // Take handles out first so we control when Close IRPs fire.
             let handles = core::mem::take(&mut guard.handles);

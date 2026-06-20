@@ -487,7 +487,7 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
     };
     let buffer = MemoryRegion { base_address: buf_ptr.as_ptr() as usize, size: buf_size };
 
-    let irp = match io_request_sync(&fdo, IrpMajor::Pnp, IrpMinor::Enumerate, buffer, 0, None) {
+    let irp = match io_request_sync(&fdo, IrpMajor::Pnp, IrpMinor::Enumerate, buffer, 0, None, false) {
         Ok(irp) => irp,
         Err(e) => {
             info!("enumerate on '{}' failed: {}", fdo.name(), e);
@@ -556,7 +556,7 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
 fn query_id(dev: &DeviceHandleK) -> Option<String> {
     let irp = {
         let _g = dev.config_guard();
-        io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Query, EMPTY_REGION, 0, None).ok()?
+        io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Query, EMPTY_REGION, 0, None, false).ok()?
     };
     if irp.status != Status::Success {
         return None;

@@ -14,7 +14,7 @@ use crate::sched::Handle::{ProcessHandle, ThreadHandle};
 use super::*;
 use kernel_intf::*;
 
-const MAX_SYSCALLS: usize = 16;
+const MAX_SYSCALLS: usize = 18;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 
 static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
@@ -33,7 +33,9 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_get_pid_handler,
     sys_get_process_info_handler,
     sys_allocate_memory_handler,
-    sys_deallocate_memory_handler
+    sys_deallocate_memory_handler,
+    sys_set_signal_handler,
+    sys_sigreturn_handler
 ];
 
 fn read_c_strlen(start: usize) -> Option<usize> {
@@ -90,12 +92,12 @@ pub fn create_user_thread(user_fn_addr: usize, context: *mut c_void) -> Result<K
 // Creates the user stack for the current thread and hands ownership of its
 // physical range to the process. Returns the stack top (VA)
 fn setup_user_stack() -> usize {
-    let mut stack = Stack::new_user_stack().expect("Failed to create user stack!");
+    let stack = Stack::new_user_stack().expect("Failed to create user stack!");
     debug!("Created new user stack with base:{:#X}", stack.get_stack_base());
-    add_memory_range_to_cur_process(stack.get_alloc_base(), stack.get_stack_size(), true);
-
-    // User stacks will be cleaned up by the process manager, so remove ownership
-    Stack::into_inner(&mut stack).addr().get()
+    let stack_base = stack.get_stack_base();
+    add_user_stack_to_cur_task(stack);
+    
+    stack_base
 }
 
 // Lays out process arguments on the user stack, main(argc, argv) style:
@@ -201,7 +203,7 @@ pub extern "C" fn user_thread_init_handler() -> ! {
         let task = get_current_task().expect("user_thread_init_handler called outside task context!");
         let guard = task.lock();
         let user_fn = guard.get_user_fn().expect("user_thread_init_handler called without a user function!");
-        (user_fn as usize, guard.get_context_ptr() as usize)
+        (user_fn as usize, guard.get_arg_context() as usize)
     };
 
     // Place the context pointer as the first item on the user stack; the user
@@ -298,7 +300,7 @@ fn sys_open_file_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 
 // arg 1 = delay in ms
 fn sys_delay_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    delay_ms(args[0] as usize);
+    delay_ms(args[0] as usize, true);
 
     E_SUCCESS
 }
@@ -470,4 +472,36 @@ fn sys_deallocate_memory_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
             E_INVALID
         }
     }
+}
+
+// arg0 = signal (u8), arg1 = handler fn ptr (user VA), arg2 = user_ctx ptr
+fn sys_set_signal_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let signal = args[0] as u8;
+    if (signal as usize) >= MAX_SIGNALS {
+        return E_INVALID;
+    }
+
+    let handler_addr = args[1] as usize;
+    if handler_addr == 0 {
+        return E_INVALID;
+    }
+
+    let handler: DispatchRoutine = unsafe { core::mem::transmute(handler_addr) };
+    let user_ctx = args[2] as *mut c_void;
+
+    let proc = get_current_process().expect("sys_set_signal_handler called from idle task");
+    proc.lock().set_signal_handler(signal, SignalHandler {
+        user_ctx,
+        handler
+    });
+
+    debug!("sys_set_signal_handler: signal={} handler={:#X} user_ctx={:#X}",
+        signal, handler_addr, args[2]);
+
+    E_SUCCESS
+}
+
+fn sys_sigreturn_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    complete_signal();
+    E_SUCCESS
 }

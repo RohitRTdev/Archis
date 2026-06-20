@@ -1,6 +1,6 @@
 use crate::sync::{Once, Spinlock};
 use kernel_intf::{debug, info};
-use super::asm;
+use super::{enable_smap_feature, asm};
 use super::lapic::enable_x2apic;
 
 enum FeatureState {
@@ -102,6 +102,7 @@ const FEATURE_MAP: [FeatureDescriptor; 13] = [
         bit_idx: 20,
         is_required: FeatureState::NotRequired(|val| {
             val.smap = true;
+            enable_smap_feature();
         })
     },
     FeatureDescriptor {

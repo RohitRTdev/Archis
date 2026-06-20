@@ -17,17 +17,22 @@ FUNC SYSCALL_ENTRY
     pushq %r14
     pushq %r15
     
-    // Restore the actual user stack into this 
+    // Restore the actual kernel stack into this 
     leaq 56(%rsp), %r15
     movq %r15, %gs:16 
+
+    // Get the user stack
+    movq 48(%rsp), %r15 
 
     // Save the return address and rflags
     pushq %rcx
     pushq %r11
 
+    // To ensure 16 byte alignment
+    subq $8, %rsp
+
     // Push all args along with syscall number
     // Make space to store user gs
-    subq $8, %rsp
     pushq %r9
     pushq %r8
     pushq %r10 
@@ -36,8 +41,9 @@ FUNC SYSCALL_ENTRY
     pushq %rdi 
     pushq %rax
 
-    // To ensure 16 byte alignment
-    subq $8, %rsp
+    // This is the user stack 
+    // (We save it once more over here just for convenience of access)
+    pushq %r15 
 
     // Call the main handler with the arguments in place
     movq %rsp, %rdi

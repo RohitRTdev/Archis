@@ -31,6 +31,8 @@ pub enum KError {
     ProcessTerminated,
     ProcessInitFailed,
     WaitFailed,
+    WaitTimedOut,
+    WaitInterrupted,
     CircularDependency,
     ModuleNotDriver,
     DriverLoadFailed,
@@ -51,6 +53,7 @@ pub const E_PROCESS_TERMINATED: i64 = -7;
 pub const E_NOPERM: i64 = -8;
 pub const E_DEV_REMOVED: i64 = -9;
 pub const E_DEV_STARTED: i64 = -10;
+pub const E_WAIT_INTERRUPTED: i64 = -11;
 
 impl<T> From<Result<T, KError>> for KError {
     fn from(e: Result<T, KError>) -> Self {
@@ -69,7 +72,8 @@ impl From<KError> for i64 {
             KError::DeviceRemoved => E_DEV_REMOVED,
             KError::DeviceStarted => E_DEV_STARTED,
             KError::ProcessTerminated => E_PROCESS_TERMINATED,
-            KError::WaitFailed | KError::CircularDependency | KError::DriverLoadFailed |
+            KError::WaitInterrupted => E_WAIT_INTERRUPTED,
+            KError::WaitFailed | KError::WaitTimedOut | KError::CircularDependency | KError::DriverLoadFailed |
             KError::ModuleNotDriver | KError::ProcessInitFailed => E_INTERNAL_FAILURE
         }
     }
@@ -83,7 +87,9 @@ impl fmt::Display for KError {
             KError::OutOfMemory => "Out of memory",
             KError::ProcessTerminated => "Process terminated",
             KError::ProcessInitFailed => "Process init failed",
-            KError::WaitFailed => "Wait internal failure",
+            KError::WaitFailed => "Wait failed",
+            KError::WaitTimedOut => "Wait timed out",
+            KError::WaitInterrupted => "Wait interrupted",
             KError::CircularDependency => "Circular dependency in module load",
             KError::DriverLoadFailed => "Driver load failed",
             KError::Unsupported => "Operation not supported",

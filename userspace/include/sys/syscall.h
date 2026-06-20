@@ -18,7 +18,9 @@ enum syscall_t {
     SYSCALL_GET_PID,
     SYSCALL_GET_PROCESS_INFO,
     SYSCALL_ALLOCATE_MEMORY,
-    SYSCALL_DEALLOCATE_MEMORY
+    SYSCALL_DEALLOCATE_MEMORY,
+    SYSCALL_SET_SIGNAL_HANDLER,
+    SYSCALL_SIGRETURN
 };
 
 typedef enum {
@@ -42,6 +44,8 @@ typedef struct {
     uint64_t sid;
 } process_info_t;
 
+
+syscall_status_t sys_exit(int64_t exit_code);
 syscall_status_t sys_close(uint64_t fd);
 syscall_status_t sys_print(const char* msg);
 syscall_status_t sys_delay_ms(size_t ms);
@@ -53,4 +57,6 @@ syscall_status_t sys_get_pid();
 syscall_status_t sys_get_process_info(uint64_t pid, process_info_t *const buf);
 syscall_status_t sys_allocate_memory(size_t size, void **out);
 syscall_status_t sys_deallocate_memory(void *addr, size_t size);
+syscall_status_t sys_set_signal_handler(uint8_t signal, void (*handler)(void), void *user_ctx);
+syscall_status_t sys_sigreturn(void);
 

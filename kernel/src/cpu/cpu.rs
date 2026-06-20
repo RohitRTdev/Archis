@@ -40,7 +40,8 @@ pub struct Stack {
     guard_size: usize,
     stack_size: usize,
     base: NonNull<u8>,
-    allocated: bool
+    allocated: bool,
+    user: bool
 }
 
 #[cfg(not(test))]
@@ -56,7 +57,8 @@ impl Stack {
             guard_size: 0,
             stack_size: 0,
             base: NonNull::dangling(),
-            allocated: false
+            allocated: false,
+            user: false
         }
     }
 
@@ -73,40 +75,37 @@ impl Stack {
     pub fn new_with(stack_size: usize, guard_size: usize, is_user: bool) -> Result<Self, KError> {
         // TODO: Roll back and deallocate any memory allocations made in case operations further down fail
         
-        let stack_raw  = if is_user {
-            // For now, user stacks won't have guard pages
-            allocate_memory(Layout::from_size_align(stack_size, PAGE_SIZE).unwrap()
-            , PageDescriptor::VIRTUAL | PageDescriptor::USER)?
+        let vflags = if is_user {
+            PageDescriptor::VIRTUAL | PageDescriptor::NO_ALLOC | PageDescriptor::USER
         }
         else {
-            let stack_raw = allocate_memory(Layout::from_size_align(stack_size + guard_size, PAGE_SIZE).unwrap()
-            , PageDescriptor::VIRTUAL | PageDescriptor::NO_ALLOC)?;
-            
-            let stack_raw_phys = allocate_memory(Layout::from_size_align(stack_size, PAGE_SIZE).unwrap(),
-        0)?;
-
-            #[cfg(feature = "stack_down")]
-            let stack_base = unsafe {
-                stack_raw.add(guard_size)
-            };
-
-            #[cfg(not(feature = "stack_down"))]
-            let stack_base = stack_raw;
-
-            map_memory(stack_raw_phys.addr(), stack_base.addr(), stack_size, 0)?;
-        
-            stack_raw
-        }; 
-
-        let guard_size = if !is_user {
-            guard_size
-        }
-        else {
-            0
+            PageDescriptor::VIRTUAL | PageDescriptor::NO_ALLOC
         };
 
+        let stack_raw = allocate_memory(Layout::from_size_align(stack_size + guard_size, PAGE_SIZE).unwrap()
+        , vflags)?;
+        
+        let stack_raw_phys = allocate_memory(Layout::from_size_align(stack_size, PAGE_SIZE).unwrap(),
+    0)?;
+
+        #[cfg(feature = "stack_down")]
+        let stack_base = unsafe {
+            stack_raw.add(guard_size)
+        };
+
+        #[cfg(not(feature = "stack_down"))]
+        let stack_base = stack_raw;
+        let flags = if is_user {
+            PageDescriptor::USER
+        }
+        else {
+            PageDescriptor::VIRTUAL
+        };
+
+        map_memory(stack_raw_phys.addr(), stack_base.addr(), stack_size, flags)?;
+    
         Ok(Self {guard_size, stack_size, base: NonNull::new(stack_raw).unwrap(), 
-        allocated: true })
+        allocated: true, user: is_user })
     }
 
     pub fn get_stack_size(&self) -> usize {
@@ -125,10 +124,19 @@ impl Stack {
             return;
         }
 
+        let (flags, vflags)  = if self.user {
+            (PageDescriptor::VIRTUAL | PageDescriptor::USER,
+                PageDescriptor::VIRTUAL | PageDescriptor::NO_ALLOC | PageDescriptor::USER)
+        }
+        else {
+            (PageDescriptor::VIRTUAL,
+                PageDescriptor::VIRTUAL | PageDescriptor::NO_ALLOC)
+        };
+
         crate::sched_log!("Destroying stack with alloc_base={:#X} and base={:#X}", self.get_alloc_base(), self.get_stack_base());
         deallocate_memory(self.get_stack_top() as *mut u8,
         Layout::from_size_align(self.stack_size, PAGE_SIZE).unwrap(),
-        PageDescriptor::VIRTUAL)
+        flags)
         .expect("Stack base address wrong during unmap??");
         
         // Deallocate the guard page memory (if any)
@@ -136,7 +144,7 @@ impl Stack {
             deallocate_memory(
                 self.get_alloc_base() as *mut u8,
                 Layout::from_size_align(self.guard_size, PAGE_SIZE).unwrap()
-            , PageDescriptor::VIRTUAL | PageDescriptor::NO_ALLOC)
+            , vflags)
             .expect("Failed to deallocate memory for stack");
         }
 
@@ -240,7 +248,8 @@ pub fn register_cpu() -> usize {
             stack_size: PAGE_SIZE * 5,
             guard_size: 0,
             base: NonNull::new(boot_stack).unwrap(),
-            allocated: false
+            allocated: false,
+            user: false
         };
  
         CPUControlBlock {
@@ -249,7 +258,8 @@ pub fn register_cpu() -> usize {
                 stack_size: PAGE_SIZE,
                 guard_size: 0,
                 base: NonNull::new(KERN_BACKUP_STACK.stack.as_ptr() as *mut u8).unwrap(),
-                allocated: true
+                allocated: true,
+                user: false
             },
             panic_base: boot_stack_top
         }
@@ -288,7 +298,7 @@ pub fn get_worker_stack(core_id: usize) -> usize {
 // This should be called once memory manager is up
 pub fn set_worker_stack_for_boot_cpu(stack_base: *mut u8) {
     let stack = Stack {stack_size: INIT_STACK_SIZE, guard_size: INIT_GUARD_PAGE_SIZE, 
-        base: NonNull::new(stack_base).unwrap(), allocated: true};
+        base: NonNull::new(stack_base).unwrap(), allocated: true, user: false};
 
     let mut cpu_list = CPU_LIST.local().lock();
 

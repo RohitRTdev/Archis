@@ -128,12 +128,12 @@ extern "C" fn acquire_spinlock_ffi(lock: &mut Lock) {
             let mut count = 0;
             while !(*ptr_to_ref_mut::<_, hal::Spinlock>(&lock.lock)).try_lock() {
                 count += 1;
-                if count > 1000000 {
+                if count > 10000000 {
                     break;
                 }
             } 
 
-            if count > 1000000 {
+            if count > 10000000 {
                 panic!("Lock acquisition failed on logger lock..."); 
             }
 

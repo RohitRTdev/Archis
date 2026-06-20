@@ -31,7 +31,7 @@ CRT_SRCS := crt/$(ARCH)/*
 
 # Mention the binaries to be compiled in this list 
 # (The names of these binaries don't correspond to the actual program you're used to)
-BINARIES := cat ls tester
+BINARIES := cat ls tester signal_test
 
 # Shared libraries (dynamically loaded) and static libraries(.a archives) are to be mentioned here
 SHARED_LIBS := c
@@ -47,6 +47,9 @@ cat_LIBS := c
 
 ls_SRCS := ls.c string.c
 ls_LIBS := c
+
+signal_test_SRCS := signal_test.c
+signal_test_LIBS := c
 
 c_SRCS := libc/*.c libc/*.s libc/$(ARCH)/*
 

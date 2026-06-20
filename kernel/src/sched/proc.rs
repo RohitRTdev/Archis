@@ -38,6 +38,12 @@ pub enum ProcessStatus {
     Terminated
 }
 
+#[derive(Clone, Copy)]
+pub struct SignalHandler {
+    pub user_ctx: *mut c_void,
+    pub handler: DispatchRoutine
+}
+
 pub struct Process {
     id: usize,
     pid: usize,
@@ -61,6 +67,9 @@ pub struct Process {
     // List of physical addresses that are deallocated once the process is killed
     // The virtual address space would be destroyed prior to this deallocation
     memory_list: DynList<MemoryRegion>,
+    signal_handlers: [Option<SignalHandler>; MAX_SIGNALS],
+    pending_signals: u8,
+    signal_guard: Arc<Spinlock<bool>>,
     args: Vec<String>,
     exit_code: AtomicIsize
 }
@@ -113,6 +122,9 @@ impl Process {
             memory_list: List::new(),
             file_table: Vec::new(),
             user_modules: Vec::new(),
+            signal_handlers: [None; MAX_SIGNALS],
+            pending_signals: 0,
+            signal_guard: Arc::new(Spinlock::new(true)),
             args,
             exit_code: AtomicIsize::new(0)
         }), PoolAllocatorGlobal);
@@ -144,6 +156,24 @@ impl Process {
 
     pub fn get_id(&self) -> usize {
         self.id
+    }
+
+    pub fn get_num_threads(&self) -> usize {
+        self.threads.get_nodes()
+    }
+
+    pub fn get_signal_handler(&self, signal: u8) -> Option<SignalHandler> {
+        assert!((signal as usize) < self.signal_handlers.len());
+        self.signal_handlers[signal as usize]
+    }
+
+    pub fn set_signal_handler(&mut self, signal: u8, handler: SignalHandler) {
+        assert!((signal as usize) < self.signal_handlers.len());
+        self.signal_handlers[signal as usize] = Some(handler);
+    }
+
+    pub fn get_threads_snapshot(&self) -> Vec<usize> {
+        self.threads.iter().map(|t| {**t}).collect()
     }
 
     pub fn attach_thread_to_current_process(&mut self, thread_id: usize) -> Result<(), KError> {
@@ -305,6 +335,18 @@ impl Process {
         device handles = {},
         misc handles = {}", self.id, file_handles, img_handles, device_handles, misc_handles);
     }
+
+    pub(super) fn get_pending_signals(&self) -> u8 {
+        self.pending_signals
+    }
+    
+    pub(super) fn set_pending_signals(&mut self, pending_signal_mask: u8) {
+        self.pending_signals = pending_signal_mask
+    }
+
+    pub(super) fn get_signal_guard(&self) -> Arc<Spinlock<bool>> {
+        self.signal_guard.clone()
+    }
 }
 
 impl Drop for Process {
@@ -458,7 +500,7 @@ pub fn create_process(args: Vec<String>, context_ptr: *mut c_void, is_user: bool
     enable_preemption();
 
     if is_user {
-        init_notify_sem.wait();
+        let _ = init_notify_sem.wait(false);
         if !process.lock().init_status {
             return Err(KError::ProcessInitFailed);
         }
@@ -646,7 +688,7 @@ extern "C" fn sched_create_process_ffi(
 #[unsafe(no_mangle)]
 extern "C" fn sched_wait_process_ffi(proc_id: usize) {
     if let Some(proc) = get_process_info(proc_id) {
-        let _ = proc.wait();
+        let _ = proc.wait(false);
     }
 }
 
@@ -657,12 +699,12 @@ extern "C" fn sched_kill_process_ffi(proc_id: usize, exit_code: isize) {
 
 impl Spinlock<Process> {
     // Blocks caller until process terminates
-    pub fn wait(&self) -> bool {
+    pub fn wait(&self, is_interruptible: bool) -> bool {
         let sem = {
             let task = self.lock();
             task.term_notify.clone() 
         };
 
-        sem.wait()
+        sem.wait(is_interruptible).is_ok()
     }
 }

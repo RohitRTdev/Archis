@@ -1,11 +1,12 @@
 use common::{MemoryRegion, PAGE_SIZE};
 use kernel_intf::{debug, info};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::ptr::NonNull;
 use crate::cpu::{self, MAX_CPUS, PerCpu, general_interrupt_handler};
 use crate::hal::x86_64::asm::switch_context_force;
 use crate::hal::{enable_scheduler_timer, get_core, get_per_cpu_base, get_per_cpu_kernel_base};
 use crate::infra;
+use crate::sched::{SIGSEGV, issue_signal};
 use crate::sync::Spinlock;
 use super::{lapic, timer};
 use crate::mem::on_page_fault;
@@ -44,6 +45,11 @@ struct IPIRequest {
     core: usize
 }
 
+struct InterruptContext {
+    is_interrupt: bool,
+    vector: usize
+}
+
 static NEXT_AVAILABLE_VECTOR: AtomicUsize = AtomicUsize::new(USER_VECTOR_START);
 
 const EXCEPTION_VECTOR_RANGE: usize = 32;
@@ -59,8 +65,8 @@ static PER_CPU_NESTED_CONTEXT: PerCpu<AtomicUsize> = PerCpu::new_with(
     [const {AtomicUsize::new(0)}; MAX_CPUS]
 );
 
-static IS_INTERRUPT_CONTEXT: PerCpu<AtomicBool> = PerCpu::new_with(
-    [const {AtomicBool::new(false)}; MAX_CPUS]
+static IS_INTERRUPT_CONTEXT: PerCpu<Spinlock<InterruptContext>> = PerCpu::new_with(
+    [const {Spinlock::new(InterruptContext { is_interrupt: false, vector: 0 })}; MAX_CPUS]
 );
 static IPI_REQUESTS: Spinlock<FixedList<IPIRequest, {Region3 as usize}>> = Spinlock::new(List::new());
 
@@ -141,9 +147,24 @@ impl CPUContext {
     }
 }
 
+fn set_interrupt_context(is_interrupt: bool, vector: usize) {
+    let mut int_context = IS_INTERRUPT_CONTEXT.local().lock();
+    int_context.is_interrupt = is_interrupt;
+    int_context.vector = vector;
+}
+
 pub fn force_context_switch() {
-    assert!(IS_INTERRUPT_CONTEXT.local().load(Ordering::Acquire));
-    IS_INTERRUPT_CONTEXT.local().store(false, Ordering::Release);
+    {
+        let mut int_context = IS_INTERRUPT_CONTEXT.local().lock();
+        assert!(int_context.is_interrupt);
+        
+        if int_context.vector as usize > DEBUG_VECTOR && int_context.vector as usize != SYS_VECTOR {
+            eoi();
+        }
+        
+        int_context.is_interrupt = false;
+        int_context.vector = 0;
+    }
     let con = PER_CPU_GLOBAL_CONTEXT.local().load(Ordering::Acquire) as *const CPUContext;
 
     unsafe { switch_context_force(con.addr() as u64); }
@@ -152,7 +173,7 @@ pub fn force_context_switch() {
 #[unsafe(no_mangle)]
 extern "C" fn global_interrupt_handler(vector: u64, cpu_context: *const CPUContext) -> *const CPUContext {
     let in_dw = crate::sched::is_in_dw_mode();
-    IS_INTERRUPT_CONTEXT.local().store(true, Ordering::Release);
+    set_interrupt_context(true, vector as usize);
 
     // While in DW mode the original interrupted-task context still lives in
     // PER_CPU_GLOBAL_CONTEXT and must not be touched 
@@ -172,7 +193,7 @@ extern "C" fn global_interrupt_handler(vector: u64, cpu_context: *const CPUConte
         crate::sched::dw_handler();
     }
     
-    IS_INTERRUPT_CONTEXT.local().store(false, Ordering::Release);
+    set_interrupt_context(false, 0);
     slot.local().load(Ordering::Acquire) as *const CPUContext
 }
 
@@ -284,7 +305,7 @@ fn page_fault_handler(_vector: usize) {
 }
 
 pub fn is_system_in_interrupt_context() -> bool {
-    IS_INTERRUPT_CONTEXT.local().load(Ordering::Acquire)
+    IS_INTERRUPT_CONTEXT.local().lock().is_interrupt
 }
 
 pub fn fetch_context() -> usize {
@@ -292,18 +313,24 @@ pub fn fetch_context() -> usize {
     PER_CPU_GLOBAL_CONTEXT.local().load(Ordering::Acquire)
 }
 
-pub fn is_user_fault_context() -> bool {
-    let con = unsafe { *(fetch_context() as *const CPUContext) };
+pub fn get_user_stack(context: usize) -> usize {
+    let con = unsafe { &*(context as *const CPUContext) };
+    con.rsp as usize
+}
+
+pub fn is_user_context(context: usize) -> bool {
+    let con = unsafe { &*(context as *const CPUContext) };
     con.cs & 3 == 3
 }
 
 // If the current fault context is user space and a user process is active,
 // kill that process with exit code -1 
 pub fn try_kill_user_process(fault_label: &str) {
-    if is_user_fault_context() {
-        if crate::sched::get_current_process_id().is_some() {
+    if is_user_context(fetch_context()) {
+        if let Some(pid) = crate::sched::get_current_process_id() {
             info!("{} in user process — killing process", fault_label);
-            crate::sched::exit_process(-1);
+            issue_signal(pid, SIGSEGV);
+            crate::sched::yield_cpu();
         }
     }
 }
@@ -313,14 +340,61 @@ pub fn switch_context(new_context: usize) {
     PER_CPU_GLOBAL_CONTEXT.local().store(new_context, Ordering::Release);
 }
 
-pub fn create_kernel_context(handler: extern "C" fn() -> !, stack_base: *mut u8) -> usize {
+pub fn create_context_from(handler: extern "C" fn() -> !, stack_base: *mut u8, actual_base: usize, context: usize) -> usize {
     let mut sp = stack_base as usize;
+    assert!(sp & 0xF == 0, "create_context_from() -> unaligned stack pointer!");
+    assert!(actual_base & 0xF == 0, "create_context_from() -> unaligned stack pointer!");
+
+    sp -= core::mem::size_of::<CPUContext>();
+    let new_context = sp as *mut CPUContext;
+    let context = context as *const CPUContext;
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(context as *const u8, new_context as *mut u8, size_of::<CPUContext>());
+        let new_context = &mut *new_context;
+        new_context.rip = handler as u64;
+        new_context.rsp = actual_base as u64;
+        new_context.rbp = 0;
+    } 
+
+    sp
+}
+
+pub fn create_user_context(handler: extern "C" fn() -> !, stack_base: *mut u8, actual_base: usize) -> usize {
+    let mut sp = stack_base as usize;
+    assert!(sp & 0xF == 0, "create_context() -> unaligned stack pointer!");
+    assert!(actual_base & 0xF == 0, "create_context_from() -> unaligned stack pointer!");
 
     // 16 byte alignment is maintained since stack_base already aligned to 4096 bytes
     sp -= core::mem::size_of::<CPUContext>();
 
-    // Sanity: ensure stack pointer remains 16-byte aligned after allocating the CPUContext
-    debug_assert_eq!(sp & 0xF, 0, "create_kernel_context produced an unaligned stack pointer");
+    let mut context = CPUContext::new();
+    context.rip = handler as u64;
+    context.rbp = 0; // Stops backtrace walkers at the base frame
+    
+    context.rsp = actual_base as u64;
+
+    // user code + user data
+    context.cs = 0x23;
+    context.ss = 0x1b;
+    context.rflags = unsafe {
+        super::cpu_regs::INIT_RFLAGS
+    };
+
+
+    unsafe {
+        (sp as *mut CPUContext).write(context);
+    };
+
+    sp    
+}
+
+pub fn create_kernel_context(handler: extern "C" fn() -> !, stack_base: *mut u8) -> usize {
+    let mut sp = stack_base as usize;
+    assert!(sp & 0xF == 0, "create_context() -> unaligned stack pointer!");
+
+    // 16 byte alignment is maintained since stack_base already aligned to 4096 bytes
+    sp -= core::mem::size_of::<CPUContext>();
 
     let mut context = CPUContext::new();
     context.rip = handler as u64;

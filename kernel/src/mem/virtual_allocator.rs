@@ -665,6 +665,21 @@ pub fn map_page_table(virt_addr: usize, phy_addr: usize, proc_id: usize) -> Resu
     Ok(())
 }
 
+pub fn map_to_kernel(phys_addr: usize, size: usize) -> Result<*mut u8, KError> {
+    let layout = Layout::from_size_align(size, PAGE_SIZE).unwrap();
+    let virt_addr = allocate_memory(layout, PageDescriptor::VIRTUAL | PageDescriptor::NO_ALLOC)?;
+    map_memory(phys_addr, virt_addr.addr(), size, PageDescriptor::VIRTUAL)?;
+
+    Ok(virt_addr)
+} 
+
+pub fn unmap_from_kernel(virt_addr: usize, size: usize) -> Result<(), KError> {
+    let layout = Layout::from_size_align(size, PAGE_SIZE).unwrap();
+
+    unmap_memory(virt_addr, size, PageDescriptor::VIRTUAL)?;
+    deallocate_memory(virt_addr as *mut u8, layout, PageDescriptor::VIRTUAL | PageDescriptor::NO_ALLOC)
+} 
+
 // When the page mapper needs to unmap page from current address space, but the page mapper
 // is not the active mapper, so it uses this utility function
 pub fn unmap_page_table(virt_addr: usize, proc_id: usize) -> Result<(), KError> {
@@ -781,12 +796,16 @@ pub fn deallocate_memory(addr: *mut u8, layout: Layout, flags: u8) -> Result<(),
     if IS_ADDR_SPACE_INIT.load(Ordering::Relaxed) & (flags & PageDescriptor::VIRTUAL != 0) {
         let phy_addr = if flags & PageDescriptor::USER != 0 {
             let active_addr_space = get_active_vcb();
-            assert!(!(flags & PageDescriptor::USER != 0 && flags & PageDescriptor::NO_ALLOC != 0), "USER and NO_ALLOC flag combination not supported right now");
-            
-            let phy_addr = unsafe {
-                (*active_addr_space.as_ptr())
-                .lock()
-                .unmap_memory(addr as usize, layout.size(), true, false)?
+
+            let phy_addr = if flags & PageDescriptor::NO_ALLOC == 0 {
+                unsafe {
+                    (*active_addr_space.as_ptr())
+                    .lock()
+                    .unmap_memory(addr as usize, layout.size(), true, false)?
+                }
+            } 
+            else {
+                0 as *mut u8
             };
             
             unsafe {
@@ -795,7 +814,9 @@ pub fn deallocate_memory(addr: *mut u8, layout: Layout, flags: u8) -> Result<(),
                 .deallocate(addr, layout)?
             };
 
-            PageMapper::invalidate_other_cores(MemoryRegion{base_address: addr.addr(), size: layout.size()});
+            if flags & PageDescriptor::NO_ALLOC == 0 {
+                PageMapper::invalidate_other_cores(MemoryRegion{base_address: addr.addr(), size: layout.size()});
+            }
 
             phy_addr
         }

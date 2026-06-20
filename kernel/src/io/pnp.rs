@@ -72,7 +72,7 @@ pub fn register_driver(name: String) {
 pub fn pnp_fence() {
     let event = KEvent::new(false);
     pnp_post(PnpRequest::Fence { event: event.clone() });
-    event.wait();
+    event.wait(false);
 }
 
 fn pop_one() -> Option<ListNodeGuard<PnpRequest, PoolAllocator>> {
@@ -129,7 +129,7 @@ extern "C" fn pnp_worker() -> ! {
     info!("Started pnp worker thread");
     loop {
         crate::io_log!("pnp_worker: Waiting for requests");
-        PNP_SIGNAL.get().unwrap().wait();
+        PNP_SIGNAL.get().unwrap().wait(false);
         // Drain until empty, then go back to waiting.
         loop {
             let guard = match pop_one() {

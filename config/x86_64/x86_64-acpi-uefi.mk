@@ -10,10 +10,10 @@ KERNEL_EXE = target/x86_64/$(CONFIG)/libaris.so
 LINKER_SCRIPT = kernel/config/x86_64/linker.ld
 MODULE_LINKER_SCRIPT = config/x86_64/module_linker.ld
 USER_LINKER_SCRIPT := config/x86_64/user_linker.ld
-OUTPUT_IMAGE = $(OUTPUT_DIR)/archis_os.iso
+OUTPUT_IMAGE = $(OUTPUT_DIR)/archis_os.img
 PLATFORM = acpi
 BOOTLOADER = uefi
-KERNEL_OPTIONS = --features acpi,stack_down,debug-scheduler-logs,debug-io-logs
+KERNEL_OPTIONS = --features acpi,stack_down,debug-io-logs
 BLR_OPTIONS = --features acpi
 
 ifeq ($(OS),Windows_NT)

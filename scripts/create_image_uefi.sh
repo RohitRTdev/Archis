@@ -2,7 +2,7 @@
 set -e
 
 # CONFIGURATION
-IMG=output/archis_os.iso
+IMG=output/archis_os.img
 SIZE_MB=200
 EFI_SIZE_MB=100
 EFI_LABEL="EFI"

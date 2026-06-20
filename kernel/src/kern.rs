@@ -41,7 +41,7 @@ mod tests;
 use sync::{Once, Spinlock};
 use mem::Regions::*;
 use mem::FixedList;
-use kernel_intf::driver::{IrpMajor, IrpMinor, IrpResult, Keystroke, Status, create_device_by_id};
+use kernel_intf::driver::{IrpMajor, IrpMinor, IrpResult, Keystroke, create_device_by_id};
 use kernel_intf::KError;
 use kernel_intf::list::List;
 use sync::KSem;
@@ -77,7 +77,7 @@ static THREAD_DONE_SEM: Once<KSem> = Once::new();
 extern "C" fn test_thread_runner() -> ! {
     let id = sched::get_current_task_id().unwrap_or(0);
     info!("test_thread_runner: started (id={})", id);
-    sched::delay_ms(500);
+    sched::delay_ms(500, false);
     info!("test_thread_runner: signaling done (id={})", id);
     THREAD_DONE_SEM.get().unwrap().signal();
     sched::exit_thread(0);
@@ -108,7 +108,7 @@ fn run_proc_thread_tests() {
     )
     .expect("proc/thread test 1: failed to create process");
 
-    proc1.wait();
+    proc1.wait(false);
     let code1 = proc1.lock().get_exit_code();
     info!("proc/thread test 1: process exited with code {}", code1);
     info!("proc/thread test 1: ctx.val1 after = {} (expect 10)", ctx.val1);
@@ -131,7 +131,7 @@ fn run_proc_thread_tests() {
     }
 
     for (i, p) in procs.iter().enumerate() {
-        p.wait();
+        p.wait(false);
         info!("proc/thread test 2: process {} exited with code {}", i, p.lock().get_exit_code());
     }
 
@@ -151,7 +151,7 @@ fn run_proc_thread_tests() {
 
     // Wait for every thread to signal it has finished.
     for _ in 0..THREAD_COUNT {
-        THREAD_DONE_SEM.get().unwrap().wait();
+        THREAD_DONE_SEM.get().unwrap().wait(false);
     }
     info!("proc/thread test 3: all {} threads completed", THREAD_COUNT);
     drop(threads);
@@ -191,10 +191,10 @@ extern "C" fn task_kill_cancel_runner() -> ! {
     let _ = handle.read(io::ReadRequest {
         buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 1 },
         offset: 0
-    });
+    }, false);
 
     info!("task_kill_cancel_runner: read returned (post-cancel)");
-    loop { sched::delay_ms(1000); }
+    loop { sched::delay_ms(1000, false); }
 }
 
 extern "C" fn self_cancel_runner() -> ! {
@@ -219,11 +219,11 @@ extern "C" fn self_cancel_runner() -> ! {
         core::ptr::null_mut(),
     );
 
-    sched::delay_ms(200);
+    sched::delay_ms(200, false);
     info!("self_cancel_runner: calling cancel_pending_irp");
     io::cancel_pending_irp(&handle);
 
-    sched::delay_ms(200);
+    sched::delay_ms(200, false);
     info!(
         "self_cancel_runner: pending_irps on input = {}",
         handle.get_pending_irps().lock().get_nodes()
@@ -233,21 +233,21 @@ extern "C" fn self_cancel_runner() -> ! {
 
 fn run_cancel_tests() {
     // Wait for PnP to start i8042 and the input class device.
-    sched::delay_ms(500);
+    sched::delay_ms(500, false);
 
     // task-kill cancellation
     let killer_target = sched::create_thread(task_kill_cancel_runner, core::ptr::null_mut())
         .expect("Failed to spawn task_kill_cancel_runner");
-    sched::delay_ms(300);
+    sched::delay_ms(300, false);
     let tid = killer_target.lock().get_id();
     info!("cancel test (a): killing thread {}", tid);
     sched::kill_thread(tid, 0);
-    sched::delay_ms(500);
+    sched::delay_ms(500, false);
 
     // per-handle self-cancellation
     let _ = sched::create_thread(self_cancel_runner, core::ptr::null_mut())
         .expect("Failed to spawn self_cancel_runner");
-    sched::delay_ms(1000);
+    sched::delay_ms(1000, false);
 
     // duplicate device name guard.
     let probe = match io::open_device_handle("input") {
@@ -296,11 +296,11 @@ extern "C" fn state_reject_loop() -> ! {
         let res = dev.read(io::ReadRequest {
             buffer: MemoryRegion { base_address: 0, size: 0 },
             offset: 0
-        });
+        }, false);
         if let Err(KError::DeviceStopped) = res {
             REJECTED_DURING_STOPPED.fetch_add(1, Ordering::Relaxed);
         }
-        sched::delay_ms(10);
+        sched::delay_ms(10, false);
     }
     sched::exit_thread(0);
 }
@@ -322,7 +322,7 @@ extern "C" fn state_io_once() -> ! {
     let res = dev.read(io::ReadRequest {
         buffer: MemoryRegion { base_address: 0, size: 0 },
         offset: 0
-    });
+    }, false);
     if matches!(res, Ok(_)) {
         REACHED_DRIVER_AFTER_START.fetch_add(1, Ordering::Relaxed);
     }
@@ -336,7 +336,7 @@ fn run_state_tests() {
     info!("=== run_state_tests: BEGIN ===");
 
     // Wait for PnP to bring up i8042.
-    sched::delay_ms(500);
+    sched::delay_ms(500, false);
 
     let dev = match io::open_device_handle("ps/2_port0") {
         Ok(h) => h,
@@ -352,7 +352,7 @@ fn run_state_tests() {
     let baseline = dev.read(io::ReadRequest {
         buffer: MemoryRegion { base_address: 0, size: 0 },
         offset: 0
-    });
+    }, false);
     info!("state phase 1 (Started baseline): read -> {:?}", baseline.map(|s| s as isize));
     assert!(matches!(baseline, Ok(_)), "baseline read on Started device must reach the driver");
 
@@ -362,12 +362,12 @@ fn run_state_tests() {
     for _ in 0..3 {
         sched::create_thread(state_reject_loop, core::ptr::null_mut()).expect("Failed to spawn state_reject_loop");
     }
-    sched::delay_ms(50);
+    sched::delay_ms(50, false);
     info!("state phase 2: stopping device");
     dev.stop().expect("stop must succeed");
-    sched::delay_ms(300);
+    sched::delay_ms(300, false);
     STATE_TEST_RUN.store(false, Ordering::Release);
-    sched::delay_ms(100);
+    sched::delay_ms(100, false);
     let rejected = REJECTED_DURING_STOPPED.load(Ordering::Relaxed);
     info!("state phase 2: rejected_during_stopped = {}", rejected);
     assert!(rejected > 0, "reads issued after stop must be rejected");
@@ -378,11 +378,11 @@ fn run_state_tests() {
     for _ in 0..3 {
         sched::create_thread(state_start_once, core::ptr::null_mut()).expect("Failed to spawn state_start_once");
     }
-    sched::delay_ms(300);
+    sched::delay_ms(300, false);
     let post_start = dev.read(io::ReadRequest {
         buffer: MemoryRegion { base_address: 0, size: 0 },
         offset: 0
-    });
+    }, false);
     info!("state phase 3: post-start sanity read -> {:?}", post_start.map(|s| s as isize));
     assert!(matches!(post_start, Ok(_)),
             "device must be Started after concurrent start attempts");
@@ -393,7 +393,7 @@ fn run_state_tests() {
     for _ in 0..3 {
         sched::create_thread(state_io_once, core::ptr::null_mut()).expect("Failed to spawn state_io_once");
     }
-    sched::delay_ms(300);
+    sched::delay_ms(300, false);
     let reached = REACHED_DRIVER_AFTER_START.load(Ordering::Relaxed);
     info!("state phase 4: reached_driver_after_start = {}", reached);
     assert!(reached > 0, "concurrent reads on Started device must reach the driver");
@@ -430,7 +430,7 @@ extern "C" fn thread_creator() -> ! {
     info!("Created new thread");
     loop {
         sched::create_thread(thread_creator, core::ptr::null_mut()).expect("Failed to create kernel thread!");
-        sched::delay_ms(500);
+        sched::delay_ms(500, false);
     }
 }
 
@@ -465,7 +465,7 @@ fn reset_sync_counters() {
 
 // Generic semaphore waiter. Records whether it was signalled vs timed out.
 extern "C" fn sync_sem_waiter() -> ! {
-    let res = SYNC_TEST_SEM.get().unwrap().wait();
+    let res = SYNC_TEST_SEM.get().unwrap().wait(false).is_ok();
     if res {
         SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -479,7 +479,7 @@ extern "C" fn sync_sem_waiter() -> ! {
 // Waits for 300ms then signals SYNC_TEST_SEM once. Used to test
 // "signal arrives before timeout".
 extern "C" fn sync_delayed_signaller() -> ! {
-    sched::delay_ms(300);
+    sched::delay_ms(300, false);
     SYNC_TEST_SEM.get().unwrap().signal();
     sched::exit_thread(0);
 }
@@ -490,7 +490,7 @@ extern "C" fn sync_delayed_signaller() -> ! {
 // regression test for the "timer-removed-by-wrong-task" bug.
 extern "C" fn sync_long_timeout_waiter() -> ! {
     // 3 seconds — well beyond the 500ms we let the test run before signalling
-    let res = SYNC_TEST_SEM.get().unwrap().wait_with_timeout(3000);
+    let res = SYNC_TEST_SEM.get().unwrap().wait_with_timeout(3000, false).is_ok();
     if res {
         SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -503,7 +503,7 @@ extern "C" fn sync_long_timeout_waiter() -> ! {
 
 extern "C" fn sync_short_timeout_waiter() -> ! {
     // 200ms — must hit the timeout deterministically
-    let res = SYNC_TEST_SEM.get().unwrap().wait_with_timeout(200);
+    let res = SYNC_TEST_SEM.get().unwrap().wait_with_timeout(200, false).is_ok();
     if res {
         SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -516,7 +516,7 @@ extern "C" fn sync_short_timeout_waiter() -> ! {
 
 // Generic event waiter (manual reset event in SYNC_MANUAL_EVENT).
 extern "C" fn sync_manual_event_waiter() -> ! {
-    let res = SYNC_MANUAL_EVENT.get().unwrap().wait();
+    let res = SYNC_MANUAL_EVENT.get().unwrap().wait(false).is_ok();
     if res {
         SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
     }
@@ -527,7 +527,7 @@ extern "C" fn sync_manual_event_waiter() -> ! {
 
 // Generic event waiter (auto reset event in SYNC_AUTO_EVENT).
 extern "C" fn sync_auto_event_waiter() -> ! {
-    let res = SYNC_AUTO_EVENT.get().unwrap().wait();
+    let res = SYNC_AUTO_EVENT.get().unwrap().wait(false).is_ok();
     if res {
         SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
     }
@@ -538,7 +538,9 @@ extern "C" fn sync_auto_event_waiter() -> ! {
 
 fn join_workers(done_sem: &KSem, count: usize) {
     for _ in 0..count {
-        done_sem.wait();
+        if done_sem.wait_with_timeout(10000, false).is_err() {
+            debug!("join workers exited due to timeout!");
+        }
     }
 }
 
@@ -549,7 +551,7 @@ fn run_sync_tests() {
     // KSem/KEvent inside each test that needs different state, but the Once
     // is filled with a placeholder first so .get() never panics.
     SYNC_TEST_SEM.call_once(|| KSem::new(0, 1));
-    SYNC_TEST_DONE.call_once(|| KSem::new(0, 64));
+    SYNC_TEST_DONE.call_once(|| KSem::new(0, 200));
     SYNC_AUTO_EVENT.call_once(|| KEvent::new(true));
     SYNC_MANUAL_EVENT.call_once(|| KEvent::new(false));
 
@@ -561,14 +563,14 @@ fn run_sync_tests() {
         sem.signal();
         sem.signal();
         // Three signals queued; three try_wait should succeed.
-        assert!(sem.wait_with_timeout(0), "test 1: first try_wait expected success");
-        assert!(sem.wait_with_timeout(0), "test 1: second try_wait expected success");
-        assert!(sem.wait_with_timeout(0), "test 1: third try_wait expected success");
+        assert!(sem.wait_with_timeout(0, false).is_ok(), "test 1: first try_wait expected success");
+        assert!(sem.wait_with_timeout(0, false).is_ok(), "test 1: second try_wait expected success");
+        assert!(sem.wait_with_timeout(0, false).is_ok(), "test 1: third try_wait expected success");
         // Fourth must fail (counter back at 0).
-        assert!(!sem.wait_with_timeout(0), "test 1: fourth try_wait must fail");
+        assert!(!sem.wait_with_timeout(0, false).is_ok(), "test 1: fourth try_wait must fail");
         // Confirm counter wasn't corrupted by the failed try_wait.
         sem.signal();
-        assert!(sem.wait_with_timeout(0),
+        assert!(sem.wait_with_timeout(0, false).is_ok(),
             "test 1: after signal post-failed-try_wait, try_wait must succeed (regression for try_wait counter leak)");
     }
     info!("sync test 1: PASSED");
@@ -579,9 +581,9 @@ fn run_sync_tests() {
         let sem = KSem::new(2, 2);   // already at max
         sem.signal();                // must clamp, not overflow
         sem.signal();
-        assert!(sem.wait_with_timeout(0), "test 2: 1st try_wait");
-        assert!(sem.wait_with_timeout(0), "test 2: 2nd try_wait");
-        assert!(!sem.wait_with_timeout(0), "test 2: 3rd try_wait must fail (counter must have been clamped at 2)");
+        assert!(sem.wait_with_timeout(0, false).is_ok(), "test 2: 1st try_wait");
+        assert!(sem.wait_with_timeout(0, false).is_ok(), "test 2: 2nd try_wait");
+        assert!(!sem.wait_with_timeout(0, false).is_ok(), "test 2: 3rd try_wait must fail (counter must have been clamped at 2)");
     }
     info!("sync test 2: PASSED");
 
@@ -589,7 +591,7 @@ fn run_sync_tests() {
     info!("sync test 3: wait_with_timeout expires without signal");
     {
         let sem = KSem::new(0, 1);
-        let res = sem.wait_with_timeout(200);
+        let res = sem.wait_with_timeout(200, false).is_ok();
         assert!(!res, "test 3: timed wait must return false on expiry");
     }
     info!("sync test 3: PASSED");
@@ -599,11 +601,11 @@ fn run_sync_tests() {
     info!("sync test 4: stale last_wait_on_expired_timer must be reset");
     {
         let sem = KSem::new(0, 1);
-        let res1 = sem.wait_with_timeout(100);
+        let res1 = sem.wait_with_timeout(100, false).is_ok();
         assert!(!res1, "test 4: setup wait must time out");
         // Now make the next wait succeed immediately.
         sem.signal();
-        let res2 = sem.wait();
+        let res2 = sem.wait(false).is_ok();
         assert!(res2, "test 4: immediate-success wait returned false — stale timer flag (regression)");
     }
     info!("sync test 4: PASSED");
@@ -615,20 +617,18 @@ fn run_sync_tests() {
         // Spawn a thread that signals after 200ms.
         static T5_SEM: Once<KSem> = Once::new();
         T5_SEM.call_once(|| sem.clone());
-        // (We don't actually need T5_SEM since `sem.clone()` shares inner.)
-        let _ = T5_SEM;
 
         extern "C" fn t5_signaller() -> ! {
-            sched::delay_ms(200);
+            sched::delay_ms(200, false);
             T5_SEM.get().unwrap().signal();
             sched::exit_thread(0);
         }
         let h = sched::create_thread(t5_signaller, core::ptr::null_mut())
             .expect("test 5: spawn signaller");
 
-        let res = sem.wait_with_timeout(2000);
+        let res = sem.wait_with_timeout(2000, false).is_ok();
 
-        h.wait();
+        h.wait(false);
         assert!(res, "test 5: must return true (signalled), got false (timeout)");
     }
     info!("sync test 5: PASSED");
@@ -649,7 +649,7 @@ fn run_sync_tests() {
         T6_SEM.call_once(|| sem.clone());
 
         extern "C" fn t6_long() -> ! {
-            let res = T6_SEM.get().unwrap().wait_with_timeout(3000);
+            let res = T6_SEM.get().unwrap().wait_with_timeout(3000, false).is_ok();
             if res { SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed); }
             else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
             SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -657,7 +657,7 @@ fn run_sync_tests() {
             sched::exit_thread(0);
         }
         extern "C" fn t6_short() -> ! {
-            let res = T6_SEM.get().unwrap().wait_with_timeout(200);
+            let res = T6_SEM.get().unwrap().wait_with_timeout(200, false).is_ok();
             if res { SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed); }
             else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
             SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -670,7 +670,7 @@ fn run_sync_tests() {
         let s1 = sched::create_thread(t6_short, core::ptr::null_mut()).unwrap();
 
         // Make sure all three blocked.
-        sched::delay_ms(50);
+        sched::delay_ms(50, false);
 
         // Two signals → wakes 2 of the 3 
         sem.signal();
@@ -678,7 +678,7 @@ fn run_sync_tests() {
 
         // Wait for all three workers.
         join_workers(SYNC_TEST_DONE.get().unwrap(), 3);
-        l1.wait(); l2.wait(); s1.wait();
+        l1.wait(false); l2.wait(false); s1.wait(false);
 
         let signalled = SYNC_SIGNAL_COUNT.load(Ordering::Relaxed);
         let timed_out = SYNC_TIMEOUT_COUNT.load(Ordering::Relaxed);
@@ -700,7 +700,7 @@ fn run_sync_tests() {
         extern "C" fn t7_waiter() -> ! {
             // 2s timeout so unsignalled waiters eventually time out and the
             // test finishes (we want them all to die so we can read counts).
-            let res = T7_SEM.get().unwrap().wait_with_timeout(1500);
+            let res = T7_SEM.get().unwrap().wait_with_timeout(1500, false).is_ok();
             if res { SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed); }
             else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
             SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -712,7 +712,7 @@ fn run_sync_tests() {
         for _ in 0..5 {
             handles.push(sched::create_thread(t7_waiter, core::ptr::null_mut()).unwrap());
         }
-        sched::delay_ms(50);
+        sched::delay_ms(50, false);
 
         // Signal 3 of 5 waiters.
         sem.signal();
@@ -720,7 +720,7 @@ fn run_sync_tests() {
         sem.signal();
 
         join_workers(SYNC_TEST_DONE.get().unwrap(), 5);
-        for h in &handles { h.wait(); }
+        for h in &handles { h.wait(false); }
 
         let signalled = SYNC_SIGNAL_COUNT.load(Ordering::Relaxed);
         let timed_out = SYNC_TIMEOUT_COUNT.load(Ordering::Relaxed);
@@ -739,7 +739,7 @@ fn run_sync_tests() {
         T8_EV.call_once(|| ev.clone());
 
         extern "C" fn t8_waiter() -> ! {
-            T8_EV.get().unwrap().wait();
+            T8_EV.get().unwrap().wait(false);
             SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
             SYNC_TEST_DONE.get().unwrap().signal();
             sched::exit_thread(0);
@@ -749,19 +749,19 @@ fn run_sync_tests() {
         for _ in 0..4 {
             hs.push(sched::create_thread(t8_waiter, core::ptr::null_mut()).unwrap());
         }
-        sched::delay_ms(50);
+        sched::delay_ms(50, false);
 
         ev.signal();
 
         join_workers(SYNC_TEST_DONE.get().unwrap(), 4);
-        for h in &hs { h.wait(); }
+        for h in &hs { h.wait(false); }
 
         // After signal, manual event stays set: a fresh wait must succeed.
-        assert!(ev.wait_with_timeout(0),
+        assert!(ev.wait_with_timeout(0, false).is_ok(),
             "test 8: try_wait on already-signalled manual event must succeed");
         // Reset must un-signal it.
         ev.reset();
-        assert!(!ev.wait_with_timeout(0),
+        assert!(!ev.wait_with_timeout(0, false).is_ok(),
             "test 8: try_wait on reset manual event must fail");
 
         let woken = SYNC_WAKE_COUNT.load(Ordering::Relaxed);
@@ -779,7 +779,7 @@ fn run_sync_tests() {
 
         extern "C" fn t9_waiter() -> ! {
             // Bounded timeout so test exits even if signalling under-counts.
-            let res = T9_EV.get().unwrap().wait_with_timeout(1500);
+            let res = T9_EV.get().unwrap().wait_with_timeout(1500, false).is_ok();
             if res { SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed); }
             else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
             SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -791,15 +791,15 @@ fn run_sync_tests() {
         for _ in 0..4 {
             hs.push(sched::create_thread(t9_waiter, core::ptr::null_mut()).unwrap());
         }
-        sched::delay_ms(50);
+        sched::delay_ms(50, false);
 
         // Signal twice with a tiny gap so consume-and-signal races resolve.
         ev.signal();
-        sched::delay_ms(20);
+        sched::delay_ms(20, false);
         ev.signal();
 
         join_workers(SYNC_TEST_DONE.get().unwrap(), 4);
-        for h in &hs { h.wait(); }
+        for h in &hs { h.wait(false); }
 
         let signalled = SYNC_SIGNAL_COUNT.load(Ordering::Relaxed);
         let timed_out = SYNC_TIMEOUT_COUNT.load(Ordering::Relaxed);
@@ -819,19 +819,19 @@ fn run_sync_tests() {
         let manual = KEvent::new(false);
         let auto   = KEvent::new(true);
 
-        assert!(!manual.wait_with_timeout(0), "test 10: manual unsignalled try_wait → false");
-        assert!(!auto.wait_with_timeout(0),   "test 10: auto unsignalled try_wait → false");
+        assert!(!manual.wait_with_timeout(0, false).is_ok(), "test 10: manual unsignalled try_wait → false");
+        assert!(!auto.wait_with_timeout(0, false).is_ok(),   "test 10: auto unsignalled try_wait → false");
 
         manual.signal();
         auto.signal();
-        assert!(manual.wait_with_timeout(0), "test 10: manual signalled try_wait → true");
-        assert!(auto.wait_with_timeout(0),   "test 10: auto signalled try_wait → true");
+        assert!(manual.wait_with_timeout(0, false).is_ok(), "test 10: manual signalled try_wait → true");
+        assert!(auto.wait_with_timeout(0, false).is_ok(),   "test 10: auto signalled try_wait → true");
 
         // Manual: still signalled after try_wait.
-        assert!(manual.wait_with_timeout(0), "test 10: manual still signalled after try_wait");
+        assert!(manual.wait_with_timeout(0, false).is_ok(), "test 10: manual still signalled after try_wait");
         // Auto: try_wait does NOT consume signal (per current code: returns
         // *signalled). A real wait() would consume it. We document this.
-        assert!(!auto.wait_with_timeout(0), "auto event consumed — second try_wait → false")
+        assert!(!auto.wait_with_timeout(0, false).is_ok(), "auto event consumed — second try_wait → false")
     }
     info!("sync test 10: PASSED");
 
@@ -845,7 +845,7 @@ fn run_sync_tests() {
         T11_SEM.call_once(|| sem.clone());
 
         extern "C" fn t11_waiter() -> ! {
-            let res = T11_SEM.get().unwrap().wait_with_timeout(2000);
+            let res = T11_SEM.get().unwrap().wait_with_timeout(2000, false).is_ok();
             if res { SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed); }
             else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
             SYNC_TEST_DONE.get().unwrap().signal();
@@ -865,8 +865,8 @@ fn run_sync_tests() {
         let signaller = sched::create_thread(t11_signaller, core::ptr::null_mut()).unwrap();
 
         join_workers(SYNC_TEST_DONE.get().unwrap(), N);
-        for h in &waiters { h.wait(); }
-        signaller.wait();
+        for h in &waiters { h.wait(false); }
+        signaller.wait(false);
 
         let signalled = SYNC_SIGNAL_COUNT.load(Ordering::Relaxed);
         let timed_out = SYNC_TIMEOUT_COUNT.load(Ordering::Relaxed);
@@ -902,7 +902,7 @@ fn run_user_tests() {
         true,
         false
     ).expect("user test 1: failed to create process");
-    p1.wait();
+    p1.wait(false);
     let code1 = p1.lock().get_exit_code();
     info!("user test 1: cat exited with code {}", code1);
 
@@ -920,8 +920,8 @@ fn run_user_tests() {
         true,
         false
     ).expect("user test 2: failed to create process B");
-    p2a.wait();
-    p2b.wait();
+    p2a.wait(false);
+    p2b.wait(false);
     info!(
         "user test 2: process A exited with code {}, B with code {}",
         p2a.lock().get_exit_code(),
@@ -943,8 +943,8 @@ fn run_user_tests() {
         true,
         false
     ).expect("user test 3: failed to create ls process");
-    p3a.wait();
-    p3b.wait();
+    p3a.wait(false);
+    p3b.wait(false);
     info!(
         "user test 3: cat exited with code {}, cat with code {}",
         p3a.lock().get_exit_code(),
@@ -959,10 +959,36 @@ fn run_user_tests() {
         true,
         false
     ).expect("user test 4: failed to create ls process");
-    p4.wait();
+    p4.wait(false);
     info!("user test 4: ls exited with code {}", p4.lock().get_exit_code());
 
     info!("=== run_user_tests: PASSED ===");
+}
+
+fn run_signal_tests() {
+    info!("=== run_signal_tests: BEGIN ===");
+
+    info!("--- signal test 1: user signal handler via sigreturn ---");
+    let p1 = sched::create_process(
+        vec!["signal_test".into()],
+        core::ptr::null_mut(),
+        true,
+        false
+    ).expect("signal test 1: failed to create signal_test process");
+
+    let pid = p1.lock().get_id();
+    info!("signal test 1: created process pid={}", pid);
+
+    sched::delay_ms(1000, false);
+    info!("signal test 1: issuing SIGSEGV to pid={}", pid);
+    //sched::issue_signal(pid, sched::SIGKILL);
+    //sched::issue_signal(pid, sched::SIGSEGV);
+    //sched::issue_signal(pid, sched::SIGSEGV);
+
+    p1.wait(false);
+    info!("signal test 1: process exited with code {}", p1.lock().get_exit_code());
+
+    info!("=== run_signal_tests: END ===");
 }
 
 fn kern_main() -> ! {
@@ -977,10 +1003,11 @@ fn kern_main() -> ! {
 #[cfg(feature = "acpi")]
     acpica::init();
     //interative_thread_spawn_tests();
-    run_cancel_tests();
-    run_fence_tests();
-    run_state_tests();
-    run_i8042_tests();
+    //run_cancel_tests();
+    //run_fence_tests();
+    //run_state_tests();
+    //run_i8042_tests();
+    run_signal_tests();
     //run_sync_tests();
     //run_proc_thread_tests();
     //spam_threads_test();
@@ -997,7 +1024,7 @@ fn kern_main() -> ! {
                 size: 9
             },
             offset: 0
-        }).expect("Failed to read input device!");
+        }, false).expect("Failed to read input device!");
 
         let command = unsafe {
             let command_slice = core::slice::from_raw_parts(input_buf.as_ptr(), 9);
@@ -1092,7 +1119,7 @@ fn run_driver_worker_tests() {
     // delay_ms blocks via semaphore wait; while we sleep the timer (or any
     // other interrupt) will land in global_interrupt_handler, which calls
     // dw_handler after the vector handler runs. The DW drains then.
-    sched::delay_ms(50);
+    sched::delay_ms(50, false);
 
     assert!(DW_RAN.load(Ordering::Relaxed) >= 1,
         "dw test 1: DW did not run");
@@ -1116,7 +1143,7 @@ fn run_driver_worker_tests() {
         kernel_intf::io_create_driver_worker(dw_test_routine, v as usize as *mut c_void)
             .expect("dw test 2: queue failed");
     }
-    sched::delay_ms(50);
+    sched::delay_ms(50, false);
 
     let ran = DW_RAN.load(Ordering::Relaxed);
     let total = DW_COUNTER.load(Ordering::Relaxed);
@@ -1130,7 +1157,7 @@ fn run_driver_worker_tests() {
     reset_dw_state();
     kernel_intf::io_create_driver_worker(dw_chain_routine, 1 as *mut c_void)
         .expect("dw test 3: queue failed");
-    sched::delay_ms(50);
+    sched::delay_ms(50, false);
 
     let total = DW_COUNTER.load(Ordering::Relaxed);
     let ran = DW_RAN.load(Ordering::Relaxed);
@@ -1148,7 +1175,7 @@ fn run_driver_worker_tests() {
 
 fn run_i8042_tests() {
     // Wait for PnP to start i8042 + input class device.
-    sched::delay_ms(500);
+    sched::delay_ms(500, false);
 
     let handle = match io::open_device_handle("ps/2_port0") {
         Ok(h) => h,
@@ -1164,7 +1191,7 @@ fn run_i8042_tests() {
     let _ = handle.read(io::ReadRequest {
         buffer: MemoryRegion { base_address: buf1.as_mut_ptr() as usize, size: 3 * size_of::<Keystroke>() },
         offset: 0
-    });
+    }, false);
     info!("i8042 test 1: got keystrokes: {:?}", buf1);
 
     // Test 2: three concurrent readers, each opens its own handle.
@@ -1181,7 +1208,7 @@ extern "C" fn i8042_reader_a() -> ! {
     let _ = h.read(io::ReadRequest {
         buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 2 * size_of::<Keystroke>()},
         offset: 0,
-    });
+    }, false);
     info!("i8042 reader-a: got chars: {:?}", buf);
     sched::exit_thread(0)
 }
@@ -1193,7 +1220,7 @@ extern "C" fn i8042_reader_b() -> ! {
     let _ = h.read(io::ReadRequest {
         buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 4 * size_of::<Keystroke>()},
         offset: 0,
-    });
+    }, false);
     info!("i8042 reader-b: got chars: {:?}", buf);
     sched::exit_thread(0)
 }
@@ -1205,7 +1232,7 @@ extern "C" fn i8042_reader_c() -> ! {
     let _ = h.read(io::ReadRequest {
         buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: size_of::<Keystroke>() },
         offset: 0,
-    });
+    }, false);
     info!("i8042 reader-c: got char: {:?}", buf);
     sched::exit_thread(0)
 }

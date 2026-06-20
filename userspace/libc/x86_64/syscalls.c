@@ -3,6 +3,9 @@
 
 syscall_status_t do_syscall(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6);
 
+syscall_status_t sys_exit(int64_t exit_code) {
+    return do_syscall(SYSCALL_EXIT_PROCESS, (uint64_t)exit_code, 0, 0, 0, 0, 0);
+}
 
 syscall_status_t sys_print(const char* msg) {
     return do_syscall(SYSCALL_PRINT, (uint64_t)msg, 0, 0, 0, 0, 0);
@@ -46,4 +49,12 @@ syscall_status_t sys_allocate_memory(size_t size, void **out) {
 
 syscall_status_t sys_deallocate_memory(void *addr, size_t size) {
     return do_syscall(SYSCALL_DEALLOCATE_MEMORY, (uint64_t)addr, size, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_set_signal_handler(uint8_t signal, void (*handler)(void), void *user_ctx) {
+    return do_syscall(SYSCALL_SET_SIGNAL_HANDLER, signal, (uint64_t)handler, (uint64_t)user_ctx, 0, 0, 0);
+}
+
+syscall_status_t sys_sigreturn(void) {
+    return do_syscall(SYSCALL_SIGRETURN, 0, 0, 0, 0, 0, 0);
 }

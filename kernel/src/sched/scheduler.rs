@@ -1,7 +1,8 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::collections::BTreeMap;
-use common::{MemoryRegion, PAGE_SIZE};
+use alloc::vec::Vec;
+use common::{MemoryRegion, PAGE_SIZE, align_down, get_highest_set_bit};
 use core::ptr::NonNull;
 use core::mem::take;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicIsize, AtomicUsize, Ordering};
@@ -9,9 +10,9 @@ use core::ffi::c_void;
 use core::ptr::null_mut;
 use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_process_info};
 use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores, get_worker_stack, set_panic_base};
-use crate::hal::{self, IPIRequestType, create_kernel_context, disable_scheduler_timer, enable_scheduler_timer, fetch_context, force_context_switch, get_per_cpu_base, get_per_cpu_data, get_per_cpu_kernel_base, is_system_in_interrupt_context, set_per_cpu_base, set_per_cpu_data, switch_context};
-use crate::mem::{VCB, get_kernel_addr_space, set_address_space};
-use crate::sched::{ProcessCleanupWork, enqueue_cleanup, get_current_process_id};
+use crate::hal::{self, *};
+use crate::mem::{PageDescriptor, VCB, VirtMemConBlk, get_kernel_addr_space, get_physical_address, map_to_kernel, set_address_space, unmap_from_kernel};
+use crate::sched::{ProcessCleanupWork, SignalHandler, enqueue_cleanup, get_current_process_id, kill_process};
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
 use crate::io::{self, IrpPtr, deallocate_irp};
 use kernel_intf::mem::{PoolAllocator, PoolAllocatorGlobal};
@@ -26,6 +27,7 @@ use crate::hal::{get_per_cpu_kernel_base_for_core, set_tss_stack};
 // This is in milliseconds
 pub const QUANTUM: usize = 10;
 const INIT_QUANTA: usize = 10;
+pub const MAX_SIGNALS: usize = 2;
 
 pub type KThread = Arc<Spinlock<Task>, PoolAllocatorGlobal>;
 
@@ -37,33 +39,96 @@ const _: () = {
     assert!(u8::MAX as usize + 1 >= MAX_CPUS);
 };
 
+#[derive(PartialEq, Clone, Copy)]
+pub enum SignalCause {
+    Normal,
+    TimerExpiry,
+    Interruption
+}
+
+pub const SIGSEGV: u8 = 0;
+pub const SIGKILL: u8 = 1;
+
+#[derive(Clone, Copy)]
+struct SignalFrame {
+    signal: u8,
+    is_kernel_mode: bool,
+    is_in_syscall: bool,
+#[cfg(target_arch = "x86_64")]
+    syscall_gs: u64,
+#[cfg(target_arch = "x86_64")]
+    syscall_rsp: u64,
+    handler: DispatchRoutine,
+    user_ctx: *mut c_void,
+    context: usize,
+    mapped_base: usize,
+    kernel_stack_base: usize,
+    last_signal_cause: SignalCause,
+#[cfg(target_arch="x86_64")]
+    per_cpu_base: u64
+}
+
+impl SignalFrame {
+    fn new(signal: u8, user_ctx: *mut c_void, handler: DispatchRoutine) -> Self {
+        Self {
+            signal,
+            is_kernel_mode: false,
+            is_in_syscall: false,
+        #[cfg(target_arch = "x86_64")]
+            syscall_gs: 0,
+        #[cfg(target_arch = "x86_64")]
+            syscall_rsp: 0,
+            handler,
+            user_ctx,
+            context: 0,
+            mapped_base: 0,
+            kernel_stack_base: 0,
+            last_signal_cause: SignalCause::Normal,
+            #[cfg(target_arch = "x86_64")]
+            per_cpu_base: 0
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum TaskStatus {
-    RUNNING,
-    ACTIVE,
-    WAITING,
-    TERMINATED,
-    SUSPENDED
+    Running,
+    Active,
+    Waiting,
+    WaitingInterruptible,
+    Terminated,
+    Suspended
 }
 
 pub struct Task {
     id: usize,
     is_kernel_mode: bool,
+    is_in_syscall: bool,
+#[cfg(target_arch = "x86_64")]
+    syscall_gs: u64,
+#[cfg(target_arch = "x86_64")]
+    syscall_rsp: u64,
     core: usize,
     stack: Option<Stack>,
+    user_stack: Option<Stack>,
     status: TaskStatus,
     context: usize,
     quanta: usize,
     panic_base: usize,
     user_fn: Option<DispatchRoutine>,
-    last_wait_on_expired_timer: bool,
+    last_signal_cause: SignalCause,
     wait_semaphores: DynList<KSemInnerType>,
     issued_irps: DynList<IrpPtr>,
+    in_signal_init: u8,
     term_notify: KEvent,
     process: Option<KProcess>,
     vcb: Option<VCB>,
-    context_ptr: *mut c_void,
+    arg_context: *mut c_void,
     exit_code: AtomicIsize,
+    pending_signals: u8,
+    completed_signals: u8,
+    signal_frame_pending: [Option<SignalFrame>; MAX_SIGNALS], 
+    signal_frame_init: [Option<SignalFrame>; MAX_SIGNALS],
 #[cfg(target_arch="x86_64")]
     per_cpu_base: u64
 }
@@ -87,21 +152,32 @@ impl Task {
         let task = Arc::new_in(Spinlock::new(Task {
             id,
             is_kernel_mode: true,
+            is_in_syscall: false,
+            #[cfg(target_arch = "x86_64")]
+            syscall_gs: 0,
+            #[cfg(target_arch = "x86_64")]
+            syscall_rsp: 0,
             core,
             stack,
-            status: TaskStatus::ACTIVE,
+            user_stack: None,
+            status: TaskStatus::Active,
             context: 0,
             quanta: INIT_QUANTA,
             panic_base: 0,
             user_fn,
             wait_semaphores: List::new(),
             issued_irps: List::new(),
-            last_wait_on_expired_timer: false,
+            last_signal_cause: SignalCause::Normal,
             term_notify: KEvent::new(false),
+            in_signal_init: 0,
             process: None,
             vcb: None,
-            context_ptr: null_mut(),
+            arg_context: null_mut(),
             exit_code: AtomicIsize::new(0),
+            pending_signals: 0,
+            completed_signals: 0,
+            signal_frame_pending: [None; MAX_SIGNALS],
+            signal_frame_init: [None; MAX_SIGNALS],
             #[cfg(target_arch = "x86_64")]
             per_cpu_base: get_per_cpu_kernel_base_for_core(core)
         }), PoolAllocatorGlobal);
@@ -121,20 +197,34 @@ impl Task {
         self.user_fn
     }
 
-    pub fn get_context_ptr(&self) -> *mut c_void {
-        self.context_ptr
+    pub fn get_arg_context(&self) -> *mut c_void {
+        self.arg_context
     }
 
     pub fn get_status(&self) -> TaskStatus {
         self.status
     }
     
-    pub fn get_expired_timer_status(&self) -> bool {
-        self.last_wait_on_expired_timer
+    pub fn get_signal_cause(&self) -> SignalCause {
+        let signal = get_highest_set_bit(self.pending_signals);
+        if signal == -1 {
+            self.last_signal_cause
+        }
+        else {
+            let sig_frame = self.signal_frame_pending[signal as usize].as_ref().expect("Failed to get sig_frame despite pending signal set");
+            sig_frame.last_signal_cause
+        }
     }
     
-    pub fn reset_expired_timer_status(&mut self) {
-        self.last_wait_on_expired_timer = false;
+    pub fn set_signal_cause(&mut self, cause: SignalCause) {
+        let signal = get_highest_set_bit(self.pending_signals);
+        if signal == -1 {
+            self.last_signal_cause = cause;
+        }
+        else {
+            let sig_frame = self.signal_frame_pending[signal as usize].as_mut().expect("Failed to get sig_frame despite pending signal set");
+            sig_frame.last_signal_cause = cause;
+        }
     }
     
     pub fn get_core(&self) -> usize {
@@ -142,7 +232,16 @@ impl Task {
     }
 
     pub fn get_stack(&self) -> Option<usize> {
-        Some(self.stack.as_ref()?.get_stack_base())
+        let signal = get_highest_set_bit(self.pending_signals);
+        if signal == -1 {
+            Some(self.stack.as_ref()?.get_stack_base())
+        }
+        else {
+            let sig_frame = self.signal_frame_pending[signal as usize].as_ref().expect("Failed to get sig_frame despite pending signal set");
+            // For kernel mode handlers, this value is not set
+            // However its still fine since we don't call this in kernel mode
+            Some(sig_frame.kernel_stack_base)
+        }
     }
 
     pub fn get_process(&self) -> Option<KProcess> {
@@ -158,16 +257,51 @@ impl Task {
         self.exit_code.load(Ordering::Relaxed)
     }
 
-    pub fn register_irp(&mut self, irp: IrpPtr) {
+    fn register_irp(&mut self, irp: IrpPtr) {
         self.issued_irps.add_node(irp).expect("Failed to register IRP with task");
     }
 
-    pub fn find_and_remove_irp(&mut self, irp: *mut Irp) {
+    fn find_and_remove_irp(&mut self, irp: *mut Irp) {
         self.issued_irps.find_and_remove(|&p| p == irp);
     }
 
-    pub fn take_irp_list(&mut self) -> DynList<IrpPtr> {
+    fn take_irp_list(&mut self) -> DynList<IrpPtr> {
         take(&mut self.issued_irps)
+    }
+
+    fn is_in_syscall(&self) -> bool {
+        let signal = get_highest_set_bit(self.pending_signals);
+        if signal == -1 {
+            self.is_in_syscall
+        }
+        else {
+            let sig_frame = self.signal_frame_pending[signal as usize].as_ref().expect("Failed to get sig_frame despite pending signal set");
+            sig_frame.is_in_syscall
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn syscall_gs(&self) -> u64 {
+        let signal = get_highest_set_bit(self.pending_signals);
+        if signal == -1 {
+            self.syscall_gs
+        }
+        else {
+            let sig_frame = self.signal_frame_pending[signal as usize].as_ref().expect("Failed to get sig_frame despite pending signal set");
+            sig_frame.syscall_gs
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn syscall_rsp(&self) -> u64 {
+        let signal = get_highest_set_bit(self.pending_signals);
+        if signal == -1 {
+            self.syscall_rsp
+        }
+        else {
+            let sig_frame = self.signal_frame_pending[signal as usize].as_ref().expect("Failed to get sig_frame despite pending signal set");
+            sig_frame.syscall_rsp
+        }
     }
 }
 
@@ -259,6 +393,11 @@ static SCHEDULER_CON_BLK: PerCpu<SchedulerCB> = PerCpu::new_with(
     }}; MAX_CPUS]
 );
 
+pub fn add_user_stack_to_cur_task(user_stack: Stack) {
+    let task = get_current_task().expect("add_user_stack_to_cur_task() called from idle task!");
+    task.lock().user_stack = Some(user_stack);
+}
+
 pub fn get_task_info(task_id: usize) -> Option<KThread> {
     let task_map = TASKS.lock();
 
@@ -332,6 +471,10 @@ pub fn dw_handler() {
     };
 
     cb.is_dw_mode.store(true, Ordering::Release);
+    // Since we are now allowing nested interrupts, we need to ensure the variant
+    // that user_gs == kernel_gs
+    let user_base = get_per_cpu_base();
+    set_per_cpu_base(get_per_cpu_kernel_base());
 
     // Stay in dw mode as long as long as dw queue is not empty
     loop {
@@ -345,6 +488,8 @@ pub fn dw_handler() {
         }
     }
 
+    // No work items left, restore base
+    set_per_cpu_base(user_base);
     cb.is_dw_mode.store(false, Ordering::Release);
 }
 
@@ -364,7 +509,7 @@ pub fn init() {
     
     TASKS.lock().insert(0, Arc::clone(&init_task));
 
-    init_task.lock().status = TaskStatus::RUNNING;
+    init_task.lock().status = TaskStatus::Running;
     init_task.lock().panic_base = get_panic_base();
     init_task.lock().process = Some(init_proc);
     init_task.lock().vcb = Some(get_kernel_addr_space());
@@ -407,7 +552,12 @@ pub fn init() {
     enable_scheduler_timer();
 }
 
-pub fn add_cur_task_to_wait_queue(wait_semaphore: KSemInnerType, timeout: Option<usize>) -> bool {
+pub fn add_cur_task_to_wait_queue(wait_semaphore: KSemInnerType, timeout: Option<usize>, is_interruptible: bool) -> Option<SignalCause> {
+    if is_interruptible {
+        let cur = get_current_process().expect("add_cur_task_to_wait_queue() called from idle process!");
+        assert!(cur.lock().get_user_flag());
+    }
+
     let mut sched_cb = SCHEDULER_CON_BLK.local().task_queue.lock();
     let cb = sched_cb.running_task;
     if cb.is_none() {
@@ -417,10 +567,18 @@ pub fn add_cur_task_to_wait_queue(wait_semaphore: KSemInnerType, timeout: Option
     let cur_task = unsafe { &**cb.unwrap().as_ptr() };
 
     let mut task = cur_task.lock();
-    
+    assert!(task.status != TaskStatus::Suspended);
+
     // TERMINATED > WAITING, don't do anything
-    if task.status == TaskStatus::TERMINATED {
-        return false;
+    if task.status == TaskStatus::Terminated {
+        return Some(SignalCause::Normal);
+    }
+    
+    // If a task goes back to interruptible wait state
+    // before we started executing the signal handler
+    // then interrupt that too
+    if is_interruptible && task.in_signal_init != 0 {
+        return Some(SignalCause::Interruption);
     }
     
     assert!(task.wait_semaphores.get_nodes() == 0);
@@ -434,8 +592,13 @@ pub fn add_cur_task_to_wait_queue(wait_semaphore: KSemInnerType, timeout: Option
         .expect("Failed to add timer info into TaskQueue!");
     }
 
-    task.status = TaskStatus::WAITING;
-    true
+    if is_interruptible {
+        task.status = TaskStatus::WaitingInterruptible;
+    }
+    else {
+        task.status = TaskStatus::Waiting;
+    }
+    None
 }
 
 fn remove_wait_semaphore(task: &mut Task, sched_cb: &mut TaskQueue, wait_semaphore: KSemInnerType) {
@@ -451,18 +614,19 @@ fn remove_wait_semaphore(task: &mut Task, sched_cb: &mut TaskQueue, wait_semapho
     });
 }
 
-
-pub fn signal_waiting_task(task_id: usize, wait_semaphore: KSemInnerType, is_expired_timer: bool) {
+pub fn signal_waiting_task(task_id: usize, wait_semaphore: KSemInnerType, cause: SignalCause) -> bool {
     let this_task = get_task_info(task_id);
 
     // It could be that this task has been killed
     if this_task.is_none() {
-        return;
+        // The task will be removed from the blocked list by kill_thread
+        return false;
     }
 
     let this_task = this_task.unwrap();
     let core = this_task.lock().core;
     let mut skip_notify = false;
+    let mut ret_status = true;
     disable_preemption();
     {
         let mut sched_cb = unsafe {
@@ -471,40 +635,38 @@ pub fn signal_waiting_task(task_id: usize, wait_semaphore: KSemInnerType, is_exp
 
         let status = this_task.lock().status;
         match status {
-            TaskStatus::WAITING => {
-                let mut waiting_task = None;
-                for task in sched_cb.waiting_tasks.iter() {
-                    if task.lock().get_id() == task_id {
-                        waiting_task = Some(NonNull::from(task));
-                        break;
-                    }
+            TaskStatus::Waiting | TaskStatus::WaitingInterruptible => {
+                if cause == SignalCause::Interruption && status != TaskStatus::WaitingInterruptible {
+                    enable_preemption();
+                    return false;
                 }
-                
+
+                let res = sched_cb.waiting_tasks.find_and_remove(|t| t.lock().id == task_id);
                 let mut task = this_task.lock();
                 // This happens when signal task is called even before the waiting task gets a chance to be put into the wait queue
-                if waiting_task.is_none() {
+                if res.is_none() {
                     // Let task run again with high priority
-                    task.status = TaskStatus::RUNNING;
+                    task.status = TaskStatus::Running;
                     task.quanta = INIT_QUANTA;
                 }
                 else {
-                    let signal_task = unsafe {
-                        ListNode::into_inner(sched_cb.waiting_tasks.remove_node(waiting_task.unwrap()))
-                    };
-                    
+                    let signal_task = ListNode::into_inner(res.unwrap());
                     sched_cb.active_tasks.insert_node_at_head(signal_task);
-                    task.status = TaskStatus::ACTIVE;
+                    task.status = TaskStatus::Active;
                 }
 
                 remove_wait_semaphore(&mut *task, &mut *sched_cb, wait_semaphore);
-                task.last_wait_on_expired_timer = is_expired_timer;
+                task.set_signal_cause(cause);
             },
 
-            TaskStatus::TERMINATED => {
+            TaskStatus::Terminated => {
                 skip_notify = true;
+                ret_status = false;
             },
 
-            TaskStatus::ACTIVE | TaskStatus::RUNNING | TaskStatus::SUSPENDED => {
+            TaskStatus::Active | TaskStatus::Running | TaskStatus::Suspended => {
+                // This case should really not be possible. If task were in one of these states
+                // then it shouldn't have been part of the blocked list within a semaphore in the first place
                 panic!("Signalled task {} which was in ACTIVE/RUNNING/SUSPENDED state??", task_id);
             }
         }
@@ -515,6 +677,7 @@ pub fn signal_waiting_task(task_id: usize, wait_semaphore: KSemInnerType, is_exp
     }
 
     enable_preemption();
+    ret_status
 }
             
 fn remove_timer_from_task_queue(sched_cb: &mut TaskQueue, id: usize) {
@@ -538,7 +701,8 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
 
     {
         let cur_proc_id = get_current_process_id().expect("kill_thread() called from idle process!");
-        //assert!(cur_proc_id != 0, "Attempted to kill system thread!");
+        #[cfg(feature = "kunit-test")]
+        assert!(cur_proc_id != 0, "Attempted to kill system thread!");
     } 
 
     let this_task = get_task_info(task_id);
@@ -560,22 +724,22 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
         let status = {
             let mut task_locked = this_task.lock();
             let status = task_locked.status;
-            task_locked.status = TaskStatus::TERMINATED;
+            task_locked.status = TaskStatus::Terminated;
             task_locked.exit_code.store(exit_code, Ordering::Relaxed);
             status
         };
-        sweep_irps = status != TaskStatus::TERMINATED;
+        sweep_irps = status != TaskStatus::Terminated;
 
         // Remove task from active list and add to terminated list
         match status {
-            TaskStatus::ACTIVE => {
+            TaskStatus::Active => {
                 let task_l = sched_cb.active_tasks.find_and_remove(|t| {t.lock().id == task_id});
                 assert!(task_l.is_some());
                 let task_node = ListNode::into_inner(task_l.unwrap());
                 sched_cb.terminated_tasks.insert_node_at_tail(task_node);
             },
 
-            TaskStatus::WAITING => {
+            TaskStatus::Waiting | TaskStatus::WaitingInterruptible => {
                 let task_l = sched_cb.waiting_tasks.find_and_remove(|t| {t.lock().id == task_id});
                 if task_l.is_some() {
                     let task_node = ListNode::into_inner(task_l.unwrap());
@@ -592,7 +756,7 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
                 drop_task = true;
             },
 
-            TaskStatus::RUNNING => {
+            TaskStatus::Running => {
                 // Since the task is currently running, we can't immediately drop it as it is using this stack
                 // So, delay the stack destruction
                 
@@ -607,7 +771,7 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
                 yield_flag = hal::get_core() == core;
             },
 
-            TaskStatus::SUSPENDED => {
+            TaskStatus::Suspended => {
                 let task_l = sched_cb.suspended_tasks.find_and_remove(|t| {t.lock().id == task_id});
                 
                 // Scheduler did not get chance to put this task into suspended queue
@@ -617,7 +781,7 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
                 }
             },
 
-            TaskStatus::TERMINATED => {
+            TaskStatus::Terminated => {
                 info!("Task {} already terminated..", task_id);
                 skip_notify = true;
                 yield_flag = hal::get_core() == core;
@@ -797,7 +961,45 @@ pub fn exit_thread(exit_code: isize) -> ! {
     panic!("exit_thread() unreachable reached!!");
 }
 
+// Release any resource here that require this task's address space
+fn release_task_resources_with_context(task: &KThread) {
+    let mut guard = task.lock();
+    while guard.pending_signals != 0 {
+        let signal = get_highest_set_bit(guard.pending_signals);
+        assert!(signal != -1);
+        guard.pending_signals &= !(1 << signal as u8);
+        uninit_signal_handler(&mut *guard, signal as usize, true);
+    }
+
+    // Release the user stack if any
+    guard.user_stack = None;
+}
+
 fn release_task_resources(task: &KThread) {
+    let old_vcb_opt = {
+        let guard = task.lock();
+        guard.vcb
+    };
+
+    if let Some(old_vcb) = old_vcb_opt {
+        let new_vcb = unsafe { get_per_cpu_data::<32>() };
+        // We're in idle task
+        if new_vcb == 0 {
+            switch_address_space_from_idle(old_vcb);
+            release_task_resources_with_context(task);
+            switch_address_space_for_idle(old_vcb);
+        } 
+        else {
+            let new_vcb = NonNull::new(new_vcb as *mut Spinlock<VirtMemConBlk>).unwrap();
+            switch_address_space(new_vcb, old_vcb);
+            release_task_resources_with_context(task);
+            switch_address_space(old_vcb, new_vcb);
+        };
+    }
+    else {
+        panic!("Task {} doesn't seem to have vcb assigned??", task.lock().id);   
+    }
+   
     // For now the only resource is the task stack, so drop it
     drop(task.lock().stack.take());
 }
@@ -878,7 +1080,7 @@ fn notify_watchers(notifier_list: DynList<KEvent>, timer_notifier_list: DynList<
     }
 
     for expired_timer in timer_notifier_list.iter() {
-        KSem::from(expired_timer.sem.clone()).signal_task(expired_timer.task_id);
+        KSem::from(expired_timer.sem.clone()).signal_task_on_timeout(expired_timer.task_id);
     }
 }
 
@@ -924,12 +1126,41 @@ fn switch_address_space_from_idle(new_vcb: VCB) {
     switch_address_space(old_vcb, new_vcb);
 }
 
+#[cfg(target_arch = "x86_64")]
+pub fn set_kernel_mode_and_syscall_params(is_kernel_mode: bool, is_in_syscall: bool, user_gs: u64, user_rsp: u64) {
+    let task = get_current_task()
+    .expect("toggle_cur_task_to_kernel_mode() called from idle task!");
+    
+    let mut guard = task.lock();
+    let signal = get_highest_set_bit(guard.pending_signals);
+    if signal == -1 {
+        guard.is_kernel_mode = is_kernel_mode;
+        guard.is_in_syscall = is_in_syscall;
+        guard.syscall_gs = user_gs;
+        guard.syscall_rsp = user_rsp;
+    }
+    else {
+        let sig_frame = guard.signal_frame_pending[signal as usize].as_mut().expect("Failed to get sig_frame despite pending signal set");
+        sig_frame.is_kernel_mode = is_kernel_mode;
+        sig_frame.is_in_syscall = is_in_syscall;
+        sig_frame.syscall_gs = user_gs;
+        sig_frame.syscall_rsp = user_rsp;
+    } 
+}
+
 pub fn toggle_cur_task_kernel_mode() {
     let task = get_current_task()
     .expect("toggle_cur_task_to_kernel_mode() called from idle task!");
     
     let mut guard = task.lock();
-    guard.is_kernel_mode = !guard.is_kernel_mode;
+    let signal = get_highest_set_bit(guard.pending_signals);
+    if signal == -1 {
+        guard.is_kernel_mode = !guard.is_kernel_mode;
+    }
+    else {
+        let sig_frame = guard.signal_frame_pending[signal as usize].as_mut().expect("Failed to get sig_frame despite pending signal set");
+        sig_frame.is_kernel_mode = !sig_frame.is_kernel_mode;
+    }
 }
 
 fn setup_current_task_ptr(sched_cb: &mut TaskQueue) {
@@ -938,15 +1169,29 @@ fn setup_current_task_ptr(sched_cb: &mut TaskQueue) {
             let kthread = &(**sched_cb.running_task.as_ref().unwrap().as_ptr()) as *const KThread;
             
             {
-                let guard = (*kthread).lock();  
-                let stack_addr = if let Some(cur_stack_address) = &guard.stack {
-                    cur_stack_address.get_stack_base()
+                let guard = (*kthread).lock(); 
+                let signal = get_highest_set_bit(guard.pending_signals);
+                let stack_addr  = if signal == -1 {
+                    if let Some(cur_stack_address) = &guard.stack {
+                        cur_stack_address.get_stack_base()
+                    }
+                    else {
+                        0
+                    }
+                }
+                else {
+                    let sig_frame = guard.signal_frame_pending[signal as usize]
+                        .as_ref().expect("signal_init set but signal frame info not available!");
+                    sig_frame.kernel_stack_base
+                };
+                let vcb = if let Some(vcb_ptr) = guard.vcb {
+                    vcb_ptr.as_ptr().addr() as u64
                 }
                 else {
                     0
                 };
-
                 set_per_cpu_data::<16>(stack_addr as u64);
+                set_per_cpu_data::<32>(vcb);
                 
                 // We're switching to a user thread. Setup the kernel stack
                 if guard.is_user_thread() {
@@ -959,6 +1204,8 @@ fn setup_current_task_ptr(sched_cb: &mut TaskQueue) {
         }
     } 
     else {
+        // Idle task will set vcb as 0
+        unsafe { set_per_cpu_data::<32>(0); }
         0
     };
 
@@ -966,6 +1213,281 @@ fn setup_current_task_ptr(sched_cb: &mut TaskQueue) {
         set_per_cpu_data::<24>(cur_task_ptr); 
     }
 }
+
+fn get_task_context(task: &mut Task, new_schedule: bool) -> (usize, u64) {
+    if !new_schedule {
+        return (fetch_context(), get_per_cpu_base())
+    }
+
+    let signal = get_highest_set_bit(task.pending_signals);
+    
+    // Restore the task context itself
+    if signal == -1 {
+        (task.context, task.per_cpu_base)
+    }
+    else {
+        // Restore the previous signal handler context
+        let sig_frame = task.signal_frame_pending[signal as usize]
+            .as_ref().expect("signal_init set but signal frame info not available!");
+        (sig_frame.context, sig_frame.per_cpu_base)
+    }
+}
+
+// Inits the signal handler if its possible
+// If success, returns true
+fn init_signal_handler(task: &mut Task, signal: usize, new_schedule: bool) -> bool {
+    let (task_context, task_per_cpu_base) = get_task_context(task, new_schedule);
+
+    // We need to first check if the thread has been to user context yet
+    // That is, it must performing a syscall or must have come here from user mode
+    // due to an interrupt
+    let is_user = is_user_context(task_context);
+    
+    #[cfg(target_arch = "x86_64")]
+    if is_user || task.is_in_syscall() {
+        // We can setup the signal handler now
+        let (user_rsp, per_cpu_base) = if is_user {
+            (get_user_stack(task_context) as u64,
+            task_per_cpu_base)
+        }
+        else {
+            (
+                task.syscall_rsp(),
+                task.syscall_gs()
+            )
+        };
+
+        // We want to put the initial context for the signal handler somewhere
+        // So we put that context in the user stack of this thread right above 
+        // where its currently being used by the user thread.
+        // Once this is done, further context saves and kernel mode execution
+        // uses the kernel stack that belongs to this thread.
+
+        // To access the user stack we first map a max of 2 pages 
+        // from stack to kernel and create the context
+        let context_base = align_down(user_rsp as usize, PAGE_SIZE);
+        let mapped_base = context_base - PAGE_SIZE;
+        let phys_addr = get_physical_address(mapped_base, PageDescriptor::USER)
+            .expect("No physical address found for given user_rsp!");
+        let mapped_base_kernel = map_to_kernel(phys_addr, PAGE_SIZE * 2)
+            .expect("Failed to map user stack address to build signal frame!");
+        let mapped_context_base = mapped_base_kernel.addr() + PAGE_SIZE;
+
+        debug!("Setting up signal handler -> signal={}, is_user={}, in_syscall={}, user_rsp={:#X}, per_cpu_base={:#X}, phys_addr={:#X}, context_base={:#X}",
+        signal, is_user, task.is_in_syscall, user_rsp, per_cpu_base, phys_addr, mapped_context_base);
+
+        let sig_frame = task.signal_frame_init[signal]
+            .as_mut().expect("signal_init set but signal frame info not available!");
+        let context = if is_user {
+            create_context_from(sig_frame.handler, mapped_context_base as *mut u8, context_base,  fetch_context())
+        }
+        else {
+            create_user_context(sig_frame.handler, mapped_context_base as *mut u8, context_base)
+        };
+
+        sig_frame.context = context;
+        sig_frame.per_cpu_base = per_cpu_base;
+        sig_frame.mapped_base = mapped_base_kernel.addr();
+
+        // We will use the existing thread kernel stack as the kernel stack for this signal
+        // Use the space on that stack. If this is a nested signal, then it layers on 
+        // top of the previous one
+        sig_frame.kernel_stack_base = align_down(task_context, 16);
+
+        assert!(task.signal_frame_pending[signal].is_none());
+
+        // Move frame from init -> pending
+        task.signal_frame_pending[signal] = task.signal_frame_init[signal].take();
+    }
+    else {
+        return false;
+    }
+    
+    if !new_schedule {
+        // Since we're going to run this handler, save the previous handler/task state
+        // If new schedule, it means that context is already saved in handler/task. Don't override it.
+        save_task_context(task);
+    } 
+    
+    // Update the signal states
+    task.in_signal_init &= !(1 << signal);
+    task.pending_signals |= 1 << signal;
+
+    true
+}
+
+fn restore_task_context(task: &mut Task) {
+    // Looks at pending signals and brings back the context 
+    // which was previously running
+    let signal = get_highest_set_bit(task.pending_signals);
+    
+    // Restore the task context itself
+    if signal == -1 {
+        switch_context(task.context);
+        #[cfg(target_arch = "x86_64")]
+        {
+            set_per_cpu_base(task.per_cpu_base);
+        }
+    }
+    else {
+        // Restore the previous signal handler context
+        let sig_frame = task.signal_frame_pending[signal as usize]
+            .as_ref().expect("signal_init set but signal frame info not available!");
+        switch_context(sig_frame.context);
+        #[cfg(target_arch = "x86_64")]
+        {
+            set_per_cpu_base(sig_frame.per_cpu_base);
+        }
+    }
+}
+
+fn save_task_context(task: &mut Task) {
+    // Look at current pending signal and save 
+    // its context
+    let context = fetch_context();
+    let per_cpu_base = get_per_cpu_base();
+    let signal = get_highest_set_bit(task.pending_signals);
+    if signal == -1 {
+        // No signal handler exists. Save the context within task itself
+        task.context = context;
+        task.per_cpu_base = per_cpu_base;
+    }
+    else {
+        let sig_frame = task.signal_frame_pending[signal as usize]
+            .as_mut().expect("signal_init set but signal frame info not available!");
+
+        sig_frame.context = context;
+        sig_frame.per_cpu_base = per_cpu_base; 
+    }
+}
+
+fn uninit_signal_handler(task: &mut Task, signal: usize, no_context_switch: bool) {
+    let sig_frame = task.signal_frame_pending[signal]
+        .as_mut().expect("signal_init set but signal frame info not available!");
+
+    // Unmap the mapped stack
+    unmap_from_kernel(sig_frame.mapped_base, PAGE_SIZE * 2)
+        .expect("Failed to unmap signal frame stack");
+
+    task.completed_signals &= !(1 << signal);
+
+    if !no_context_switch {
+        // Restore previous context
+        restore_task_context(task);
+    }
+
+    task.signal_frame_pending[signal] = None;
+}
+
+fn save_signal_context(task: &mut Task, signal: usize) {
+    let sig_frame = task.signal_frame_pending[signal]
+        .as_mut().expect("signal_init set but signal frame info not available!");
+
+    sig_frame.context = fetch_context();
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        sig_frame.per_cpu_base = get_per_cpu_base();
+    }
+}
+
+// This is called right before a thread is going to be scheduled out
+// So save whatever state we currently have
+fn check_and_save_signal_handler(task:&mut Task) -> bool {
+    let pend_signal = get_highest_set_bit(task.pending_signals);
+    if pend_signal == -1 {
+        // Tell scheduler to do normal thread scheduling
+        false
+    }
+    else {
+        save_signal_context(task, pend_signal as usize);
+        true
+    }
+}
+
+fn switch_to_signal_handler(task: &mut Task, signal: usize, new_schedule: bool) {
+    // This means the signal handler was already running or 
+    // another signal handler completed. In both cases, the context
+    // is already setup, we don't need to do anything else
+    if !new_schedule {
+        return;
+    }
+    let sig_frame = task.signal_frame_pending[signal]
+        .as_mut().expect("signal_init set but signal frame info not available!");
+    
+    switch_context(sig_frame.context);
+#[cfg(target_arch = "x86_64")]
+    set_per_cpu_base(sig_frame.per_cpu_base);
+}
+
+// If there is a signal handler pending, switch to its context
+// If there is init pending for a signal handler and no higher prio signal is running
+// then save the current task/signal context and then switch to new context
+// If any signals have been completed, then release its resources and switch back 
+// to any pending signal handlers/task
+fn check_and_execute_signal_handler(task: &mut Task, new_schedule: bool) -> bool {
+    let comp_signal = get_highest_set_bit(task.completed_signals);
+    
+    // First check for any completions and deallocate the resources
+    // associated with them
+    if comp_signal != -1 {
+        assert!(task.completed_signals.is_power_of_two()); 
+        
+        debug!("check_and_execute: completing signal {}", comp_signal);
+        uninit_signal_handler(task, comp_signal as usize, false);
+    }
+    
+    let pend_signal = get_highest_set_bit(task.pending_signals);
+    let init_signal = get_highest_set_bit(task.in_signal_init);
+
+    // Now check and run any pending signals
+    if pend_signal == -1 && init_signal == -1 {
+        // There is no signal handler or anything pending
+        // Tell scheduler to do normal thread scheduling
+        false
+    }
+    else if pend_signal != -1 && init_signal == -1 {
+        // Continue running the pending signal handler
+        switch_to_signal_handler(task, pend_signal as usize, new_schedule);
+        true
+    }
+    else if pend_signal == -1 && init_signal != -1 {
+        // Init the new signal handler and start running it
+        if !init_signal_handler(task, init_signal as usize, new_schedule) {
+            debug!("Init signal {} found, but failed to start", init_signal);
+            false
+        }
+        else {
+            debug!("Init signal {} found. Starting new handler", init_signal);
+            // We have successfully init this handler. Now start running it immediately
+            switch_to_signal_handler(task, init_signal as usize, true);
+            true
+        }
+    }
+    else {
+        assert!(pend_signal != init_signal); 
+        if pend_signal < init_signal {
+            // There is higher priority signal
+            // Save the current one and start allocating 
+            // and running the new handler
+            if init_signal_handler(task, init_signal as usize, new_schedule) {
+                debug!("Higher prio {} signal found over {}. Switching to that", init_signal, pend_signal);
+                switch_to_signal_handler(task, init_signal as usize, true);
+            }
+            else {
+                panic!("Signal handler already running.. This case must not be possible!");
+            }
+        }
+        else {
+            // Continue running the same signal
+            debug!("Found lower prio {} signal over {}. Continuing with existing one", init_signal, pend_signal);
+            switch_to_signal_handler(task, pend_signal as usize, new_schedule);
+        }
+    
+        true
+    }
+}
+
 
 // Main scheduler loop
 pub fn schedule() {
@@ -996,37 +1518,40 @@ pub fn schedule() {
 
                 task_info.quanta = task_info.quanta.saturating_sub(1);
                 let old_vcb = task_info.vcb.expect("VCB is none");
-
+                
                 // Switch to new task
-                if task_info.status == TaskStatus::WAITING || task_info.status == TaskStatus::TERMINATED ||
-                task_info.status == TaskStatus::SUSPENDED || task_info.quanta == 0 {
+                if task_info.status == TaskStatus::Waiting || task_info.status == TaskStatus::WaitingInterruptible || 
+                task_info.status == TaskStatus::Terminated || task_info.status == TaskStatus::Suspended || 
+                task_info.quanta == 0 {
                     // First choose new task
                     // We create NonNull here so that the node can later be removed
                     let head_task = sched_cb.active_tasks.first().and_then(|item| {
                         Some(NonNull::from(item))
                     });
 
+                    // We have a new task to switch to
                     if head_task.is_some() {
                         let mut head_task_info = unsafe {
                             head_task.unwrap().as_ref().lock()
                         };
                         
-                        assert!(head_task_info.status == TaskStatus::ACTIVE); 
-                        head_task_info.status = TaskStatus::RUNNING;
+                        assert!(head_task_info.status == TaskStatus::Active); 
+                        head_task_info.status = TaskStatus::Running;
                         head_task_info.quanta = INIT_QUANTA;
                         let new_context = head_task_info.context;
                         let new_vcb = head_task_info.vcb.expect("VCB is none");
 
-                        let prev_context = fetch_context();
-                        task_info.context = prev_context;
+                        if !check_and_save_signal_handler(&mut *task_info) {
+                            task_info.context = fetch_context();
 
-                        #[cfg(target_arch = "x86_64")] 
-                        {
-                            task_info.per_cpu_base = get_per_cpu_base();
+                            #[cfg(target_arch = "x86_64")] 
+                            {
+                                task_info.per_cpu_base = get_per_cpu_base();
+                            }
                         }
 
-                        if task_info.status == TaskStatus::RUNNING {
-                            task_info.status = TaskStatus::ACTIVE; 
+                        if task_info.status == TaskStatus::Running {
+                            task_info.status = TaskStatus::Active; 
                         }
 
                         // This ensures that list doesn't delete the node. It simply removes it from the list 
@@ -1034,14 +1559,14 @@ pub fn schedule() {
                             ListNode::into_inner(sched_cb.active_tasks.remove_node(head_task.unwrap()))
                         };
 
-                        if task_info.status == TaskStatus::WAITING {
+                        if task_info.status == TaskStatus::Waiting || task_info.status == TaskStatus::WaitingInterruptible {
                             sched_cb.waiting_tasks.insert_node_at_tail(current_task);
                         }
-                        else if task_info.status == TaskStatus::TERMINATED {
+                        else if task_info.status == TaskStatus::Terminated {
                             crate::sched_log!("Adding task {} to terminated list", task_info.id);
                             sched_cb.terminated_tasks.insert_node_at_tail(current_task);
                         }
-                        else if task_info.status == TaskStatus::SUSPENDED {
+                        else if task_info.status == TaskStatus::Suspended {
                             crate::sched_log!("Adding task {} to suspended list", task_info.id);
                             sched_cb.suspended_tasks.insert_node_at_tail(current_task);
                         }
@@ -1053,29 +1578,34 @@ pub fn schedule() {
 
                         switch_address_space(old_vcb, new_vcb);
                         set_panic_base(head_task_info.panic_base);
-                        switch_context(new_context);
 
-                        #[cfg(target_arch = "x86_64")]
-                        set_per_cpu_base(head_task_info.per_cpu_base);
+                        if !check_and_execute_signal_handler(&mut head_task_info, true) {
+                            switch_context(new_context);
+
+                            #[cfg(target_arch = "x86_64")]
+                            set_per_cpu_base(head_task_info.per_cpu_base);
+                        }
                     }
                     else {
-                        if task_info.status != TaskStatus::RUNNING {
-                            let prev_context = fetch_context();
-                            task_info.context = prev_context;
-                            
-                            #[cfg(target_arch = "x86_64")] 
-                            {
-                                task_info.per_cpu_base = get_per_cpu_base();
+                        // No more tasks left. Check if we can continue running same task
+                        if task_info.status != TaskStatus::Running {
+                            if !check_and_save_signal_handler(&mut *task_info) {
+                                task_info.context = fetch_context();
+                                
+                                #[cfg(target_arch = "x86_64")] 
+                                {
+                                    task_info.per_cpu_base = get_per_cpu_base();
+                                }
                             }
 
-                            if task_info.status == TaskStatus::WAITING {
+                            if task_info.status == TaskStatus::Waiting || task_info.status == TaskStatus::WaitingInterruptible {
                                 sched_cb.waiting_tasks.insert_node_at_tail(current_task);
                             }
-                            else if task_info.status == TaskStatus::TERMINATED {
+                            else if task_info.status == TaskStatus::Terminated {
                                 crate::sched_log!("Adding task {} to terminated list", task_info.id);
                                 sched_cb.terminated_tasks.insert_node_at_tail(current_task);
                             }
-                            else if task_info.status == TaskStatus::SUSPENDED {
+                            else if task_info.status == TaskStatus::Suspended {
                                 crate::sched_log!("Adding task {} to suspended list", task_info.id);
                                 sched_cb.suspended_tasks.insert_node_at_tail(current_task);
                             }
@@ -1083,10 +1613,15 @@ pub fn schedule() {
                             prep_idle_task(&mut sched_cb, old_vcb);
                         }
                         else {
-                            // No other task to run. Continue with this task
+                            // Current task is in running state. Continue with it
+                            check_and_execute_signal_handler(&mut *task_info, false);
                             task_info.quanta = INIT_QUANTA;
                         }
                     }
+                }
+                else {
+                    // Continue executing same task
+                    check_and_execute_signal_handler(&mut *task_info, false);
                 }
             }
             else {
@@ -1100,8 +1635,8 @@ pub fn schedule() {
                         head_task.unwrap().as_ref().lock()
                     };
 
-                    assert!(head_task_info.status == TaskStatus::ACTIVE); 
-                    head_task_info.status = TaskStatus::RUNNING;
+                    assert!(head_task_info.status == TaskStatus::Active); 
+                    head_task_info.status = TaskStatus::Running;
                     head_task_info.quanta = INIT_QUANTA;
                     let new_context = head_task_info.context;
                     
@@ -1115,12 +1650,16 @@ pub fn schedule() {
 
                     switch_address_space_from_idle(new_vcb);
                     set_panic_base(head_task_info.panic_base);
-                    switch_context(new_context);
-                    
-                    #[cfg(target_arch = "x86_64")]
-                    set_per_cpu_base(head_task_info.per_cpu_base);
+
+                    if !check_and_execute_signal_handler(&mut *head_task_info, true) {
+                        switch_context(new_context);
+                        
+                        #[cfg(target_arch = "x86_64")]
+                        set_per_cpu_base(head_task_info.per_cpu_base);
+                    }
                 }
                 else {
+                    // Nothing to run
                     // If stack deletions / timers are pending, don't go into idle task yet
                     if can_sleep(&mut sched_cb) {
                         disable_scheduler_timer(); 
@@ -1183,14 +1722,14 @@ pub fn suspend_process() {
     if proc_guard.get_status() == ProcessStatus::Suspended {
         let mut task_guard = cur_task.lock();
         match task_guard.status {
-            TaskStatus::TERMINATED => {
+            TaskStatus::Terminated => {
                 // TERMINATED > SUSPENDED
                 crate::sched_log!("Suspend process {} failed since task is terminated", proc_guard.get_id());
                 return;  
             },
-            TaskStatus::RUNNING => {
+            TaskStatus::Running => {
                 crate::sched_log!("Suspend process {} suspended task {}", proc_guard.get_id(), task_guard.id);
-                task_guard.status = TaskStatus::SUSPENDED;
+                task_guard.status = TaskStatus::Suspended;
             },
             _ => {
                 panic!("suspend_process called on task with invalid state = {:?}!", task_guard.status);
@@ -1213,6 +1752,7 @@ pub fn resume_process(pid: usize) -> bool {
     let res = {
         let mut proc_guard = this_proc.lock();
         if proc_guard.get_status() == ProcessStatus::Suspended {
+            assert!(proc_guard.get_num_threads() == 1);
             crate::sched_log!("Resuming process {}", proc_guard.get_id());
             proc_guard.set_status(ProcessStatus::Ready);
         }
@@ -1237,20 +1777,20 @@ pub fn resume_process(pid: usize) -> bool {
     let mut sched_cb = unsafe { SCHEDULER_CON_BLK.get(core).task_queue.lock() };
 
     // If task was suspended, remove from suspend list
-    if this_task.lock().status == TaskStatus::SUSPENDED {
+    if this_task.lock().status == TaskStatus::Suspended {
         let id = this_task.lock().id;
         let task = sched_cb.suspended_tasks.find_and_remove(|t| {t.lock().id == id});
         if task.is_some() {
             let task_inner = ListNode::into_inner(task.unwrap());
             sched_cb.active_tasks.insert_node_at_head(task_inner);
             crate::sched_log!("Resumed task {} from suspend list", id);
-            this_task.lock().status = TaskStatus::ACTIVE;
+            this_task.lock().status = TaskStatus::Active;
         }
         else {
             // Scheduler did not get chance to put the suspended task into suspended queue
             // So just revert state back to running
             crate::sched_log!("Resumed task {} directly", id);
-            this_task.lock().status = TaskStatus::RUNNING;
+            this_task.lock().status = TaskStatus::Running;
         }
         notify_other_cpu(core);
         true
@@ -1259,6 +1799,273 @@ pub fn resume_process(pid: usize) -> bool {
         false
     }
 }
+
+fn setup_signal_handler(
+    signal: u8,
+    user_ctx: *mut c_void,
+    handler: DispatchRoutine,
+    task: &mut Task
+) {
+    debug!("setup_signal_handler: signal={} task_id={}", signal, task.id);
+    let signal_frame = SignalFrame::new(signal, user_ctx, handler);
+    task.signal_frame_init[signal as usize] = Some(signal_frame);
+}
+
+// Signal handling must not be ongoing or in init phase
+fn check_signal_validity(task: &mut Task, signal: u8) -> bool {
+    (task.in_signal_init & (1 << signal) == 0) && (task.pending_signals & (1 << signal) == 0)
+}
+
+fn do_issue_signal_to_eligible_thread(
+    handler: DispatchRoutine,
+    signal: u8,
+    user_ctx: *mut c_void,
+    state: Option<TaskStatus>,
+    thread_list: &Vec<usize>
+) -> bool {
+    let mut waiting_desc = None;
+    for &tid in thread_list {
+        let res = get_task_info(tid);
+        if let Some(task) = res {
+            let mut guard = task.lock();
+            let valid = check_signal_validity(&mut *guard, signal);
+            debug!("do_issue_signal: tid={} status={:?} valid={}", tid, guard.status, valid);
+
+            if !valid {
+                continue;
+            }
+
+            if state.is_none() || guard.status == *state.as_ref().unwrap() {
+                match guard.status {
+                    TaskStatus::Terminated => {
+                        panic!("Task cannot be in terminated state in issue_signal path!");
+                    },
+                    TaskStatus::Suspended => {
+                        panic!("Task in suspended state in signal issue path!");
+                    },
+                    _ => {
+                        debug!("do_issue_signal: setting up signal {} on tid={} (status={:?})", signal, tid, guard.status);
+                        guard.in_signal_init |= 1 << signal;
+                        setup_signal_handler(
+                            signal,
+                            user_ctx,
+                            handler,
+                            &mut *guard
+                        );
+                        if guard.status == TaskStatus::WaitingInterruptible {
+                            debug!("do_issue_signal: waking interruptible tid={}", tid);
+                            let wait_sem = (*guard.wait_semaphores.first().unwrap()).clone();
+                            waiting_desc = Some((task.clone(), wait_sem));
+                            break;
+                        }
+                        else {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some((task, wait_sem)) = waiting_desc {
+        let task_id = task.lock().id;
+        KSem::from(wait_sem).signal_task_interrupted(task_id);
+        return true;
+    }
+
+    false
+}
+
+fn check_process_signal_validity(pid: usize) -> Option<KProcess> {
+    let res = get_process_info(pid);
+    if res.is_none() {
+        return None;
+    }
+
+    let this_proc = res.unwrap();
+    assert!(this_proc.lock().get_user_flag());
+
+    // If process about to be suspended or terminated, then don't issue signal
+    if this_proc.lock().get_status() == ProcessStatus::Ready {
+        Some(this_proc)
+    }
+    else {
+        None
+    }
+}
+
+fn unset_signal_from_process(this_proc: KProcess, signal: u8) {
+    let mut guard = this_proc.lock();
+    let mut signal_mask = guard.get_pending_signals();
+    signal_mask &= !(1 << signal);
+    guard.set_pending_signals(signal_mask);
+}
+
+fn proc_do_issue_signal(this_proc: KProcess, action: SignalHandler, signal: u8) -> bool {
+    let pid = this_proc.lock().get_id();
+    let SignalHandler{handler, user_ctx} = action;
+
+    const PRIORITY_LIST: [TaskStatus; 4] = [
+            TaskStatus::Running,
+            TaskStatus::Active,
+            TaskStatus::WaitingInterruptible,
+            TaskStatus::Waiting
+        ];
+
+    let threads = this_proc.lock().get_threads_snapshot();
+    for state in PRIORITY_LIST {
+        let res = do_issue_signal_to_eligible_thread(
+            handler,
+            signal,
+            user_ctx,
+            Some(state),
+            &threads
+        );
+
+        if res {
+            debug!("issue_signal: signal {} delivered to pid={} (state={:?})", signal, pid, state);
+            return true;
+        }
+    }
+    
+    debug!("issue_signal: no eligible thread found for pid={} signal={}", pid, signal);
+    false 
+}
+
+pub fn issue_signal(pid: usize, signal: u8) {
+    debug!("issue_signal: pid={} signal={}", pid, signal);
+    let proc_res = check_process_signal_validity(pid);
+
+    if proc_res.is_none() {
+        debug!("issue_signal: process {} not valid for signalling", pid);
+        return;
+    }
+    let this_proc = proc_res.unwrap();
+    // For process, the pending signal mask indicates whether the signal has 
+    // been delivered to a thread or not. Whether it has started executing and
+    // such is managed by the thread itself.
+
+    // This is a spinlock instead of mutex. Required since issue_signal could 
+    // be called from idle task
+    let sig_guard = this_proc.lock().get_signal_guard();
+    let _guard = sig_guard.lock();
+    let action = {
+        let mut guard = this_proc.lock();
+        let handler_info_opt = guard.get_signal_handler(signal);
+        let mut pending_signal_mask = guard.get_pending_signals();  
+        let pending_signal = get_highest_set_bit(pending_signal_mask);
+        pending_signal_mask |= 1 << signal;
+        guard.set_pending_signals(pending_signal_mask);
+
+        // No signal exists, we're free to fire the new signal to an eligible thread
+        if pending_signal == -1 {
+            handler_info_opt
+        }
+        else {
+            let pending_signal = pending_signal as u8;
+            // This signal is already in queue, don't do anything further
+            if pending_signal == signal {
+                debug!("signal already pending in process");
+                return;
+            }
+            else if pending_signal > signal {
+                debug!("current signal is lower prio than existing one");
+                // If this signal is lower priority, queue it
+                return;
+            }
+            else {
+                // New signal priority is higher, send this to one of the threads
+                handler_info_opt
+            }
+        }
+    };
+
+    // No handler installed, take default action
+    // For now, its just to kill the process
+    disable_preemption();
+    if action.is_none() {
+        debug!("issue_signal: Taking default action for signal {}", signal);
+        unset_signal_from_process(this_proc, signal);
+        
+        // It could be that we're killing this process, so drop the signal_guard explicitly
+        drop(_guard);
+        drop(sig_guard);
+        enable_preemption();
+        kill_process(pid, -1);
+    }
+    else {
+        // We have found an eligible thread to issue the signal to
+        if proc_do_issue_signal(this_proc.clone(), action.unwrap(), signal) {
+            unset_signal_from_process(this_proc, signal);
+        }
+        else {
+            debug!("issue_signal: Failed to issue signal {} to process", signal);
+        }
+        enable_preemption();
+    }
+}
+
+pub fn complete_signal() {
+    disable_preemption();
+    let this_proc = {
+        let task = get_current_task().expect("complete_signal called from idle task");
+        let mut guard = task.lock();
+        let pend_signal = get_highest_set_bit(guard.pending_signals);
+        if pend_signal == -1 {
+            debug!("complete_signal: no pending signal to complete for task {}", guard.id);
+            return;
+        }
+        debug!("complete_signal: marking signal {} as completed for task {}", pend_signal, guard.id);
+        guard.completed_signals |= 1 << pend_signal;
+        guard.pending_signals &= !(1 << pend_signal);
+        guard.get_process().unwrap()
+    };
+
+    // Now check if there are any pending signals in this process and fire them
+    let sig_guard = this_proc.lock().get_signal_guard();
+    let _guard = sig_guard.lock();
+    let (pid, mut pending_signal_mask) = {
+        let guard = this_proc.lock();
+        let pid = guard.get_id();
+        let pending_signal_mask = guard.get_pending_signals();
+        (pid, pending_signal_mask)
+    };
+
+    let mut pending_signal = get_highest_set_bit(pending_signal_mask);
+    let mut kill_signal = false;
+    while pending_signal != -1 {
+        let signal = pending_signal as u8;
+        let handler_opt = this_proc.lock().get_signal_handler(signal);
+        // Take default action
+        if handler_opt.is_none() {
+            debug!("complete_signal: Taking default action for signal {}", signal);
+            pending_signal_mask &= !(1 << signal);
+            kill_signal = true;
+            break;
+        }
+        else {
+            debug!("complete_signal: Trying to deliver signal {} to eligible thread", signal);
+            if !proc_do_issue_signal(this_proc.clone(), handler_opt.unwrap(), signal) {
+                // We tried to issue high prio signal but failed, stop issuing further signals
+                debug!("complete_signal: Failed to issue signal {}", signal);
+                break;
+            }
+        }
+
+        pending_signal_mask &= !(1 << signal);
+        pending_signal = get_highest_set_bit(pending_signal_mask);
+    }
+
+    this_proc.lock().set_pending_signals(pending_signal_mask);
+    enable_preemption();
+    if kill_signal {
+        drop(_guard);
+        drop(sig_guard);
+        drop(this_proc);
+        kill_process(pid, -1);
+    }
+}
+
 
 extern "C" fn idle_task() -> ! {
     hal::sleep();
@@ -1274,6 +2081,8 @@ fn notify_other_cpu(target_core: usize) {
     hal::notify_core(IPIRequestType::SchedChange, target_core);
 }
 
+// handler = Function to execute in kernel mode once thread starts
+// user_function = Function to execute in user mode (Usually provided as argument by create_user_thread)
 fn create_thread_common(handler: DispatchRoutine, user_function: Option<DispatchRoutine>) -> Result<(KThread, usize), KError> {
     // We will use simple round robin to determine the cpu which gets this task
     let core = TASK_CPU.fetch_add(1, Ordering::Relaxed) as usize % get_total_cores();   
@@ -1312,7 +2121,7 @@ pub fn create_init_thread(
     let proc_addr_space = process.lock().get_vcb();
     crate::sched_log!("Created init thread {} on process {} on core {}", thread_id, proc_id, core);
 
-    thread.lock().context_ptr = context_ptr;
+    thread.lock().arg_context = context_ptr;
     thread.lock().process = Some(process);
     thread.lock().vcb = Some(proc_addr_space);
     Ok(thread)
@@ -1384,7 +2193,7 @@ pub fn create_thread_do_work(proc_id: Option<usize>, handler: DispatchRoutine, u
             }
             else {
                 crate::sched_log!("Creating new task {} under process {}", thread_id, guard.get_id());
-                thread.lock().context_ptr = context_ptr;
+                thread.lock().arg_context = context_ptr;
                 thread.lock().process = Some(process_ref);
                 thread.lock().vcb = Some(proc_addr_space);
                 drop(guard);
@@ -1436,27 +2245,27 @@ pub fn create_system_thread(handler: DispatchRoutine, context_ptr: *mut c_void) 
 
 pub fn get_current_thread_args() -> *mut c_void {
     match get_current_task() {
-        Some(t) => t.lock().context_ptr,
+        Some(t) => t.lock().arg_context,
         None => null_mut(),
     }
 }
 
 impl Spinlock<Task> {
     // Blocks caller until thread terminates
-    pub fn wait(&self) -> bool {
+    pub fn wait(&self, is_interruptible: bool) -> bool {
         let sem = {
             let task = self.lock();
             task.term_notify.clone() 
         };
 
-        sem.wait()
+        sem.wait(is_interruptible).is_ok()
     }
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn sched_get_cur_thread_arg_ffi() -> *mut c_void {
     let task = get_current_task().expect("sched_get_cur_thread_arg() called from idle task!");
-    task.lock().context_ptr
+    task.lock().arg_context
 } 
 
 #[unsafe(no_mangle)]
@@ -1486,14 +2295,21 @@ extern "C" fn sched_kill_thread_ffi(thread_id: usize, exit_code: isize) {
 }
 
 // Do not call this function from interrupt context
-pub fn delay_ms(value: usize) {
+pub fn delay_ms(value: usize, is_interruptible: bool) -> bool {
     let timer = KSem::new(0, 1);
 
-    // Let's not panic if wait fails (Since this could happen if process/thread is getting killed)
-    let _ = timer.wait_with_timeout(value);
+    let res = timer.wait_with_timeout(value, is_interruptible);
+    match res {
+        Ok(()) => {
+            panic!("delay_ms() semaphore signalled in normal path??");
+        },
+        Err(e) => {
+            e == KError::WaitTimedOut
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sched_delay_ms_ffi(value: usize) {
-    delay_ms(value);
+    delay_ms(value, false);
 }

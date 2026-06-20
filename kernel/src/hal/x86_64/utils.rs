@@ -2,6 +2,10 @@ use super::asm;
 use kernel_intf::debug;
 use crate::hal;
 
+
+static mut COPY_USER_FN_PTR: unsafe fn(to: *mut u8, from: *const u8, len: usize) = do_copy_basic;
+static mut SET_USER_FN_PTR: unsafe fn(to: *mut u8, value: u8, len: usize) = do_set_basic;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn read_timestamp() -> usize {
     asm::rdtsc() as usize
@@ -46,22 +50,63 @@ pub fn canonicalize_virtual(addr: usize) -> usize {
     VirtAddr::new(addr).get()
 }
 
-pub unsafe fn copy_user_memory(to: *mut u8, from: *const u8, len: usize) {
-    if len == 0 {
-        return;
+pub(super) fn enable_smap_feature() {
+    unsafe {
+        COPY_USER_FN_PTR = do_copy_smap;
+        SET_USER_FN_PTR = do_set_smap;
     }
+}
 
+unsafe fn do_copy_basic(to: *mut u8, from: *const u8, len: usize) {
+    unsafe {
+        core::ptr::copy_nonoverlapping(from, to, len);
+    }
+}
+
+unsafe fn do_copy_smap(to: *mut u8, from: *const u8, len: usize) {
     unsafe {
         core::arch::asm!(
             "cld",    
             "stac",   
             "rep movsb", 
             "clac",      
-            in("rdi") to,
-            in("rsi") from,
-            in("rcx") len,
+            inout("rdi") to => _,
+            inout("rsi") from => _,
+            inout("rcx") len => _,
             options(nostack)
         );
+    }
+}
+
+
+pub unsafe fn copy_user_memory(to: *mut u8, from: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+
+    unsafe {
+        COPY_USER_FN_PTR(to, from, len);
+    }
+}
+
+unsafe fn do_set_basic(to: *mut u8, value: u8, len: usize) {
+    unsafe {
+        to.write_bytes(value, len);
+    }
+}
+
+unsafe fn do_set_smap(to: *mut u8, value: u8, len: usize) {
+    unsafe {
+        core::arch::asm!(
+            "cld",
+            "stac",
+            "rep stosb",
+            "clac",
+            inout("rdi") to => _,
+            inout("al") value => _,
+            inout("rcx") len => _,
+            options(nostack)
+        ); 
     }
 }
 
@@ -71,16 +116,7 @@ pub unsafe fn set_user_memory(to: *mut u8, value: u8, len: usize) {
     }
 
     unsafe {
-        core::arch::asm!(
-            "cld",
-            "stac",
-            "rep stosb",
-            "clac",
-            in("rdi") to,
-            in("al") value,
-            in("rcx") len,
-            options(nostack)
-        );
+        SET_USER_FN_PTR(to, value, len);
     }
 }
 
