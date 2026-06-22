@@ -187,7 +187,7 @@ fn load_image_uncached(
     let deps = load_dependencies(&mod_info, in_progress)?;
     apply_relocations(&mod_info, &deps)?;
 
-    let (module_name, driver_init_address) = configure_module(&mod_info);
+    let (module_name, driver_init_address, driver_unload_address) = configure_module(&mod_info);
 
     let module_name = module_name.ok_or_else(|| {
         info!("Image at path {} is not valid kernel module!", path);
@@ -198,6 +198,7 @@ fn load_image_uncached(
         mod_type: ModuleType::Kernel(KernelModule {
             name: module_name,
             driver_init_address,
+            driver_unload_address,
             file_handle: Some(file),
             info: mod_info,
             _deps: Some(deps)
@@ -249,11 +250,12 @@ pub(super) unsafe fn read_cstr<'a>(base: usize, idx: usize) -> &'a str {
     }
 }
 
-fn configure_module(info: &ModuleInfo) -> (Option<&'static str>, Option<usize>) {
+fn configure_module(info: &ModuleInfo) -> (Option<&'static str>, Option<usize>, Option<usize>) {
     let mut res_str: Option<&str> = None;
     let mut driver_init_addr = None;
-    let dyn_tab = match info.dyn_tab { Some(t) => t, None => return (res_str, None) };
-    let dyn_str = match info.dyn_str { Some(s) => s, None => return (res_str, None) };
+    let mut driver_unload_addr = None;
+    let dyn_tab = match info.dyn_tab { Some(t) => t, None => return (res_str, None, None) };
+    let dyn_str = match info.dyn_str { Some(s) => s, None => return (res_str, None, None) };
 
     let entries = unsafe {
         core::slice::from_raw_parts(
@@ -282,9 +284,13 @@ fn configure_module(info: &ModuleInfo) -> (Option<&'static str>, Option<usize>) 
             let func_addr = info.base + sym.st_value as usize;
             driver_init_addr = Some(func_addr);
         }
+        else if sym_name == "_shim_driver_unload" {
+            let func_addr = info.base + sym.st_value as usize;
+            driver_unload_addr = Some(func_addr);
+        }
     }
 
-    (res_str, driver_init_addr)
+    (res_str, driver_init_addr, driver_unload_addr)
 }
 
 fn resolve_import(name: &str, deps: &[LoadedImage]) -> Option<usize> {

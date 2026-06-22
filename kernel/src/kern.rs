@@ -181,19 +181,21 @@ extern "C" fn task_kill_cancel_runner() -> ! {
     let handle = match io::open_device_handle("input") {
         Ok(h) => h,
         Err(_) => {
-            info!("task_kill_cancel_runner: input device not found");
+            info!("task_kill_cancel_runner: input device could not be opened");
             sched::exit_thread(0);
         }
     };
+
+    unload_driver("i8042").expect("Failed to unload driver");
     
     let mut buf = [0u8; 1];
     info!("task_kill_cancel_runner: issuing sync read (will pend until killed)");
-    let _ = handle.read(io::ReadRequest {
+    let res= handle.read(io::ReadRequest {
         buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: 1 },
         offset: 0
     }, false);
 
-    info!("task_kill_cancel_runner: read returned (post-cancel)");
+    info!("task_kill_cancel_runner: read returned (post-cancel) with {:?}", res);
     loop { sched::delay_ms(1000, false); }
 }
 
@@ -201,14 +203,14 @@ extern "C" fn self_cancel_runner() -> ! {
     let handle = match io::open_device_handle("input") {
         Ok(h) => h,
         Err(_) => {
-            info!("self_cancel_runner: input device not found");
+            info!("self_cancel_runner: input device could not be opened");
             sched::exit_thread(0);
         }
     };
 
     let mut buf = [0u8; 1];
     info!("self_cancel_runner: dispatching async read");
-    let _ = io::io_request_async(
+    let res = io::io_request_async(
         &handle,
         IrpMajor::Read,
         IrpMinor::None,
@@ -220,7 +222,7 @@ extern "C" fn self_cancel_runner() -> ! {
     );
 
     sched::delay_ms(200, false);
-    info!("self_cancel_runner: calling cancel_pending_irp");
+    info!("self_cancel_runner: calling cancel_pending_irp with {:?}", res);
     io::cancel_pending_irp(&handle);
 
     sched::delay_ms(200, false);
@@ -238,7 +240,7 @@ fn run_cancel_tests() {
     // task-kill cancellation
     let killer_target = sched::create_thread(task_kill_cancel_runner, core::ptr::null_mut())
         .expect("Failed to spawn task_kill_cancel_runner");
-    sched::delay_ms(300, false);
+    sched::delay_ms(2000, false);
     let tid = killer_target.lock().get_id();
     info!("cancel test (a): killing thread {}", tid);
     sched::kill_thread(tid, 0);
@@ -409,7 +411,7 @@ fn run_fence_tests() {
     // Already-loaded drivers are handled gracefully by the PnP worker; what
     // matters is that pnp_fence() blocks until all queued work is drained.
     for _ in 0..4 {
-        io::register_driver("i8042".into());
+        io::add_config("i8042".into());
     }
     info!("fence test: posted batch 1 (4x register_driver i8042), entering fence");
     io::pnp_fence();
@@ -417,7 +419,7 @@ fn run_fence_tests() {
 
     // Batch 2: post 3 more, then fence.
     for _ in 0..3 {
-        io::register_driver("input".into());
+        io::add_config("input".into());
     }
     info!("fence test: posted batch 2 (3x register_driver input), entering fence");
     io::pnp_fence();
@@ -1022,47 +1024,48 @@ fn kern_main() -> ! {
 #[cfg(feature = "acpi")]
     acpica::init();
     //interative_thread_spawn_tests();
-    //run_cancel_tests();
+    //unload_driver("i8042").expect("Failed to unload driver");
+    run_cancel_tests();
     //run_fence_tests();
     //run_state_tests();
-    //run_i8042_tests();
-    run_signal_tests();
+    run_i8042_tests();
+    //run_signal_tests();
     //run_sync_tests();
     //run_proc_thread_tests();
     //spam_threads_test();
     //run_driver_worker_tests();
     //run_user_tests();
     info!("Main task going to sleep");
-    info!("====TTY mode====");
-    let kbd = open_device_handle("input").expect("Failed to open input device!");
-    let input_buf: [u8; 256] = [0; 256];
-    loop {
-        kbd.read(ReadRequest{
-            buffer: MemoryRegion {
-                base_address: input_buf.as_ptr().addr(),
-                size: 9
-            },
-            offset: 0
-        }, false).expect("Failed to read input device!");
+    //info!("====TTY mode====");
+    //let kbd = open_device_handle("input").expect("Failed to open input device!");
+    //let input_buf: [u8; 256] = [0; 256];
+    //loop {
+    //    kbd.read(ReadRequest{
+    //        buffer: MemoryRegion {
+    //            base_address: input_buf.as_ptr().addr(),
+    //            size: 9
+    //        },
+    //        offset: 0
+    //    }, false).expect("Failed to read input device!");
 
-        let command = unsafe {
-            let command_slice = core::slice::from_raw_parts(input_buf.as_ptr(), 9);
-            core::str::from_utf8(command_slice).expect("Failed to decode utf-8")
-        };
+    //    let command = unsafe {
+    //        let command_slice = core::slice::from_raw_parts(input_buf.as_ptr(), 9);
+    //        core::str::from_utf8(command_slice).expect("Failed to decode utf-8")
+    //    };
 
-        if command == "shutdown\n" {
-            #[cfg(feature = "acpi")]
-            {
-                acpi_enter_sleep_state_prep(ACPI_SLEEP_S5);
-                acpi_enter_sleep_state(ACPI_SLEEP_S5);
-            }
-        }
-        else {
-            kernel_intf::println!();
-            kernel_intf::print!("Type shutdown:");
-        }
-    }
-    //hal::sleep();
+    //    if command == "shutdown\n" {
+    //        #[cfg(feature = "acpi")]
+    //        {
+    //            acpi_enter_sleep_state_prep(ACPI_SLEEP_S5);
+    //            acpi_enter_sleep_state(ACPI_SLEEP_S5);
+    //        }
+    //    }
+    //    else {
+    //        kernel_intf::println!();
+    //        kernel_intf::print!("Type shutdown:");
+    //    }
+    //}
+    hal::sleep();
 }
 
 // === Driver worker (DPC) tests ===
@@ -1077,7 +1080,7 @@ fn kern_main() -> ! {
 
 use core::sync::atomic::AtomicI64;
 
-use crate::io::{ReadRequest, open_device_handle};
+use crate::io::{ReadRequest, open_device_handle, unload_driver};
 use crate::sched::SIGKILL;
 use crate::sync::KEvent;
 

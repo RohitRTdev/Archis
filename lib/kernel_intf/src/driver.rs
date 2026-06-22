@@ -58,7 +58,7 @@ impl IrpMinor {
 }
 
 #[repr(isize)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Success     =  0,
     Pending     =  1,

@@ -15,6 +15,7 @@ use crate::mem::{self, MapFetchType, PageDescriptor};
 pub struct KernelModule {
     pub name: &'static str,
     pub driver_init_address: Option<usize>,
+    pub driver_unload_address: Option<usize>,
     pub file_handle: Option<FileInstance>,
     pub info: ModuleInfo,
 
@@ -117,6 +118,7 @@ pub fn early_init() {
         mod_type: ModuleType::Kernel(KernelModule {
             name: env!("CARGO_PKG_NAME"),
             driver_init_address: None,
+            driver_unload_address: None,
             file_handle: None,
             info: info.kernel_desc,
             _deps: None

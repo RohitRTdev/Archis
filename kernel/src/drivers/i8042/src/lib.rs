@@ -465,3 +465,8 @@ extern "C" fn keyboard_dw(ctx_ptr: *mut c_void) {
         }
     }
 }
+
+#[kmod::driver_unload]
+fn destroy(driver: &mut DriverObject) {
+    info!("Destroying driver {}", driver.get_name());
+}

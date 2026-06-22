@@ -107,6 +107,30 @@ pub fn init(
 }
 
 #[proc_macro_attribute]
+pub fn driver_unload(
+    attr: TokenStream,
+    item: TokenStream,
+) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+
+    let ident = &func.sig.ident;
+
+    quote! {
+        #func
+        #[unsafe(no_mangle)]
+        extern "C" fn _shim_driver_unload(
+            driver: *mut kernel_intf::driver::DriverObject
+        ) {
+            let obj = unsafe { &mut *driver };
+            #ident(obj)
+        }
+    }
+    .into()
+}
+
+
+
+#[proc_macro_attribute]
 pub fn export(
     _attr: TokenStream,
     item: TokenStream,

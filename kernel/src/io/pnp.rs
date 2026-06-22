@@ -6,6 +6,7 @@ use kernel_intf::list::{DynList, List, ListNodeGuard};
 use kernel_intf::mem::PoolAllocator;
 use kernel_intf::info;
 
+use crate::io::unload_driver;
 use crate::sync::{KEvent, Once, Spinlock};
 use crate::sched;
 
@@ -14,11 +15,11 @@ use super::stack;
 
 pub enum PnpRequest {
     InvalidateDevice { device_id: usize },
-    RefreshDeviceTree,
     StartDevice      { device_id: usize },
     StopDevice       { device_id: usize },
     RemoveDevice     { device_id: usize },
-    RegisterDriver   { name: String },
+    RemoveDriver     { name: String },
+    AddConfig        { name: String },
     Fence            { event: KEvent }
 }
 
@@ -27,15 +28,16 @@ impl core::fmt::Debug for PnpRequest {
         match self {
             PnpRequest::InvalidateDevice { device_id } =>
                 write!(f, "InvalidateDevice {{ device_id: {} }}", device_id),
-            PnpRequest::RefreshDeviceTree => write!(f, "RefreshDeviceTree"),
             PnpRequest::StartDevice { device_id } =>
                 write!(f, "StartDevice {{ device_id: {} }}", device_id),
             PnpRequest::StopDevice { device_id } =>
                 write!(f, "StopDevice {{ device_id: {} }}", device_id),
             PnpRequest::RemoveDevice { device_id } =>
                 write!(f, "RemoveDevice {{ device_id: {} }}", device_id),
-            PnpRequest::RegisterDriver { name } =>
-                write!(f, "RegisterDriver {{ name: {:?} }}", name),
+            PnpRequest::RemoveDriver { name } =>
+                write!(f, "RemoveDriver {{ name: {:?} }}", name),
+            PnpRequest::AddConfig { name } =>
+                write!(f, "AddConfig {{ name: {:?} }}", name),
             PnpRequest::Fence { .. } => write!(f, "Fence"),
         }
     }
@@ -47,10 +49,6 @@ static PNP_SIGNAL: Once<KEvent> = Once::new();
 pub fn pnp_post(req: PnpRequest) {
     PNP_QUEUE.lock().add_node(req).expect("PnP enqueue failed");
     PNP_SIGNAL.get().expect("io::init not called before pnp_post").signal();
-}
-
-pub fn refresh_device_tree() {
-    pnp_post(PnpRequest::RefreshDeviceTree);
 }
 
 pub fn start_device(device_id: usize) {
@@ -65,8 +63,8 @@ pub fn remove_device_async(device_id: usize) {
     pnp_post(PnpRequest::RemoveDevice { device_id });
 }
 
-pub fn register_driver(name: String) {
-    pnp_post(PnpRequest::RegisterDriver { name });
+pub fn add_config(name: String) {
+    pnp_post(PnpRequest::AddConfig { name });
 }
 
 pub fn pnp_fence() {
@@ -93,9 +91,6 @@ fn handle(req: &PnpRequest) {
                 None => info!("pnp: invalidate target device {} no longer exists", device_id)
             }
         },
-        PnpRequest::RefreshDeviceTree => {
-            stack::do_refresh_device_tree();
-        },
         PnpRequest::StartDevice { device_id } => {
             match get_device(*device_id) {
                 Some(dev) => { let _ = dev.start(); }
@@ -114,7 +109,10 @@ fn handle(req: &PnpRequest) {
                 None => info!("pnp: remove target device {} no longer exists", device_id)
             }
         },
-        PnpRequest::RegisterDriver { name } => {
+        PnpRequest::RemoveDriver { name } => {
+            unload_driver(name);
+        },
+        PnpRequest::AddConfig { name } => {
             // This will get the new configuration data and scan uninitialized pdo to check
             // if the new device stacks can be attached to it
             //todo!();

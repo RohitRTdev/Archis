@@ -1,6 +1,7 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::cell::UnsafeCell;
+use core::mem::take;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -38,6 +39,13 @@ pub struct OpenDeviceHandleInner {
 
 impl Drop for OpenDeviceHandleInner {
     fn drop(&mut self) {
+        match self.dev.state() {
+            DeviceState::Stopping | DeviceState::Stopped |
+            DeviceState::Removing | DeviceState::Removed => {
+                return;
+            },
+            _ => {}
+        }
         let _ = io_request_sync(&self.dev, IrpMajor::Close, IrpMinor::None, EMPTY_REGION, 0, None, false);
     }
 }
@@ -59,12 +67,32 @@ enum DeviceState {
     Removed  = 4
 }
 
+#[repr(usize)]
+#[derive(PartialEq)]
+enum DriverState {
+    Loaded = 0,
+    Unloaded = 1
+}
+
 pub struct DriverObjectK {
-    _image: LoadedImage,
-    driver: UnsafeCell<DriverObject>
+    image: UnsafeCell<Option<LoadedImage>>,
+    state: AtomicUsize,
+    driver: UnsafeCell<DriverObject>,
+    driver_guard: KSem,
+    devices: Spinlock<Vec<usize>>
 }
 
 unsafe impl Sync for DriverObjectK {} 
+
+impl DriverObjectK {
+    fn state(&self) -> DriverState {
+        unsafe { core::mem::transmute(self.state.load(Ordering::Acquire)) }
+    }
+
+    fn set_state(&self, s: DriverState) {
+        self.state.store(s as usize, Ordering::Release);
+    }
+}
 
 pub struct DeviceObjectK {
     id: usize,
@@ -471,9 +499,12 @@ fn load_driver(path: &str) -> Result<DriverHandle, KError> {
         (guard.kernel().name, guard.kernel().driver_init_address)
     };
 
-    let mut driver_k = DriverObjectK {
-        _image: image,
-        driver: UnsafeCell::new(DriverObject::new(id, StrRef::from_str(name)))
+    let driver_k = DriverObjectK {
+        image: UnsafeCell::new(Some(image)),
+        state: AtomicUsize::new(DriverState::Loaded as usize),
+        driver: UnsafeCell::new(DriverObject::new(id, StrRef::from_str(name))),
+        driver_guard: KSem::new(1,1),
+        devices: Spinlock::new(Vec::new())
     };
 
     if entry_addr.is_none() {
@@ -509,6 +540,51 @@ pub fn load_driver_by_name(name: &str) -> Result<DriverHandle, KError> {
     Ok(driver)
 }
 
+pub fn unload_driver(name: &str) -> Result<(), KError> {
+    let _guard = semaphore_guard(
+        DRIVER_LOAD_LOCK.get().expect("io::init() not called before load_driver_by_name()")
+    );
+    
+    let driver = if let Some(driver) = DRIVER_BY_NAME.lock().get(name) {
+        driver.clone()
+    }
+    else {
+        return Err(KError::InvalidArgument);
+    };
+
+    // Remove all devices within the driver
+    {
+        let _guard = semaphore_guard(&driver.driver_guard);
+        let device_list = driver.devices.lock().clone();   
+        for id in device_list {
+            if let Some(device) = get_device(id) {
+                remove_device(&device);
+            }
+        }
+
+        DRIVER_REGISTRY.lock().remove(unsafe {&(*driver.driver.get()).id});
+        DRIVER_BY_NAME.lock().remove(unsafe {(*driver.driver.get()).get_name()});
+
+        // Call driver unload function (if it exists)
+        // A driver is required to have init function, but unload is optional
+        let image = unsafe { &mut *driver.image.get() }.take()
+            .expect("No driver image found in driver object!");
+        let unload_addr_opt = image.lock().kernel().driver_unload_address;  
+        if let Some(unload_fn_addr) = unload_addr_opt {
+            let unload_fn: extern "C" fn(*mut kernel_intf::driver::DriverObject) = unsafe {
+                core::mem::transmute(unload_fn_addr)
+            };
+
+            unload_fn(driver.driver.get());
+        }
+
+        drop(image);
+        driver.set_state(DriverState::Unloaded);
+    }
+
+    Ok(())
+}
+
 // Returns null on failure. Failure causes: unknown driver id, or the supplied
 // name is already registered for another device 
 #[unsafe(no_mangle)]
@@ -526,6 +602,12 @@ pub extern "C" fn io_create_device(
             return core::ptr::null_mut();
         }
     };
+    
+    let _guard = semaphore_guard(&driver.driver_guard);
+    if driver.state() == DriverState::Unloaded {
+        info!("Device could not be created since driver is unloading!");
+        return core::ptr::null_mut();
+    } 
 
     let id = NEXT_DEVICE_ID.fetch_add(1, Ordering::Relaxed);
     // Class devices have no parent; normal devices may be unattached if parent is null.
@@ -545,7 +627,7 @@ pub extern "C" fn io_create_device(
         DeviceObjectK {
             id,
             device: DeviceObject::new(id, name, ctx),
-            driver: Some(driver),
+            driver: Some(driver.clone()),
             state: AtomicUsize::new(DeviceState::Stopped as usize),
             is_pdo: AtomicBool::new(false),
             is_class_device: is_class,
@@ -558,6 +640,9 @@ pub extern "C" fn io_create_device(
         },
         PoolAllocatorGlobal
     );
+
+    // Add the device to the driver
+    driver.devices.lock().push(id);
 
     let device_ptr = device.device_ptr() as *mut DeviceObject;
     DEVICE_REGISTRY.lock().insert(id, device.clone());
@@ -586,12 +671,24 @@ pub fn resolve_device(ptr: *const DeviceObject) -> Option<DeviceHandleK> {
 
 pub fn open_device_handle(name: &str) -> Result<OpenDeviceHandle, KError> {
     let dev = DEVICE_BY_NAME.lock().get(name).cloned().ok_or(KError::InvalidArgument)?;
+    match dev.state() {
+        DeviceState::Stopping | DeviceState::Stopped => {
+            return Err(KError::DeviceStopped);
+        },
+        _ => {}
+    }
     let _ = io_request_sync(&dev, IrpMajor::Open, IrpMinor::None, EMPTY_REGION, 0, None, false);
     Ok(Arc::new_in(OpenDeviceHandleInner { dev }, PoolAllocatorGlobal))
 }
 
 // Cancel every non-PNP IRP issued by the current thread to this device.
 pub fn cancel_pending_irp(dev: &DeviceObjectK) {
+    match dev.state() {
+        DeviceState::Removed | DeviceState::Removing => {
+            return;
+        },
+        _ => {}
+    }
     let tid = sched::get_current_task_id().expect("cancel_pending_irp called from idle task!");
     let snapshot: Vec<IrpPtr> = dev.pending_irps
     .lock()
@@ -638,11 +735,17 @@ pub fn remove_device(dev: &DeviceObjectK) {
         return;
     }
 
+    crate::io_log!("Removing device id {}", dev.id);
+
     if let Some(pid) = dev.parent_id() {
         if let Some(parent) = get_device(pid) {
             parent.children.lock().retain(|&c| c != dev.id);
         }
     }
+
+    // Remove device from driver
+    let driver = dev.driver.as_ref().expect("No driver found for device object!");
+    driver.devices.lock().retain(|&c| c != dev.id);
 
     // Notify the device's stack instance
     if let Some((stack, level)) = dev.stack.lock().take() {

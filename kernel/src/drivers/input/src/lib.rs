@@ -370,3 +370,8 @@ unsafe extern "C" fn keystroke_received(
         }
     }
 }
+
+#[kmod::driver_unload]
+fn destroy(driver: &mut DriverObject) {
+    info!("Destroying driver {}", driver.get_name());
+}
