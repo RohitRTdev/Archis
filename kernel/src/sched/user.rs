@@ -300,9 +300,12 @@ fn sys_open_file_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 
 // arg 1 = delay in ms
 fn sys_delay_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    delay_ms(args[0] as usize, true);
-
-    E_SUCCESS
+    if !delay_ms(args[0] as usize, true) {
+        E_WAIT_INTERRUPTED
+    }
+    else {
+        E_SUCCESS
+    }
 }
 
 // arg1 = user VA of the thread function (extern "C" fn() -> !), arg2 = context pointer

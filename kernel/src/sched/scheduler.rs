@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::collections::BTreeMap;
+use alloc::vec;
 use alloc::vec::Vec;
 use common::{MemoryRegion, PAGE_SIZE, align_down, get_highest_set_bit};
 use core::ptr::NonNull;
@@ -12,7 +13,7 @@ use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_p
 use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores, get_worker_stack, set_panic_base};
 use crate::hal::{self, *};
 use crate::mem::{PageDescriptor, VCB, VirtMemConBlk, get_kernel_addr_space, get_physical_address, map_to_kernel, set_address_space, unmap_from_kernel};
-use crate::sched::{ProcessCleanupWork, SignalHandler, enqueue_cleanup, get_current_process_id, kill_process};
+use crate::sched::{ProcessCleanupWork, SignalHandler, enqueue_cleanup, exit_process, get_current_process_id, kill_process};
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
 use crate::io::{self, IrpPtr, deallocate_irp};
 use kernel_intf::mem::{PoolAllocator, PoolAllocatorGlobal};
@@ -27,7 +28,7 @@ use crate::hal::{get_per_cpu_kernel_base_for_core, set_tss_stack};
 // This is in milliseconds
 pub const QUANTUM: usize = 10;
 const INIT_QUANTA: usize = 10;
-pub const MAX_SIGNALS: usize = 2;
+pub const MAX_SIGNALS: usize = 4;
 
 pub type KThread = Arc<Spinlock<Task>, PoolAllocatorGlobal>;
 
@@ -46,8 +47,10 @@ pub enum SignalCause {
     Interruption
 }
 
-pub const SIGSEGV: u8 = 0;
-pub const SIGKILL: u8 = 1;
+pub const SIGFPE:  u8 = 0;
+pub const SIGSEGV: u8 = 1;
+pub const SIGILL:  u8 = 2;
+pub const SIGKILL: u8 = 3;
 
 #[derive(Clone, Copy)]
 struct SignalFrame {
@@ -1394,13 +1397,24 @@ fn save_signal_context(task: &mut Task, signal: usize) {
 // This is called right before a thread is going to be scheduled out
 // So save whatever state we currently have
 fn check_and_save_signal_handler(task:&mut Task) -> bool {
-    let pend_signal = get_highest_set_bit(task.pending_signals);
-    if pend_signal == -1 {
+    let comp_signal = get_highest_set_bit(task.completed_signals);
+    let signal = if comp_signal == -1 {
+        get_highest_set_bit(task.pending_signals)
+    }
+    else {
+        // Completion bit has been set for this process
+        // but its about to be scheduled out.
+        // If we only consider pending bit, we'll wrongly
+        // save to the context of another handler/task
+        comp_signal
+    };
+
+    if signal == -1 {
         // Tell scheduler to do normal thread scheduling
         false
     }
     else {
-        save_signal_context(task, pend_signal as usize);
+        save_signal_context(task, signal as usize);
         true
     }
 }
@@ -1414,7 +1428,7 @@ fn switch_to_signal_handler(task: &mut Task, signal: usize, new_schedule: bool) 
     }
     let sig_frame = task.signal_frame_pending[signal]
         .as_mut().expect("signal_init set but signal frame info not available!");
-    
+
     switch_context(sig_frame.context);
 #[cfg(target_arch = "x86_64")]
     set_per_cpu_base(sig_frame.per_cpu_base);
@@ -1458,7 +1472,7 @@ fn check_and_execute_signal_handler(task: &mut Task, new_schedule: bool) -> bool
             false
         }
         else {
-            debug!("Init signal {} found. Starting new handler", init_signal);
+            debug!("Init signal {} found. Starting new handler with context={:#X}", init_signal, task.context);
             // We have successfully init this handler. Now start running it immediately
             switch_to_signal_handler(task, init_signal as usize, true);
             true
@@ -1471,7 +1485,7 @@ fn check_and_execute_signal_handler(task: &mut Task, new_schedule: bool) -> bool
             // Save the current one and start allocating 
             // and running the new handler
             if init_signal_handler(task, init_signal as usize, new_schedule) {
-                debug!("Higher prio {} signal found over {}. Switching to that", init_signal, pend_signal);
+                debug!("Higher prio {} signal found over {}. Switching to that with context={:#X}", init_signal, pend_signal, task.context);
                 switch_to_signal_handler(task, init_signal as usize, true);
             }
             else {
@@ -1480,7 +1494,7 @@ fn check_and_execute_signal_handler(task: &mut Task, new_schedule: bool) -> bool
         }
         else {
             // Continue running the same signal
-            debug!("Found lower prio {} signal over {}. Continuing with existing one", init_signal, pend_signal);
+            debug!("Found lower prio {} signal over {}. Continuing with existing one with context={:#X}", init_signal, pend_signal, task.context);
             switch_to_signal_handler(task, pend_signal as usize, new_schedule);
         }
     
@@ -1838,7 +1852,7 @@ fn do_issue_signal_to_eligible_thread(
             if state.is_none() || guard.status == *state.as_ref().unwrap() {
                 match guard.status {
                     TaskStatus::Terminated => {
-                        panic!("Task cannot be in terminated state in issue_signal path!");
+                        continue;
                     },
                     TaskStatus::Suspended => {
                         panic!("Task in suspended state in signal issue path!");
@@ -1932,6 +1946,39 @@ fn proc_do_issue_signal(this_proc: KProcess, action: SignalHandler, signal: u8) 
     false 
 }
 
+pub fn issue_signal_to_thread(tid: usize, signal: u8) {
+    debug!("issue_signal_to_thread: tid={} signal={}", tid, signal);
+    let task_opt = get_task_info(tid);
+    if task_opt.is_none() {
+        return;
+    }
+
+    let task = task_opt.unwrap();
+    let proc = task.lock().get_process().unwrap();
+    let pid = proc.lock().get_id();
+    if check_process_signal_validity(pid).is_none() {
+        return;
+    }
+    disable_preemption();
+
+    let handler_opt = proc.lock().get_signal_handler(signal);
+    
+    // Default action is to kill the process (even if thread directed)
+    if handler_opt.is_none() {
+        debug!("issue_signal_to_thread: Taking default action on signal {}", signal);
+        drop(task);
+        drop(proc);
+        enable_preemption();
+        kill_process(pid, -1);
+    }
+    else {
+        let SignalHandler { user_ctx, handler } = handler_opt.unwrap();
+        let thread_list = vec![tid];
+        do_issue_signal_to_eligible_thread(handler, signal, user_ctx, None, &thread_list);
+        enable_preemption();
+    }
+}
+
 pub fn issue_signal(pid: usize, signal: u8) {
     debug!("issue_signal: pid={} signal={}", pid, signal);
     let proc_res = check_process_signal_validity(pid);
@@ -2005,7 +2052,9 @@ pub fn issue_signal(pid: usize, signal: u8) {
     }
 }
 
-pub fn complete_signal() {
+// Always called from signal handler context
+// If user calls sigreturn from another context, we kill the process
+pub fn complete_signal() -> ! {
     disable_preemption();
     let this_proc = {
         let task = get_current_task().expect("complete_signal called from idle task");
@@ -2013,7 +2062,9 @@ pub fn complete_signal() {
         let pend_signal = get_highest_set_bit(guard.pending_signals);
         if pend_signal == -1 {
             debug!("complete_signal: no pending signal to complete for task {}", guard.id);
-            return;
+            drop(guard);
+            enable_preemption();
+            exit_process(-1);
         }
         debug!("complete_signal: marking signal {} as completed for task {}", pend_signal, guard.id);
         guard.completed_signals |= 1 << pend_signal;
@@ -2057,13 +2108,16 @@ pub fn complete_signal() {
     }
 
     this_proc.lock().set_pending_signals(pending_signal_mask);
+    drop(_guard);
+    drop(sig_guard);
+    drop(this_proc);
     enable_preemption();
     if kill_signal {
-        drop(_guard);
-        drop(sig_guard);
-        drop(this_proc);
         kill_process(pid, -1);
     }
+
+    yield_cpu();
+    panic!("Reached end of complete_signal!");
 }
 
 

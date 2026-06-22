@@ -48,8 +48,8 @@ extern "C" fn arch_syscall_handler(context: *mut SyscallContext) -> i64 {
 
     let stat = syscall_dispatcher(syscall_number, args);
 
-    set_kernel_mode_and_syscall_params(false, false, per_cpu_base, user_rsp);
     disable_interrupts();
+    set_kernel_mode_and_syscall_params(false, false, per_cpu_base, user_rsp);
     
     // Restore user gs
     unsafe {

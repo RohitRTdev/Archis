@@ -1,4 +1,6 @@
 #pragma once
 
-#define SIGSEGV 0
-#define SIGKILL 1
+#define SIGFPE 0
+#define SIGSEGV 1
+#define SIGILL 2
+#define SIGKILL 3

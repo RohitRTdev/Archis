@@ -1,4 +1,7 @@
-use crate::{REMAP_LIST, cpu::{self, PerCpu}, mem::{KERNEL_HALF_OFFSET, KERNEL_HALF_OFFSET_RAW, PageDescriptor, fixed_allocator::Regions::*}};
+use crate::REMAP_LIST;
+use crate::cpu::{self, PerCpu};
+use crate::hal::PAGE_FAULT_VECTOR;
+use crate::mem::{KERNEL_HALF_OFFSET, KERNEL_HALF_OFFSET_RAW, PageDescriptor, fixed_allocator::Regions::*};
 use crate::sync::{Once, Spinlock};
 use crate::hal::{self, PageMapper, try_kill_user_process};
 use crate::mem::FixedList;
@@ -11,7 +14,7 @@ use core::alloc::Layout;
 use core::ptr::{null_mut, NonNull};
 use core::hint::likely;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use common::{MemoryRegion, PAGE_SIZE, align_down, ceil_div, ptr_to_ref_mut};
+use common::{MemoryRegion, PAGE_SIZE, ceil_div, ptr_to_ref_mut};
 use super::PHY_MEM_CB;
 
 const ERROR_MESSAGE: &'static str = "System in bad state. Critical memory failure";
@@ -1237,6 +1240,6 @@ pub fn virtual_allocator_test() {
 }
 
 pub fn on_page_fault(fault_address: usize) {
-    try_kill_user_process("Page fault");
+    try_kill_user_process(PAGE_FAULT_VECTOR, "Page fault");
     panic!("Page fault exception!\nFault address:{:#X}", fault_address);
 }

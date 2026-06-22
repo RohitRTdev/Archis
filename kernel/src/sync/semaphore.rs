@@ -125,7 +125,7 @@ fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>, is_interruptible: 
         }
     }
 
-    // Yield outside the lock so the spinlock is released first.
+    // Yield outside the lock
     if yield_flag {
         sched::yield_cpu();
     }

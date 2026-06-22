@@ -6,7 +6,7 @@ use crate::cpu::{self, MAX_CPUS, PerCpu, general_interrupt_handler};
 use crate::hal::x86_64::asm::switch_context_force;
 use crate::hal::{enable_scheduler_timer, get_core, get_per_cpu_base, get_per_cpu_kernel_base};
 use crate::infra;
-use crate::sched::{SIGSEGV, issue_signal};
+use crate::sched::{SIGFPE, SIGILL, SIGSEGV, issue_signal_to_thread};
 use crate::sync::Spinlock;
 use super::{lapic, timer};
 use crate::mem::on_page_fault;
@@ -20,6 +20,8 @@ use crate::mem::FixedList;
 use kernel_intf::list::List;
 use crate::mem::Regions::Region3;
 
+pub const DIVIDE_EXCP_VECTOR: usize = 0;
+pub const INVALID_OPCODE_EXCP_VECTOR: usize = 6;
 pub const PAGE_FAULT_VECTOR: usize = 14;
 pub const DOUBLE_FAULT_VECTOR: usize = 8;
 pub const NMI_FAULT_VECTOR: usize = 2;
@@ -226,7 +228,7 @@ pub fn init() {
 
                 // For all other exceptions originating in user space, kill the process
                 // instead of crashing the kernel.
-                try_kill_user_process(EXCP_STRINGS[idx]);
+                try_kill_user_process(idx, EXCP_STRINGS[idx]);
 
                 panic!("{} exception!", EXCP_STRINGS[idx]);
             };
@@ -325,11 +327,22 @@ pub fn is_user_context(context: usize) -> bool {
 
 // If the current fault context is user space and a user process is active,
 // kill that process with exit code -1 
-pub fn try_kill_user_process(fault_label: &str) {
+pub fn try_kill_user_process(fault_idx: usize, fault_label: &str) {
     if is_user_context(fetch_context()) {
-        if let Some(pid) = crate::sched::get_current_process_id() {
-            info!("{} in user process — killing process", fault_label);
-            issue_signal(pid, SIGSEGV);
+        if let Some(tid) = crate::sched::get_current_task_id() {
+            info!("{} in user process — issuing signal", fault_label);
+            match fault_idx {
+               DIVIDE_EXCP_VECTOR => {
+                issue_signal_to_thread(tid, SIGFPE);
+               },
+               INVALID_OPCODE_EXCP_VECTOR => {
+                issue_signal_to_thread(tid, SIGILL);
+               },
+               _ => {
+                issue_signal_to_thread(tid, SIGSEGV);
+               }
+            }
+
             crate::sched::yield_cpu();
         }
     }

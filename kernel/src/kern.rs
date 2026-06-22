@@ -967,7 +967,22 @@ fn run_user_tests() {
 
 fn run_signal_tests() {
     info!("=== run_signal_tests: BEGIN ===");
+    static SEM: Once<KEvent> = Once::new();
+    static PID: AtomicUsize = AtomicUsize::new(0);
+    SEM.call_once(|| {
+        KEvent::new(false)
+    });
 
+    extern "C" fn signaller() -> ! {
+        let _ = SEM.get().unwrap().wait(false);
+        let pid = PID.load(Ordering::Acquire); 
+        info!("Issuing signal from child thread");
+        sched::issue_signal(pid, SIGKILL);
+
+        sched::exit_thread(0);
+    }
+
+    sched::create_thread(signaller, core::ptr::null_mut()).unwrap();
     info!("--- signal test 1: user signal handler via sigreturn ---");
     let p1 = sched::create_process(
         vec!["signal_test".into()],
@@ -976,14 +991,18 @@ fn run_signal_tests() {
         false
     ).expect("signal test 1: failed to create signal_test process");
 
+
+
     let pid = p1.lock().get_id();
     info!("signal test 1: created process pid={}", pid);
 
     sched::delay_ms(1000, false);
-    info!("signal test 1: issuing SIGSEGV to pid={}", pid);
-    //sched::issue_signal(pid, sched::SIGKILL);
-    //sched::issue_signal(pid, sched::SIGSEGV);
-    //sched::issue_signal(pid, sched::SIGSEGV);
+    PID.store(pid, Ordering::Release);
+    SEM.get().unwrap().signal();
+
+    info!("signal test 1: issuing signals to pid={}", pid);
+    sched::issue_signal(pid, sched::SIGSEGV);
+    sched::issue_signal(pid, sched::SIGILL);
 
     p1.wait(false);
     info!("signal test 1: process exited with code {}", p1.lock().get_exit_code());
@@ -1059,6 +1078,7 @@ fn kern_main() -> ! {
 use core::sync::atomic::AtomicI64;
 
 use crate::io::{ReadRequest, open_device_handle};
+use crate::sched::SIGKILL;
 use crate::sync::KEvent;
 
 static DW_COUNTER:        AtomicI64    = AtomicI64::new(0);
