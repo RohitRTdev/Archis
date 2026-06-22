@@ -15,7 +15,7 @@ use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::info;
 
 use crate::fs::{FileBuffer, open};
-use crate::sync::{Once, Spinlock};
+use crate::sync::{KSem, Once, Spinlock, semaphore_guard};
 
 use super::driver::{
     DeviceHandleK, driver_invoke_add, get_device, io_request_sync, load_driver_by_name, remove_device,
@@ -43,7 +43,7 @@ struct DriverInformation {
 // Immutable template parsed from boot.conf: one per [DeviceStack] block. Tells us
 // which drivers to load (bottom -> top) for a given match id. Shared 
 // across every live instance that matches the same id.
-struct DeviceStackDescriptor {
+pub(super) struct DeviceStackDescriptor {
     match_id: String,
     driver_names: Vec<String>
 }
@@ -136,6 +136,8 @@ impl DeviceStack {
 static DESCRIPTORS: Once<Spinlock<Vec<Arc<DeviceStackDescriptor>>>> = Once::new();
 static STACK_INSTANCES: Once<Spinlock<Vec<Arc<DeviceStack>>>> = Once::new();
 static DRIVER_INFO_REGISTRY: Spinlock<Vec<DriverInformation>> = Spinlock::new(Vec::new());
+static DEVICE_TREE_REBUILD_LOCK: Once<KSem> = Once::new();
+static DEVICE_TREE_REFRESH_LOCK: Once<KSem> = Once::new();
 
 fn read_file_to_string(path: &str) -> Option<String> {
     let file = open(path).ok()?;
@@ -149,7 +151,8 @@ fn read_file_to_string(path: &str) -> Option<String> {
 
 fn push_descriptor(out: &mut Vec<Arc<DeviceStackDescriptor>>, match_id: String, driver_names: Vec<String>) {
     if out.iter().any(|d| d.match_id != ROOT_ID && d.match_id == match_id) {
-        panic!("boot.conf: duplicate device stack id '{}' (a PDO must belong to at most one stack)", match_id);
+        info!("boot.conf: duplicate device stack id '{}' (a PDO must belong to at most one stack)", match_id);
+        return;
     }
     out.push(Arc::new(DeviceStackDescriptor { match_id, driver_names }));
 }
@@ -182,12 +185,14 @@ fn parse(text: &str) -> Vec<Arc<DeviceStackDescriptor>> {
         driver_boot_start: bool
     | {
         if driver_name.is_none() || driver_path.is_none() {
-            panic!("Driver configuration is missing path/name!");
+            info!("Driver configuration is missing path/name!");
+            return;
         }
 
         let name = driver_name.take().unwrap();
         if driver_names.contains(&name) {
-            panic!("Duplicate driver name found while parsing boot.conf -> {}", name);
+            info!("Duplicate driver name found while parsing boot.conf -> {}", name);
+            return;
         }
 
         driver_info_registry.push(DriverInformation{
@@ -294,6 +299,8 @@ pub fn get_driver_path(name: &str) -> Option<String> {
 pub fn load_boot_config() {
     DESCRIPTORS.call_once(|| Spinlock::new(Vec::new()));
     STACK_INSTANCES.call_once(|| Spinlock::new(Vec::new()));
+    DEVICE_TREE_REBUILD_LOCK.call_once(|| KSem::new(1, 1));
+    DEVICE_TREE_REFRESH_LOCK.call_once(|| KSem::new(1, 1));
 
     let text = match read_file_to_string(BOOT_CONF_PATH) {
         Some(text) => text,
@@ -336,11 +343,19 @@ fn remove_instance(stack: &Arc<DeviceStack>) {
     }
 }
 
-pub fn load_root_stacks() {
+pub fn load_root_stacks(descs: Option<&Vec<Arc<DeviceStackDescriptor>>>) {
     let root = root_device();
-    let root_descriptors: Vec<Arc<DeviceStackDescriptor>> = match DESCRIPTORS.get() {
-        Some(d) => d.lock().iter().filter(|d| d.match_id == ROOT_ID).cloned().collect(),
-        None => panic!("DESCRIPTORS is uninitialized??")
+
+    let root_descriptors: Vec<Arc<DeviceStackDescriptor>> = match descs {
+        Some(d) => { d.iter().filter(|d| d.match_id == ROOT_ID).cloned().collect() },
+        None => {
+            DESCRIPTORS.get().expect("DESCRIPTORS is uninitialized??")
+            .lock()
+            .iter()
+            .filter(|d| d.match_id == ROOT_ID)
+            .cloned()
+            .collect()
+        }
     };
 
     info!("Loading root stack");
@@ -569,7 +584,13 @@ fn query_id(dev: &DeviceHandleK) -> Option<String> {
     Some(unsafe { sref.as_str() }.to_string())
 }
 
+// Scan any currently failed to load/removed stacks
+// and try to rebuild it
 pub fn do_refresh_device_tree() {
+    let _guard = semaphore_guard(
+        DEVICE_TREE_REFRESH_LOCK.get().expect("io::init() not called before load_driver_by_name()")
+    );
+
     let instances: Vec<Arc<DeviceStack>> = match STACK_INSTANCES.get() {
         Some(list) => list.lock().clone(),
         None => panic!("STACK_INSTANCES not initialized??")
@@ -592,4 +613,18 @@ pub fn on_device_removed(stack: &Arc<DeviceStack>, level: usize) {
     } else {
         stack.clear_level(level);
     }
+}
+
+pub fn add_driver_config(new_config: &String) {
+    let _guard = semaphore_guard(
+        DEVICE_TREE_REBUILD_LOCK.get().expect("io::init() not called before load_driver_by_name()")
+    );
+    let descs = parse(new_config);
+    DESCRIPTORS.get().expect("DESCRIPTORS is uninitialized??").lock().extend(descs.clone());
+
+    // First load all root device stacks in this new list
+    load_root_stacks(Some(&descs));
+
+    // Now retry loading drivers for any failed stacks
+    do_refresh_device_tree();
 }

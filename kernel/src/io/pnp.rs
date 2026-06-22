@@ -6,6 +6,7 @@ use kernel_intf::list::{DynList, List, ListNodeGuard};
 use kernel_intf::mem::PoolAllocator;
 use kernel_intf::info;
 
+use crate::io::stack::{add_driver_config, do_refresh_device_tree};
 use crate::io::unload_driver;
 use crate::sync::{KEvent, Once, Spinlock};
 use crate::sched;
@@ -19,8 +20,9 @@ pub enum PnpRequest {
     StopDevice       { device_id: usize },
     RemoveDevice     { device_id: usize },
     RemoveDriver     { name: String },
-    AddConfig        { name: String },
-    Fence            { event: KEvent }
+    AddConfig        { new_config: String },
+    Fence            { event: KEvent },
+    RefreshDeviceTree
 }
 
 impl core::fmt::Debug for PnpRequest {
@@ -36,9 +38,10 @@ impl core::fmt::Debug for PnpRequest {
                 write!(f, "RemoveDevice {{ device_id: {} }}", device_id),
             PnpRequest::RemoveDriver { name } =>
                 write!(f, "RemoveDriver {{ name: {:?} }}", name),
-            PnpRequest::AddConfig { name } =>
-                write!(f, "AddConfig {{ name: {:?} }}", name),
+            PnpRequest::AddConfig { new_config } =>
+                write!(f, "AddConfig {{ new_config: {:?} }}", new_config),
             PnpRequest::Fence { .. } => write!(f, "Fence"),
+            PnpRequest::RefreshDeviceTree => write!(f, "RefreshDeviceTree")
         }
     }
 }
@@ -63,8 +66,8 @@ pub fn remove_device_async(device_id: usize) {
     pnp_post(PnpRequest::RemoveDevice { device_id });
 }
 
-pub fn add_config(name: String) {
-    pnp_post(PnpRequest::AddConfig { name });
+pub fn add_config(new_config: String) {
+    pnp_post(PnpRequest::AddConfig { new_config });
 }
 
 pub fn pnp_fence() {
@@ -117,13 +120,16 @@ fn handle(req: &PnpRequest) {
                 _ => {}
             }
         },
-        PnpRequest::AddConfig { .. } => {
+        PnpRequest::AddConfig { new_config } => {
             // This will get the new configuration data and scan uninitialized pdo to check
             // if the new device stacks can be attached to it
-            //todo!();
+            add_driver_config(new_config);
         },
         PnpRequest::Fence { event } => {
             event.signal();
+        },
+        PnpRequest::RefreshDeviceTree => {
+            do_refresh_device_tree();
         }
     }
 }

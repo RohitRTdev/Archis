@@ -914,7 +914,7 @@ pub fn init() {
     // Parse boot.conf and bring up every Root stack. Enumeration inside the
     // root bus drivers recursively detects and loads child stacks.
     stack::load_boot_config();
-    stack::load_root_stacks();
+    stack::load_root_stacks(None);
 
     super::pnp::start_worker();
 }
