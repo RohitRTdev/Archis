@@ -45,6 +45,12 @@ SECTIONS {
         *(.plt) 
     }
     
+    .kunit_tests ALIGN(0x1000): {
+        __kunit_tests_start = .;
+        KEEP(*(.kunit_tests))
+        __kunit_tests_end = .;
+    }
+
     /DISCARD/ : {
         *(.comment)
         *(.eh_frame)

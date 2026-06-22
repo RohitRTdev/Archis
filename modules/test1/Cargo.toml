@@ -12,3 +12,7 @@ common.workspace = true
 kernel_intf.workspace = true
 kmod.workspace = true
 
+[features]
+default = []
+kunit-test = ["kernel_intf/kunit-test"]
+

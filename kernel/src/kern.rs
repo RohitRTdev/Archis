@@ -22,10 +22,12 @@ mod acpica;
 #[cfg(feature = "acpi")]
 use acpi_intf::{ACPI_SLEEP_S5, acpi_enter_sleep_state, acpi_enter_sleep_state_prep};
 
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::sync::atomic::AtomicUsize;
-use core::ffi::c_void;
-use io::OpenDeviceHandle;
+#[cfg(feature = "kunit-test")] 
+use {
+    core::sync::atomic::{AtomicUsize, AtomicBool, Ordering},
+    core::ffi::c_void,
+    io::OpenDeviceHandle
+};
 
 use kernel_intf::{info, debug};
 use common::*;
@@ -33,6 +35,7 @@ use loader::module;
 
 extern crate alloc;
 use alloc::collections::BTreeMap;
+#[cfg(feature = "kunit-test")]
 use alloc::vec;
 
 #[cfg(test)]
@@ -41,9 +44,12 @@ mod tests;
 use sync::{Once, Spinlock};
 use mem::Regions::*;
 use mem::FixedList;
+#[cfg(feature = "kunit-test")]
 use kernel_intf::driver::{IrpMajor, IrpMinor, IrpResult, Keystroke, create_device_by_id};
+#[cfg(feature = "kunit-test")]
 use kernel_intf::KError;
 use kernel_intf::list::List;
+#[cfg(feature = "kunit-test")]
 use sync::KSem;
 
 static BOOT_INFO: Once<BootInfo> = Once::new();
@@ -70,10 +76,11 @@ struct InitFS {
 
 static INIT_FS: Once<InitFS> = Once::new();  
 static REMAP_LIST: Spinlock<FixedList<RemapEntry, {Region2 as usize}>> = Spinlock::new(List::new());
-static THREAD_DONE_SEM: Once<KSem> = Once::new();
-
+//#[cfg(feature = "kunit-test")]
+static THREAD_DONE_SEM: Once<crate::sync::KSem> = Once::new();
 
 // Simple worker used in run_proc_thread_tests test 3.
+#[cfg(feature = "kunit-test")]
 extern "C" fn test_thread_runner() -> ! {
     let id = sched::get_current_task_id().unwrap_or(0);
     info!("test_thread_runner: started (id={})", id);
@@ -87,9 +94,8 @@ extern "C" fn test_thread_runner() -> ! {
 //   1. Single kernel process create + wait + exit-code check.
 //   2. Three concurrent kernel processes, each waited individually.
 //   3. Three worker threads synchronised through a semaphore.
+#[kmod::test_function(true)]
 fn run_proc_thread_tests() {
-    info!("=== run_proc_thread_tests: BEGIN ===");
-
     // Test 1: single process with context_ptr; verify the module mutates it
     info!("--- proc/thread test 1: single process with context ---");
 
@@ -101,8 +107,8 @@ fn run_proc_thread_tests() {
 
     let mut ctx = TestCtx { val1: 42, val2: -7 };
     let proc1 = sched::create_process(
-        vec!["libtest1.so".into(), "hello_from_test1".into()],
-        &mut ctx as *mut TestCtx as *mut c_void,
+        alloc::vec!["libtest1.so".into(), "hello_from_test1".into()],
+        &mut ctx as *mut TestCtx as *mut core::ffi::c_void,
         false,
         false
     )
@@ -120,7 +126,7 @@ fn run_proc_thread_tests() {
     let mut procs = alloc::vec::Vec::with_capacity(PROC_COUNT);
     for i in 0..PROC_COUNT {
         let p = sched::create_process(
-            vec!["libtest1.so".into(), alloc::format!("concurrent_proc_{}", i)],
+            alloc::vec!["libtest1.so".into(), alloc::format!("concurrent_proc_{}", i)],
             core::ptr::null_mut(),
             false,
             false
@@ -139,7 +145,7 @@ fn run_proc_thread_tests() {
     info!("--- proc/thread test 3: thread creation ---");
 
     const THREAD_COUNT: usize = 3;
-    THREAD_DONE_SEM.call_once(|| KSem::new(0, THREAD_COUNT as isize));
+    THREAD_DONE_SEM.call_once(|| crate::sync::KSem::new(0, THREAD_COUNT as isize));
 
     let mut threads = alloc::vec::Vec::with_capacity(THREAD_COUNT);
     for _ in 0..THREAD_COUNT {
@@ -172,11 +178,13 @@ fn run_proc_thread_tests() {
 // i8042 is up). A read for 1 char pends until a key is pressed, making it
 // an ideal subject for cancellation.
 
+#[cfg(feature = "kunit-test")]
 extern "C" fn cancel_test_completion(result: *const IrpResult, _ctx: *mut core::ffi::c_void) {
     let status = unsafe { (*result).status };
     info!("cancel_test_completion: IRP delivered with status {}", status as isize);
 }
 
+#[cfg(feature = "kunit-test")]
 extern "C" fn task_kill_cancel_runner() -> ! {
     let handle = match io::open_device_handle("input") {
         Ok(h) => h,
@@ -186,8 +194,6 @@ extern "C" fn task_kill_cancel_runner() -> ! {
         }
     };
 
-    unload_driver("i8042").expect("Failed to unload driver");
-    
     let mut buf = [0u8; 1];
     info!("task_kill_cancel_runner: issuing sync read (will pend until killed)");
     let res= handle.read(io::ReadRequest {
@@ -199,6 +205,7 @@ extern "C" fn task_kill_cancel_runner() -> ! {
     loop { sched::delay_ms(1000, false); }
 }
 
+#[cfg(feature = "kunit-test")]
 extern "C" fn self_cancel_runner() -> ! {
     let handle = match io::open_device_handle("input") {
         Ok(h) => h,
@@ -233,6 +240,7 @@ extern "C" fn self_cancel_runner() -> ! {
     sched::exit_thread(0);
 }
 
+#[kmod::test_function(false)]
 fn run_cancel_tests() {
     // Wait for PnP to start i8042 and the input class device.
     sched::delay_ms(500, false);
@@ -280,11 +288,16 @@ fn run_cancel_tests() {
     }
 }
 
+#[cfg(feature = "kunit-test")]
 static STATE_TEST_DEV: Once<OpenDeviceHandle> = Once::new();
+#[cfg(feature = "kunit-test")]
 static STATE_TEST_RUN: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "kunit-test")]
 static REJECTED_DURING_STOPPED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "kunit-test")]
 static REACHED_DRIVER_AFTER_START: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(feature = "kunit-test")]
 fn state_test_handle() -> OpenDeviceHandle {
     STATE_TEST_DEV.get().expect("state test device handle not initialised").clone()
 }
@@ -292,6 +305,7 @@ fn state_test_handle() -> OpenDeviceHandle {
 // Spin-read with size 0 while STATE_TEST_RUN; tally DeviceStopped rejections.
 // i8042 rejects size-0 reads with Status::Failed when started (reaches driver),
 // so this never pends — the loop spins freely and only counts stopped-state hits.
+#[cfg(feature = "kunit-test")]
 extern "C" fn state_reject_loop() -> ! {
     let dev = state_test_handle();
     while STATE_TEST_RUN.load(Ordering::Acquire) {
@@ -307,6 +321,7 @@ extern "C" fn state_reject_loop() -> ! {
     sched::exit_thread(0);
 }
 
+#[cfg(feature = "kunit-test")]
 extern "C" fn state_start_once() -> ! {
     let dev = state_test_handle();
     let r = dev.start();
@@ -319,6 +334,7 @@ extern "C" fn state_start_once() -> ! {
 // Issue a size-0 read. i8042 returns Ok(Status::Failed) for empty buffers when
 // started (request reached the driver). Any Err variant means the state guard
 // rejected it before dispatch.
+#[cfg(feature = "kunit-test")]
 extern "C" fn state_io_once() -> ! {
     let dev = state_test_handle();
     let res = dev.read(io::ReadRequest {
@@ -334,9 +350,8 @@ extern "C" fn state_io_once() -> ! {
     sched::exit_thread(0);
 }
 
+#[kmod::test_function(false)]
 fn run_state_tests() {
-    info!("=== run_state_tests: BEGIN ===");
-
     // Wait for PnP to bring up i8042.
     sched::delay_ms(500, false);
 
@@ -404,9 +419,8 @@ fn run_state_tests() {
 }
 
 // === PnP fence test ===
+#[kmod::test_function(false)]
 fn run_fence_tests() {
-    info!("=== run_fence_tests: BEGIN ===");
-
     // Batch 1: post 4 register_driver calls, then fence.
     // Already-loaded drivers are handled gracefully by the PnP worker; what
     // matters is that pnp_fence() blocks until all queued work is drained.
@@ -428,6 +442,7 @@ fn run_fence_tests() {
     info!("=== run_fence_tests: PASSED ===");
 }
 
+#[cfg(feature = "kunit-test")]
 extern "C" fn thread_creator() -> ! {
     info!("Created new thread");
     loop {
@@ -436,6 +451,7 @@ extern "C" fn thread_creator() -> ! {
     }
 }
 
+#[kmod::test_function(false)]
 fn spam_threads_test() {
     sched::create_thread(thread_creator, core::ptr::null_mut()).expect("Failed to create kernel thread!");
 }
@@ -449,95 +465,31 @@ fn spam_threads_test() {
 //     Otherwise task A being signalled wipes task B's timer.
 //   - timer-fired-after-signal race must not double-bump the counter.
 
-static SYNC_TEST_SEM:    Once<KSem>   = Once::new();
-static SYNC_TEST_DONE:   Once<KSem>   = Once::new();
-static SYNC_AUTO_EVENT:  Once<KEvent> = Once::new();
-static SYNC_MANUAL_EVENT:Once<KEvent> = Once::new();
+#[cfg(feature = "kunit-test")]
+mod test_sync {
+    use super::*;
 
-// Per-test bookkeeping populated by worker threads.
-static SYNC_WAKE_COUNT:    AtomicUsize = AtomicUsize::new(0);
-static SYNC_TIMEOUT_COUNT: AtomicUsize = AtomicUsize::new(0);
-static SYNC_SIGNAL_COUNT:  AtomicUsize = AtomicUsize::new(0);
+    pub static SYNC_TEST_SEM: Once<KSem> = Once::new();
+    pub static SYNC_TEST_DONE: Once<KSem> = Once::new();
+    pub static SYNC_AUTO_EVENT: Once<KEvent> = Once::new();
+    pub static SYNC_MANUAL_EVENT: Once<KEvent> = Once::new();
 
+    pub static SYNC_WAKE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    pub static SYNC_TIMEOUT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    pub static SYNC_SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+}
+
+#[cfg(feature = "kunit-test")]
+use test_sync::*;
+
+#[cfg(feature = "kunit-test")]
 fn reset_sync_counters() {
     SYNC_WAKE_COUNT.store(0, Ordering::Relaxed);
     SYNC_TIMEOUT_COUNT.store(0, Ordering::Relaxed);
     SYNC_SIGNAL_COUNT.store(0, Ordering::Relaxed);
 }
 
-// Generic semaphore waiter. Records whether it was signalled vs timed out.
-extern "C" fn sync_sem_waiter() -> ! {
-    let res = SYNC_TEST_SEM.get().unwrap().wait(false).is_ok();
-    if res {
-        SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
-    } else {
-        SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-    SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
-    SYNC_TEST_DONE.get().unwrap().signal();
-    sched::exit_thread(0);
-}
-
-// Waits for 300ms then signals SYNC_TEST_SEM once. Used to test
-// "signal arrives before timeout".
-extern "C" fn sync_delayed_signaller() -> ! {
-    sched::delay_ms(300, false);
-    SYNC_TEST_SEM.get().unwrap().signal();
-    sched::exit_thread(0);
-}
-
-// Test 5 helper. Three workers, each with a DIFFERENT timeout, all waiting on
-// the same KSem. After we signal twice the two longest-timeout waiters must
-// have been woken with success; the shortest must have timed out. This is the
-// regression test for the "timer-removed-by-wrong-task" bug.
-extern "C" fn sync_long_timeout_waiter() -> ! {
-    // 3 seconds — well beyond the 500ms we let the test run before signalling
-    let res = SYNC_TEST_SEM.get().unwrap().wait_with_timeout(3000, false).is_ok();
-    if res {
-        SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
-    } else {
-        SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-    SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
-    SYNC_TEST_DONE.get().unwrap().signal();
-    sched::exit_thread(0);
-}
-
-extern "C" fn sync_short_timeout_waiter() -> ! {
-    // 200ms — must hit the timeout deterministically
-    let res = SYNC_TEST_SEM.get().unwrap().wait_with_timeout(200, false).is_ok();
-    if res {
-        SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
-    } else {
-        SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-    SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
-    SYNC_TEST_DONE.get().unwrap().signal();
-    sched::exit_thread(0);
-}
-
-// Generic event waiter (manual reset event in SYNC_MANUAL_EVENT).
-extern "C" fn sync_manual_event_waiter() -> ! {
-    let res = SYNC_MANUAL_EVENT.get().unwrap().wait(false).is_ok();
-    if res {
-        SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-    SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
-    SYNC_TEST_DONE.get().unwrap().signal();
-    sched::exit_thread(0);
-}
-
-// Generic event waiter (auto reset event in SYNC_AUTO_EVENT).
-extern "C" fn sync_auto_event_waiter() -> ! {
-    let res = SYNC_AUTO_EVENT.get().unwrap().wait(false).is_ok();
-    if res {
-        SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-    SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
-    SYNC_TEST_DONE.get().unwrap().signal();
-    sched::exit_thread(0);
-}
-
+#[cfg(feature = "kunit-test")]
 fn join_workers(done_sem: &KSem, count: usize) {
     for _ in 0..count {
         if done_sem.wait_with_timeout(10000, false).is_err() {
@@ -546,9 +498,8 @@ fn join_workers(done_sem: &KSem, count: usize) {
     }
 }
 
+#[kmod::test_function(false)]
 fn run_sync_tests() {
-    info!("=== run_sync_tests: BEGIN ===");
-
     // Initialise the global slots used by all sub-tests. We re-create the
     // KSem/KEvent inside each test that needs different state, but the Once
     // is filled with a placeholder first so .get() never panics.
@@ -893,9 +844,8 @@ fn run_sync_tests() {
 // Test 3: shared dep — cat and ls launched concurrently,
 //         both pull in libc.so (warm-loads the shared dependency).
 // Test 4: ls test — spawn ls internally only.
+#[kmod::test_function(false)]
 fn run_user_tests() {
-    info!("=== run_user_tests: BEGIN ===");
-
     // Test 1: basic user process with dependency
     info!("--- user test 1: basic load (cat) ---");
     let p1 = sched::create_process(
@@ -967,8 +917,8 @@ fn run_user_tests() {
     info!("=== run_user_tests: PASSED ===");
 }
 
+#[kmod::test_function(false)]
 fn run_signal_tests() {
-    info!("=== run_signal_tests: BEGIN ===");
     static SEM: Once<KEvent> = Once::new();
     static PID: AtomicUsize = AtomicUsize::new(0);
     SEM.call_once(|| {
@@ -1023,49 +973,38 @@ fn kern_main() -> ! {
 
 #[cfg(feature = "acpi")]
     acpica::init();
-    //interative_thread_spawn_tests();
-    //unload_driver("i8042").expect("Failed to unload driver");
-    run_cancel_tests();
-    //run_fence_tests();
-    //run_state_tests();
-    run_i8042_tests();
-    //run_signal_tests();
-    //run_sync_tests();
-    //run_proc_thread_tests();
-    //spam_threads_test();
-    //run_driver_worker_tests();
-    //run_user_tests();
+    kernel_intf::run_tests!();
     info!("Main task going to sleep");
-    //info!("====TTY mode====");
-    //let kbd = open_device_handle("input").expect("Failed to open input device!");
-    //let input_buf: [u8; 256] = [0; 256];
-    //loop {
-    //    kbd.read(ReadRequest{
-    //        buffer: MemoryRegion {
-    //            base_address: input_buf.as_ptr().addr(),
-    //            size: 9
-    //        },
-    //        offset: 0
-    //    }, false).expect("Failed to read input device!");
+    info!("====TTY mode====");
+    let kbd = crate::io::open_device_handle("input").expect("Failed to open input device!");
+    let input_buf: [u8; 256] = [0; 256];
+    loop {
+        kbd.read(crate::io::ReadRequest{
+            buffer: MemoryRegion {
+                base_address: input_buf.as_ptr().addr(),
+                size: 9
+            },
+            offset: 0
+        }, false).expect("Failed to read input device!");
 
-    //    let command = unsafe {
-    //        let command_slice = core::slice::from_raw_parts(input_buf.as_ptr(), 9);
-    //        core::str::from_utf8(command_slice).expect("Failed to decode utf-8")
-    //    };
+        let command = unsafe {
+            let command_slice = core::slice::from_raw_parts(input_buf.as_ptr(), 9);
+            core::str::from_utf8(command_slice).expect("Failed to decode utf-8")
+        };
 
-    //    if command == "shutdown\n" {
-    //        #[cfg(feature = "acpi")]
-    //        {
-    //            acpi_enter_sleep_state_prep(ACPI_SLEEP_S5);
-    //            acpi_enter_sleep_state(ACPI_SLEEP_S5);
-    //        }
-    //    }
-    //    else {
-    //        kernel_intf::println!();
-    //        kernel_intf::print!("Type shutdown:");
-    //    }
-    //}
-    hal::sleep();
+        if command == "shutdown\n" {
+            #[cfg(feature = "acpi")]
+            {
+                acpi_enter_sleep_state_prep(ACPI_SLEEP_S5);
+                acpi_enter_sleep_state(ACPI_SLEEP_S5);
+            }
+        }
+        else {
+            kernel_intf::println!();
+            kernel_intf::print!("Type shutdown:");
+        }
+    }
+    //hal::sleep();
 }
 
 // === Driver worker (DPC) tests ===
@@ -1078,18 +1017,27 @@ fn kern_main() -> ! {
 //      loop (no need to wait for the next interrupt).
 //   4. After everything drains, the CPU leaves DW mode.
 
-use core::sync::atomic::AtomicI64;
+#[cfg(feature = "kunit-test")]
+use { 
+    core::sync::atomic::AtomicI64,
+    crate::sched::SIGKILL,
+    crate::sync::KEvent
+};
 
-use crate::io::{ReadRequest, open_device_handle, unload_driver};
-use crate::sched::SIGKILL;
-use crate::sync::KEvent;
+#[cfg(feature = "kunit-test")]
+mod dw_test_sync {
+    use super::*;
+    pub static DW_COUNTER:        AtomicI64    = AtomicI64::new(0);
+    pub static DW_RAN:            AtomicUsize  = AtomicUsize::new(0);
+    pub static DW_SAW_DW_MODE:    AtomicBool   = AtomicBool::new(false);
+    pub static DW_SAW_INT_ENABLED:AtomicBool   = AtomicBool::new(false);
+    pub static DW_RUN_CORE:       AtomicUsize  = AtomicUsize::new(usize::MAX);
+}
 
-static DW_COUNTER:        AtomicI64    = AtomicI64::new(0);
-static DW_RAN:            AtomicUsize  = AtomicUsize::new(0);
-static DW_SAW_DW_MODE:    AtomicBool   = AtomicBool::new(false);
-static DW_SAW_INT_ENABLED:AtomicBool   = AtomicBool::new(false);
-static DW_RUN_CORE:       AtomicUsize  = AtomicUsize::new(usize::MAX);
+#[cfg(feature = "kunit-test")]
+pub use dw_test_sync::*;
 
+#[cfg(feature = "kunit-test")]
 extern "C" fn dw_test_routine(ctx: *mut c_void) {
     // ctx encodes a small i64 value to add to the counter.
     let v = ctx as usize as i64;
@@ -1105,6 +1053,7 @@ extern "C" fn dw_test_routine(ctx: *mut c_void) {
     DW_RUN_CORE.store(hal::get_core(), Ordering::Relaxed);
 }
 
+#[cfg(feature = "kunit-test")]
 extern "C" fn dw_chain_routine(ctx: *mut c_void) {
     let v = ctx as usize;
     DW_COUNTER.fetch_add(v as i64, Ordering::Relaxed);
@@ -1119,6 +1068,7 @@ extern "C" fn dw_chain_routine(ctx: *mut c_void) {
     }
 }
 
+#[cfg(feature = "kunit-test")]
 fn reset_dw_state() {
     DW_COUNTER.store(0, Ordering::Relaxed);
     DW_RAN.store(0, Ordering::Relaxed);
@@ -1127,6 +1077,7 @@ fn reset_dw_state() {
     DW_RUN_CORE.store(usize::MAX, Ordering::Relaxed);
 }
 
+#[kmod::test_function(false)]
 fn run_driver_worker_tests() {
     info!("=== run_driver_worker_tests: BEGIN ===");
 
@@ -1196,6 +1147,7 @@ fn run_driver_worker_tests() {
     info!("=== run_driver_worker_tests: PASSED ===");
 }
 
+#[kmod::test_function(false)]
 fn run_i8042_tests() {
     // Wait for PnP to start i8042 + input class device.
     sched::delay_ms(500, false);
@@ -1219,11 +1171,13 @@ fn run_i8042_tests() {
 
     // Test 2: three concurrent readers, each opens its own handle.
     info!("i8042 test 2: spawning 3 concurrent readers (need 2+4+1 = 7 more keys)...");
-    sched::create_thread(i8042_reader_a, core::ptr::null_mut()).expect("i8042: spawn reader-a");
-    sched::create_thread(i8042_reader_b, core::ptr::null_mut()).expect("i8042: spawn reader-b");
-    sched::create_thread(i8042_reader_c, core::ptr::null_mut()).expect("i8042: spawn reader-c");
+    let t1 = sched::create_thread(i8042_reader_a, core::ptr::null_mut()).expect("i8042: spawn reader-a");
+    let t2 = sched::create_thread(i8042_reader_b, core::ptr::null_mut()).expect("i8042: spawn reader-b");
+    let t3 = sched::create_thread(i8042_reader_c, core::ptr::null_mut()).expect("i8042: spawn reader-c");
+    t1.wait(false); t2.wait(false); t3.wait(false);
 }
 
+#[cfg(feature = "kunit-test")]
 extern "C" fn i8042_reader_a() -> ! {
     let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-a: no input device");
     let mut buf = [Keystroke::default(); 2];
@@ -1236,6 +1190,7 @@ extern "C" fn i8042_reader_a() -> ! {
     sched::exit_thread(0)
 }
 
+#[cfg(feature = "kunit-test")]
 extern "C" fn i8042_reader_b() -> ! {
     let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-b: no input device");
     let mut buf = [Keystroke::default(); 4];
@@ -1248,6 +1203,7 @@ extern "C" fn i8042_reader_b() -> ! {
     sched::exit_thread(0)
 }
 
+#[cfg(feature = "kunit-test")]
 extern "C" fn i8042_reader_c() -> ! {
     let h = io::open_device_handle("ps/2_port0").expect("i8042 reader-c: no input device");
     let mut buf = [Keystroke::default(); 1];

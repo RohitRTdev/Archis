@@ -13,3 +13,4 @@ common.workspace = true
 default = []
 link-kernel = []
 test-kernel = []
+kunit-test = []

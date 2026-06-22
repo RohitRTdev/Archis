@@ -1,7 +1,7 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{Expr, Ident, ItemFn, Token, parse_macro_input, punctuated::Punctuated};
-use syn::parse::{Parse, ParseStream}; 
+use syn::{Expr, Ident, ItemFn, LitBool, Token, parse_macro_input, punctuated::Punctuated};
+use syn::parse::{Parse, ParseStream};
 
 #[proc_macro_attribute]
 pub fn init(
@@ -42,14 +42,17 @@ pub fn init(
                 driver: *mut kernel_intf::driver::DriverObject
             ) -> kernel_intf::driver::Status {
                 let obj = unsafe { &mut *driver };
-                #ident(obj)
+                let result = #ident(obj);
+                
+                result
             }
         }
     } else {
         quote! {
             #[unsafe(no_mangle)]
             extern "C" fn _shim_module_init() {
-                #ident()
+                kernel_intf::run_tests!();
+                #ident();
             }
         }
     };
@@ -108,7 +111,7 @@ pub fn init(
 
 #[proc_macro_attribute]
 pub fn driver_unload(
-    attr: TokenStream,
+    _attr: TokenStream,
     item: TokenStream,
 ) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
@@ -238,6 +241,64 @@ impl Parse for DispatchInit {
             handlers,
         })
     }
+}
+
+#[proc_macro_attribute]
+pub fn test_function(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let enabled = parse_macro_input!(attr as LitBool);
+    let func = parse_macro_input!(item as ItemFn);
+
+    if !func.sig.inputs.is_empty() {
+        return syn::Error::new_spanned(
+            &func.sig.inputs,
+            "test_function: function must take no arguments"
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    match &func.sig.output {
+        syn::ReturnType::Default => {}
+        syn::ReturnType::Type(_, ty) => {
+            if !matches!(ty.as_ref(), syn::Type::Tuple(t) if t.elems.is_empty()) {
+                return syn::Error::new_spanned(
+                    &func.sig.output,
+                    "test_function: function must return ()"
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
+    }
+
+    let ident = &func.sig.ident;
+    let name_str = ident.to_string();
+    let name_bytes = format!("{}\0", name_str);
+    let name_len = name_str.len();
+    let enabled_val = enabled.value;
+
+    let shim_ident = format_ident!("_kunit_shim_{}", ident);
+    let entry_ident = format_ident!("_KUNIT_ENTRY_{}", &name_str.to_uppercase());
+
+    quote! {
+        #[cfg(feature = "kunit-test")]
+        #func
+
+        #[cfg(feature = "kunit-test")]
+        unsafe extern "C" fn #shim_ident() { #ident() }
+
+        #[cfg(feature = "kunit-test")]
+        #[used]
+        #[unsafe(link_section = ".kunit_tests")]
+        static #entry_ident: kernel_intf::kunit::KUnitEntry =
+            kernel_intf::kunit::KUnitEntry {
+                name: #name_bytes.as_ptr(),
+                name_len: #name_len,
+                func: #shim_ident,
+                enabled: #enabled_val
+            };
+    }
+    .into()
 }
 
 #[proc_macro]

@@ -13,7 +13,7 @@ USER_LINKER_SCRIPT := config/x86_64/user_linker.ld
 OUTPUT_IMAGE = $(OUTPUT_DIR)/archis_os.img
 PLATFORM = acpi
 BOOTLOADER = uefi
-KERNEL_OPTIONS = --features acpi,stack_down,debug-io-logs
+KERNEL_OPTIONS = --features acpi,stack_down,kunit-test
 BLR_OPTIONS = --features acpi
 
 ifeq ($(OS),Windows_NT)

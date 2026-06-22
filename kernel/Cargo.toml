@@ -19,12 +19,14 @@ debug-io-logs = []
 debug-loader-logs = []
 debug-mem-logs = []
 debug-allocator-logs = []
-kunit-test = []
+debug-acpica-logs = []
+kunit-test = ["kernel_intf/kunit-test"]
 
 [dependencies]
 kernel_intf = {workspace = true, features = ["link-kernel"]}
 common.workspace = true
 acpi_intf.workspace = true
+kmod.workspace = true
 rustc-demangle = "*"
 
 # Used for testing

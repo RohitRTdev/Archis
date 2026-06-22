@@ -74,6 +74,7 @@ dependencies = [
  "ctor",
  "env_logger",
  "kernel_intf",
+ "kmod",
  "rustc-demangle",
  "tests",
  "walkdir",

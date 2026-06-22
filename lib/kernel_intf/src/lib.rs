@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![feature(allocator_api)]
 
 extern crate alloc;
@@ -371,3 +371,23 @@ pub fn disable_tty_mode() {
 pub fn tty_print(s: &str) {
     unsafe { tty_print_ffi(s.as_ptr(), s.len()); }
 }
+
+#[macro_export]
+macro_rules! run_tests {
+    () => {
+        #[cfg(feature = "kunit-test")]
+        {
+            unsafe extern "C" {
+                static __kunit_tests_start: $crate::kunit::KUnitEntry;
+                static __kunit_tests_end: $crate::kunit::KUnitEntry;
+            }
+            $crate::kunit::_run_range(
+                unsafe { &__kunit_tests_start as *const $crate::kunit::KUnitEntry },
+                unsafe { &__kunit_tests_end as *const $crate::kunit::KUnitEntry }
+            );
+        }
+    }
+}
+
+#[cfg(feature = "kunit-test")]
+pub mod kunit;

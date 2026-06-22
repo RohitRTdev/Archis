@@ -711,19 +711,6 @@ pub fn reserve_virtual_memory(virt_addr: usize, layout: Layout) -> Result<(), KE
     }
 }
 
-// Reserve a fixed range of user virtual address space in the current process.
-// Used to map shared user modules at the same VA in every process. Fails if
-// the range is already occupied in this address space
-pub fn reserve_user_virtual_memory(virt_addr: usize, layout: Layout) -> Result<(), KError> {
-    assert!(IS_ADDR_SPACE_INIT.load(Ordering::Relaxed));
-
-    let active_addr_space = get_active_vcb();
-    unsafe {
-        (*active_addr_space.as_ptr()).lock().reserve_virtual_space(virt_addr, layout)
-    }
-}
-
-
 // Flags => VIRTUAL = allocate virtual memory + phy memory + map to current virtual address space
 // Flags => NO_ALLOC = Reserve some space in the virtual address space
 pub fn allocate_memory(layout: Layout, flags: u8) -> Result<*mut u8, KError> {

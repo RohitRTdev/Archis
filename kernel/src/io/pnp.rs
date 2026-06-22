@@ -110,9 +110,14 @@ fn handle(req: &PnpRequest) {
             }
         },
         PnpRequest::RemoveDriver { name } => {
-            unload_driver(name);
+            match unload_driver(name) {
+                Err(err) => {
+                    info!("Unload driver failed due to {:?}", err);
+                },
+                _ => {}
+            }
         },
-        PnpRequest::AddConfig { name } => {
+        PnpRequest::AddConfig { .. } => {
             // This will get the new configuration data and scan uninitialized pdo to check
             // if the new device stacks can be attached to it
             //todo!();

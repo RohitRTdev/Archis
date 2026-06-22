@@ -4,18 +4,17 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 use common::{MemoryRegion, PAGE_SIZE, align_down, get_highest_set_bit};
-use core::ptr::NonNull;
+use core::ptr::{null_mut, NonNull};
 use core::mem::take;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicIsize, AtomicUsize, Ordering};
 use core::ffi::c_void;
-use core::ptr::null_mut;
 use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_process_info};
 use crate::cpu::{self, MAX_CPUS, PerCpu, Stack, get_panic_base, get_total_cores, get_worker_stack, set_panic_base};
 use crate::hal::{self, *};
-use crate::mem::{PageDescriptor, VCB, VirtMemConBlk, get_kernel_addr_space, get_physical_address, map_to_kernel, set_address_space, unmap_from_kernel};
-use crate::sched::{ProcessCleanupWork, SignalHandler, enqueue_cleanup, exit_process, get_current_process_id, kill_process};
+use crate::mem::*;
+use crate::sched::{ProcessCleanupWork, SignalHandler, enqueue_cleanup, exit_process, kill_process};
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
-use crate::io::{self, IrpPtr, deallocate_irp};
+use crate::io::{self, DeviceState, IrpPtr, deallocate_irp, get_device};
 use kernel_intf::mem::{PoolAllocator, PoolAllocatorGlobal};
 use kernel_intf::list::{DynList, List, ListNode, ListNodeGuard};
 use kernel_intf::driver::{DeviceObject, Irp, IrpMajor, IrpMinor, IrpResult, Status};
@@ -702,9 +701,9 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
     let mut drop_task  = false;
     let mut skip_notify  = false;
 
+    #[cfg(not(feature = "kunit-test"))]
     {
-        let cur_proc_id = get_current_process_id().expect("kill_thread() called from idle process!");
-        #[cfg(feature = "kunit-test")]
+        let cur_proc_id = crate::sched::get_current_process_id().expect("kill_thread() called from idle process!");
         assert!(cur_proc_id != 0, "Attempted to kill system thread!");
     } 
 
@@ -950,6 +949,21 @@ pub fn cancel_irp(irp_ptr: IrpPtr) {
 fn kill_sweep_irps(task: &KThread) {
     let irp_list = task.lock().take_irp_list();
     for irp in irp_list.iter() {
+        let dev_obj = unsafe {(***irp).device};
+        match get_device(unsafe {(*dev_obj).id}) {
+            None => {
+                // This device has been removed, don't send any cancel irp atp
+                continue;
+            },
+            Some(d) => {
+                match d.state() {
+                    DeviceState::Removed | DeviceState::Removing => {
+                        continue;
+                    },
+                    _ => {}
+                }
+            }
+        }
         cancel_irp(**irp);
     }
 }

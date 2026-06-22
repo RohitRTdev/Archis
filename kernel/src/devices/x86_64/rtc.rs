@@ -41,7 +41,7 @@ fn bcd_to_bin(val: u8) -> u8 {
 pub fn read_realtime() -> RtcTime {
     // Serialise CMOS port access across cores. The guard also disables
     // interrupts on the current core for the duration of the read.
-    let guard = RTC_LOCK.lock();
+    let _guard = RTC_LOCK.lock();
 
     // Wait until not updating
     while is_updating() {

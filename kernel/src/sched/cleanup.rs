@@ -2,7 +2,6 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 
 use alloc::vec::Vec;
-use kernel_intf::debug;
 use kernel_intf::list::{DynList, List, ListNodeGuard};
 use kernel_intf::mem::PoolAllocator;
 use common::{MemoryRegion, PAGE_SIZE};

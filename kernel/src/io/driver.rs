@@ -1,7 +1,6 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::cell::UnsafeCell;
-use core::mem::take;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -59,7 +58,7 @@ pub type OpenDeviceHandle = Arc<OpenDeviceHandleInner, PoolAllocatorGlobal>;
 
 #[repr(usize)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DeviceState {
+pub enum DeviceState {
     Stopped  = 0,
     Started  = 1,
     Stopping = 2,
@@ -149,7 +148,7 @@ impl DeviceObjectK {
         *self.parent.lock() = Some(pid);
     }
 
-    fn state(&self) -> DeviceState {
+    pub fn state(&self) -> DeviceState {
         unsafe { core::mem::transmute(self.state.load(Ordering::Acquire)) }
     }
 

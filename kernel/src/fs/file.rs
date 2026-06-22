@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use alloc::string::String;
 use alloc::borrow::ToOwned;
-use kernel_intf::{KError, info};
+use kernel_intf::KError;
 use crate::INIT_FS;
 use crate::sync::Spinlock;
 use kernel_intf::mem::PoolAllocatorGlobal;

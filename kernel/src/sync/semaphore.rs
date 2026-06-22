@@ -160,7 +160,7 @@ fn do_signal(inner_arc: &KSemInnerType) {
             *counter = (*max_count).min(*counter + 1);
             if *counter <= 0 { Wake::One } else { Wake::None }
         },
-        SemState::Event { signalled, is_auto_reset } => {
+        SemState::Event { is_auto_reset, ..  } => {
             if *is_auto_reset {
                 Wake::One
             } else {

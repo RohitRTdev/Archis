@@ -96,13 +96,6 @@ impl ModuleDescriptor {
             ModuleType::Kernel(_) => panic!("Expected user module descriptor!")
         }
     }
-
-    pub fn user_mut(&mut self) -> &mut UserModule {
-        match &mut self.mod_type {
-            ModuleType::User(u) => u,
-            ModuleType::Kernel(_) => panic!("Expected user module descriptor!")
-        }
-    }
 }
 
 pub static ARIS: Once<Spinlock<ModuleDescriptor>> = Once::new(); 
@@ -242,22 +235,9 @@ pub fn complete_handoff() {
     
     // This is the old unmapped kernel address
     let load_base = mod_cb.kernel().info.base;
-    let dyn_tab = mod_cb.kernel().info.dyn_tab;
 
     let info = |bitmap: u64| {
         (bitmap & 0xffffffff) as u32
-    };
-
-    let stringizer = |str_idx: usize| {
-        use core::ffi::CStr;
-
-        let str_base = unsafe {
-            (mod_cb.kernel().info.dyn_str.unwrap().base_address as *const u8).add(str_idx)
-        };
-
-        unsafe {
-            CStr::from_ptr(str_base as *const i8).to_str().unwrap()
-        }
     };
 
     if let Some(rlc_shn) = &mod_cb.kernel().info.rlc_shn {

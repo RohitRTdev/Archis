@@ -256,7 +256,7 @@ fn sys_close_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 }
 
 // arg0 = fd, arg1 = user buffer, arg2 = length, arg3 = ptr to bytes written
-fn sys_read_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+fn sys_read_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     E_INVALID
 }
 
@@ -290,11 +290,11 @@ fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-fn sys_open_device_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+fn sys_open_device_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     E_INVALID
 }
 
-fn sys_open_file_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+fn sys_open_file_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     E_INVALID
 }
 
@@ -407,7 +407,7 @@ fn sys_set_session_leader_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-fn sys_get_pid_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+fn sys_get_pid_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let cur_proc_id = get_current_process_id().expect("syscall in idle process??");
     cur_proc_id as i64
 }
@@ -506,5 +506,4 @@ fn sys_set_signal_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 
 fn sys_sigreturn_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     complete_signal();
-    E_SUCCESS
 }

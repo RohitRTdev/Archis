@@ -22,6 +22,12 @@ extern "C" fn worker_thread() -> ! {
     sched_exit_thread(0);
 }
 
+#[kmod::test_function(true)]
+fn test_fn() {
+    info!("Hi! Testing kernel module test framework!");
+}
+
+
 #[kmod::init]
 fn module_init() {
     let num_args = sched_get_num_process_args();
