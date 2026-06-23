@@ -270,10 +270,12 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
 
     acquire_spinlock(&mut ctx.lock);
 
-    if ctx.ascii_ring.len() >= requested {
+    let avail = ctx.ascii_ring.len();
+    if avail > 0 {
+        let give = avail.min(requested);
         let dst = request.buffer.base_address as *mut u8;
-        unsafe { ctx.ascii_ring.dequeue_into(dst, requested); }
-        request.bytes_completed = requested;
+        unsafe { ctx.ascii_ring.dequeue_into(dst, give); }
+        request.bytes_completed = give;
         release_spinlock(&mut ctx.lock);
         request.complete_irp(Status::Success);
         return Status::Success;
@@ -308,8 +310,6 @@ extern "C" fn input_cancel(dev: *const DeviceObject, irp: *mut Irp) {
     io_complete_irp(irp, Status::Cancelled);
 }
 
-// Batch pattern: push ALL new keystrokes first (tail advances), then satisfy
-// all pending IRPs (head advances per IRP)
 unsafe extern "C" fn keystroke_received(
     keystrokes: *const Keystroke,
     count:      usize,
@@ -334,38 +334,26 @@ unsafe extern "C" fn keystroke_received(
         }
     }
 
-    let avail = ctx.ascii_ring.len();
-    let mut max_consumed = 0usize;
-    let mut collected     = [null_mut::<Irp>(); MAX_PENDING];
+    let mut satisfied = 0usize;
+    let mut collected = [null_mut::<Irp>(); MAX_PENDING];
     let mut collected_len = 0;
-    let mut i = 0;
 
-    while i < ctx.pending_len {
-        let entry = ctx.pending[i];
-        let already_given = unsafe { (*entry.irp).bytes_completed };
-        let remaining = entry.requested - already_given;
-        let give = avail.min(remaining);
-
-        if give > 0 {
-            let dst = unsafe {
-                ((*entry.irp).buffer.base_address as *mut u8).add(already_given)
-            };
-            unsafe { ctx.ascii_ring.peek_into(dst, give); }
-            unsafe { (*entry.irp).bytes_completed += give; }
-            if give > max_consumed { max_consumed = give; }
-        }
-
-        if unsafe { (*entry.irp).bytes_completed } == entry.requested {
-            ctx.pending[i] = ctx.pending[ctx.pending_len - 1];
-            ctx.pending_len -= 1;
-            collected[collected_len] = entry.irp;
-            collected_len += 1;
-        } else {
-            i += 1;
-        }
+    while ctx.ascii_ring.len() > 0 && satisfied < ctx.pending_len {
+        let entry = ctx.pending[satisfied];
+        let give = ctx.ascii_ring.len().min(entry.requested);
+        let dst = unsafe { (*entry.irp).buffer.base_address as *mut u8 };
+        unsafe { ctx.ascii_ring.dequeue_into(dst, give); }
+        unsafe { (*entry.irp).bytes_completed = give; }
+        collected[collected_len] = entry.irp;
+        collected_len += 1;
+        satisfied += 1;
     }
 
-    ctx.ascii_ring.advance(max_consumed);
+    let remaining = ctx.pending_len - satisfied;
+    for i in 0..remaining {
+        ctx.pending[i] = ctx.pending[satisfied + i];
+    }
+    ctx.pending_len = remaining;
 
     release_spinlock(&mut ctx.lock);
 

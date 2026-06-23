@@ -336,10 +336,12 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
 
     acquire_spinlock(&mut ctx.lock);
 
-    if ctx.ks_ring.len() >= requested {
+    let avail = ctx.ks_ring.len();
+    if avail > 0 {
+        let give = avail.min(requested);
         let dst = request.buffer.base_address as *mut Keystroke;
-        unsafe { ctx.ks_ring.dequeue_into(dst, requested); }
-        request.bytes_completed = requested * ks_size;
+        unsafe { ctx.ks_ring.dequeue_into(dst, give); }
+        request.bytes_completed = give * ks_size;
         release_spinlock(&mut ctx.lock);
         request.complete_irp(Status::Success);
         return Status::Success;
@@ -415,38 +417,26 @@ extern "C" fn keyboard_dw(ctx_ptr: *mut c_void) {
         ctx.ks_ring.push(batch[i]);
     }
 
-    let avail = ctx.ks_ring.len();
-    let mut max_consumed = 0usize;
-    let mut collected     = [core::ptr::null_mut::<Irp>(); MAX_PENDING];
+    let mut satisfied = 0usize;
+    let mut collected = [core::ptr::null_mut::<Irp>(); MAX_PENDING];
     let mut collected_len = 0;
-    let mut i = 0;
 
-    while i < ctx.pending_len {
-        let entry = ctx.pending[i];
-        let already_given = unsafe { (*entry.irp).bytes_completed } / ks_size;
-        let remaining = entry.requested - already_given;
-        let give = avail.min(remaining);
-
-        if give > 0 {
-            let dst = unsafe {
-                ((*entry.irp).buffer.base_address as *mut Keystroke).add(already_given)
-            };
-            unsafe { ctx.ks_ring.peek_into(dst, give); }
-            unsafe { (*entry.irp).bytes_completed += give * ks_size; }
-            if give > max_consumed { max_consumed = give; }
-        }
-
-        if unsafe { (*entry.irp).bytes_completed } == entry.requested * ks_size {
-            ctx.pending[i] = ctx.pending[ctx.pending_len - 1];
-            ctx.pending_len -= 1;
-            collected[collected_len] = entry.irp;
-            collected_len += 1;
-        } else {
-            i += 1;
-        }
+    while ctx.ks_ring.len() > 0 && satisfied < ctx.pending_len {
+        let entry = ctx.pending[satisfied];
+        let give = ctx.ks_ring.len().min(entry.requested);
+        let dst = unsafe { (*entry.irp).buffer.base_address as *mut Keystroke };
+        unsafe { ctx.ks_ring.dequeue_into(dst, give); }
+        unsafe { (*entry.irp).bytes_completed = give * ks_size; }
+        collected[collected_len] = entry.irp;
+        collected_len += 1;
+        satisfied += 1;
     }
 
-    ctx.ks_ring.advance(max_consumed);
+    let remaining = ctx.pending_len - satisfied;
+    for i in 0..remaining {
+        ctx.pending[i] = ctx.pending[satisfied + i];
+    }
+    ctx.pending_len = remaining;
 
     let maybe_handler = ctx.keystroke_handler;
 
