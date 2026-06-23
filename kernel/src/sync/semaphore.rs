@@ -25,8 +25,12 @@ enum Wake {
     All
 }
 
-// True indicates that the lock was signalled
-// False means that semaphore got signalled due to timeout
+// Decrement the counter state -> if < 0, then block the task, add to semaphore blocked list
+// If its an event and not signalled, then block task and add to semaphore blocked list
+// If timeout is set to 0, then return immediately with status indicating whether sem/event is acquired or not
+// In case of success when timeout is set to 0, the semaphore count is decremented
+// If a task is killed when holding a semaphore, a hook is called by scheduler which removes the killed task
+// from the semaphore blocked list. For this reason, the semaphore is internally referenced by the task control block.
 fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>, is_interruptible: bool) -> Result<(), KError> {
     let int_enabled = hal::are_interrupts_enabled();
     let preemption_enabled = is_preemption_enabled();
@@ -152,6 +156,13 @@ fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>, is_interruptible: 
     }
 }
 
+// Increment count. If <= 0, then wake a task (this could succeed or fail)
+// If event, then signal it if its manual reset, otherwise leave it unsignalled so that it emulates auto-reset behaviour
+// If no task could be woken up (blocked list is empty), then signalled is set back to on in auto-reset case so that
+// the signal is not lost
+// signal could happen due to timeout and signal interruption too. In those cases, wake up the specific task that it 
+// wants to wake up and update the semaphore counters accordingly. If the task is already woken up by normal signal
+// and timeout is called by that point (before timers could be removed from the scheduler), then don't update the semaphore counts.
 fn do_signal(inner_arc: &KSemInnerType) {
     let mut inner = inner_arc.lock();
 

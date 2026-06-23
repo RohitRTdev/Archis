@@ -363,7 +363,7 @@ fn sys_create_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 
     let is_suspended = args[2] & PROCESS_SUSPENDED_FLAG != 0;
     let res = create_process(
-        command_args_str, 
+        command_args_str.as_slice(), 
         core::ptr::null_mut(), 
         true,
         is_suspended
@@ -438,13 +438,17 @@ fn sys_allocate_memory_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
         Ok(l) => l,
         Err(_) => return E_INVALID,
     };
-    let res = mem::allocate_memory(layout, PageDescriptor::VIRTUAL | PageDescriptor::USER);
+    let flags = PageDescriptor::VIRTUAL | PageDescriptor::USER; 
+    let res = mem::allocate_memory(layout, flags);
 
     match res {
         Ok(virt_addr) => {
             if mem::copy_to_user(args[1] as usize, &virt_addr as *const _ as *const u8, size_of::<usize>()).is_err() {
+                mem::deallocate_memory(virt_addr, layout, flags).expect("Unexpected failure during memory deallocation!");
                 return E_INVALID_MEMORY_RANGE;
             }
+
+            add_memory_range_to_cur_process(virt_addr.addr(), layout.size(), true);
 
             E_SUCCESS
         },
@@ -469,6 +473,7 @@ fn sys_deallocate_memory_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let res = mem::deallocate_memory(args[0] as *mut u8, layout, PageDescriptor::VIRTUAL | PageDescriptor::USER);
     match res {
         Ok(..) => {
+            remove_memory_range_from_cur_process(args[0] as usize, size, true);
             E_SUCCESS
         },
         _ => {

@@ -107,7 +107,7 @@ fn run_proc_thread_tests() {
 
     let mut ctx = TestCtx { val1: 42, val2: -7 };
     let proc1 = sched::create_process(
-        alloc::vec!["libtest1.so".into(), "hello_from_test1".into()],
+        &["libtest1.so", "hello_from_test1"],
         &mut ctx as *mut TestCtx as *mut core::ffi::c_void,
         false,
         false
@@ -126,7 +126,7 @@ fn run_proc_thread_tests() {
     let mut procs = alloc::vec::Vec::with_capacity(PROC_COUNT);
     for i in 0..PROC_COUNT {
         let p = sched::create_process(
-            alloc::vec!["libtest1.so".into(), alloc::format!("concurrent_proc_{}", i)],
+            &["libtest1.so", alloc::format!("concurrent_proc_{}", i).as_str()],
             core::ptr::null_mut(),
             false,
             false
@@ -849,7 +849,7 @@ fn run_user_tests() {
     // Test 1: basic user process with dependency
     info!("--- user test 1: basic load (cat) ---");
     let p1 = sched::create_process(
-        vec!["cat".into()],
+        &["cat"],
         core::ptr::null_mut(),
         true,
         false
@@ -861,13 +861,13 @@ fn run_user_tests() {
     // Test 2: warm load — same image in two concurrent processes
     info!("--- user test 2: warm load (2x cat) ---");
     let p2a = sched::create_process(
-        vec!["cat".into()],
+        &["cat"],
         core::ptr::null_mut(),
         true,
         false
     ).expect("user test 2: failed to create process A");
     let p2b = sched::create_process(
-        vec!["cat".into()],
+        &["cat"],
         core::ptr::null_mut(),
         true,
         false
@@ -884,13 +884,13 @@ fn run_user_tests() {
     // Test 3: different images, shared dependency
     info!("--- user test 3: shared dep (cat + ls) ---");
     let p3a = sched::create_process(
-        vec!["cat".into()],
+        &["cat"],
         core::ptr::null_mut(),
         true,
         false
     ).expect("user test 3: failed to create cat process");
     let p3b = sched::create_process(
-        vec!["ls".into()],
+        &["ls"],
         core::ptr::null_mut(),
         true,
         false
@@ -906,7 +906,7 @@ fn run_user_tests() {
     // Test 4: user-initiated process spawn
     info!("--- user test 4: ls test ---");
     let p4 = sched::create_process(
-        vec!["ls".into()],
+        &["ls"],
         core::ptr::null_mut(),
         true,
         false
@@ -937,7 +937,7 @@ fn run_signal_tests() {
     sched::create_thread(signaller, core::ptr::null_mut()).unwrap();
     info!("--- signal test 1: user signal handler via sigreturn ---");
     let p1 = sched::create_process(
-        vec!["signal_test".into()],
+        &["signal_test"],
         core::ptr::null_mut(),
         true,
         false

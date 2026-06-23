@@ -319,11 +319,18 @@ unsafe extern "C" fn keystroke_received(
 
     acquire_spinlock(&mut ctx.lock);
 
+    let mut ascii_batch     = [0u8; ASCII_BUF_SIZE];
+    let mut ascii_batch_len = 0usize;
+
     for i in 0..count {
         let ks = unsafe { &*keystrokes.add(i) };
         ctx.raw_ring.push(*ks);
         if ks.ascii != 0 && ks.flags & 1 == 0 {
             ctx.ascii_ring.push(ks.ascii);
+            if ascii_batch_len < ASCII_BUF_SIZE {
+                ascii_batch[ascii_batch_len] = ks.ascii;
+                ascii_batch_len += 1;
+            }
         }
     }
 
@@ -361,6 +368,10 @@ unsafe extern "C" fn keystroke_received(
     ctx.ascii_ring.advance(max_consumed);
 
     release_spinlock(&mut ctx.lock);
+
+    if ascii_batch_len > 0 {
+        unsafe { tty::tty_input(ascii_batch.as_ptr(), ascii_batch_len); }
+    }
 
     // Complete collected IRPs outside the lock.
     for k in 0..collected_len {

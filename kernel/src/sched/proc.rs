@@ -3,6 +3,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use alloc::borrow::ToOwned;
 use common::{MemoryRegion, StrRef};
 use kernel_intf::{KError, info, debug};
 use kernel_intf::list::{List, DynList};
@@ -442,7 +443,7 @@ pub fn get_current_process_args() -> *const Vec<String> {
     &guard.args as *const Vec<String>
 }
 
-pub fn create_process(args: Vec<String>, context_ptr: *mut c_void, is_user: bool, is_suspended: bool) -> Result<KProcess, KError> {
+pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_user: bool, is_suspended: bool) -> Result<KProcess, KError> {
     // args[0] must name the module to load (kernel and user alike)
     if args.is_empty() {
         return Err(KError::InvalidArgument);
@@ -457,6 +458,10 @@ pub fn create_process(args: Vec<String>, context_ptr: *mut c_void, is_user: bool
     };
 
     disable_preemption();
+
+    let args = args.iter()
+        .map(|s| s.as_ref().to_owned())
+        .collect();
 
     let process = match Process::new(
         true, 
@@ -597,6 +602,23 @@ pub fn add_memory_range_to_cur_process(virtual_base: usize, size: usize, is_user
     .expect("Failed to add node to process memory list!");
 }
 
+pub fn remove_memory_range_from_cur_process(virtual_base: usize, size: usize, is_user: bool) {
+    let flags = if is_user {PageDescriptor::USER} else {0};
+    let base_address = get_physical_address(virtual_base, flags)
+    .expect("Unable to find physical address for given virtual address from remove_memory_range_from_cur_process!");
+    
+    let process = get_current_process()
+    .expect("Called remove_memory_range_from_cur_process() from idle task!");
+
+    crate::sched_log!("Removing memory range with virtual_base:{:#X}, phy_base:{:#X} and size {}", virtual_base,
+    base_address, size);
+    
+    process.lock().memory_list.find_and_remove(|t| {
+        t.base_address == base_address && t.size == size
+    })
+    .expect("Failed to remove node from process memory list!");
+}
+
 pub fn get_handle(fd: usize) -> Option<Handle> {
     let proc = get_current_process()
     .expect("add_new_handle() called in idle task!");
@@ -679,7 +701,7 @@ extern "C" fn sched_create_process_ffi(
             .map(|s| String::from(s.as_str()))
             .collect()
     };
-    match create_process(args_vec, context_ptr, false, false) {
+    match create_process(args_vec.as_slice(), context_ptr, false, false) {
         Ok(proc) => proc.lock().get_id(),
         Err(_) => usize::MAX,
     }

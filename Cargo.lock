@@ -425,6 +425,15 @@ name = "tests"
 version = "0.1.0"
 
 [[package]]
+name = "tty"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "kernel_intf",
+ "kmod",
+]
+
+[[package]]
 name = "ucs2"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

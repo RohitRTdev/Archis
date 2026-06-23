@@ -73,8 +73,6 @@ impl Stack {
     }
     
     pub fn new_with(stack_size: usize, guard_size: usize, is_user: bool) -> Result<Self, KError> {
-        // TODO: Roll back and deallocate any memory allocations made in case operations further down fail
-        
         let vflags = if is_user {
             PageDescriptor::VIRTUAL | PageDescriptor::NO_ALLOC | PageDescriptor::USER
         }
@@ -85,8 +83,18 @@ impl Stack {
         let stack_raw = allocate_memory(Layout::from_size_align(stack_size + guard_size, PAGE_SIZE).unwrap()
         , vflags)?;
         
-        let stack_raw_phys = allocate_memory(Layout::from_size_align(stack_size, PAGE_SIZE).unwrap(),
-    0)?;
+        let stack_raw_phys = match allocate_memory(Layout::from_size_align(stack_size, PAGE_SIZE).unwrap(), 0) {
+            Ok(addr) => { addr },
+            Err(err) => {
+                deallocate_memory( 
+                    stack_raw, 
+                    Layout::from_size_align(stack_size + guard_size, PAGE_SIZE).unwrap(), 
+                    vflags
+                ).expect("Unexpected failure during roll back of memory allocation on stack creation!");
+
+                return Err(err);
+            }
+        };
 
         #[cfg(feature = "stack_down")]
         let stack_base = unsafe {
@@ -102,7 +110,26 @@ impl Stack {
             PageDescriptor::VIRTUAL
         };
 
-        map_memory(stack_raw_phys.addr(), stack_base.addr(), stack_size, flags)?;
+        match map_memory(stack_raw_phys.addr(), stack_base.addr(), stack_size, flags) {
+            Err(err) => {
+                // First deallocate the physical memory associated with the stack
+                deallocate_memory(
+                    stack_raw_phys, 
+            Layout::from_size_align(stack_size, PAGE_SIZE).unwrap(),
+                    0
+                ).expect("Unexpected failure during deallocation of physical memory on stack creation!");
+                
+                // Now remove the virtual memory reserved for this stack
+                deallocate_memory( 
+                    stack_raw, 
+                    Layout::from_size_align(stack_size + guard_size, PAGE_SIZE).unwrap(), 
+                    vflags
+                ).expect("Unexpected failure during roll back of memory allocation on stack creation during map!");
+
+                return Err(err);
+            },
+            _ => {}
+        }
     
         Ok(Self {guard_size, stack_size, base: NonNull::new(stack_raw).unwrap(), 
         allocated: true, user: is_user })
