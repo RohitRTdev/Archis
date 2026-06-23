@@ -41,7 +41,14 @@ static IOAPIC_LIST: Spinlock<[Ioapic; MAX_IOAPIC]> = Spinlock::new([Ioapic { id:
 static OVERRIDE_LIST: Spinlock<[IntOverride; MAX_INT_OVERRIDE]> = Spinlock::new([IntOverride { irq: 0, gsi: 0, is_edge_triggered: true, is_active_high: true}; MAX_INT_OVERRIDE]);
 
 // Register legacy type IRQ with IOAPIC
-pub fn add_redirection_entry(irq: usize, cpu_lapic_id: usize, vector: usize, active_high: bool, is_edge_triggered: bool) {
+pub fn set_redirection_entry(
+    enable: bool, 
+    irq: usize, 
+    cpu_lapic_id: usize, 
+    vector: usize, 
+    active_high: bool, 
+    is_edge_triggered: bool
+) {
     assert!(cpu_lapic_id <= 0xf);
     
     // First apply any interrupt source overrides
@@ -53,10 +60,21 @@ pub fn add_redirection_entry(irq: usize, cpu_lapic_id: usize, vector: usize, act
 
     let msg_type = 0u32 << 8;
     let upper_dword = (cpu_lapic_id as u32) << 24;
-    let lower_dword = (((if irq_override.is_edge_triggered {0} else {1}) as u32) << 15) | 
+
+    let masked_lower_dword = (1u32 << 16) |
+    (((if irq_override.is_edge_triggered {0} else {1}) as u32) << 15) | 
     (((if irq_override.is_active_high {0} else {1}) as u32) << 13) | (msg_type) | ((vector as u32) & 0xff);
 
-    info!("Adding IOAPIC redirection entry for src_irq:{}, dest_irq:{}", irq_override.irq, irq_override.gsi);
+    let lower_dword = (((if !enable {1} else {0}) as u32) << 16) |
+    (((if irq_override.is_edge_triggered {0} else {1}) as u32) << 15) | 
+    (((if irq_override.is_active_high {0} else {1}) as u32) << 13) | (msg_type) | ((vector as u32) & 0xff);
+
+    if enable {
+        info!("Adding IOAPIC redirection entry for src_irq:{}, dest_irq:{}", irq_override.irq, irq_override.gsi);
+    }
+    else {
+        info!("Disabling IOAPIC redirection entry for src_irq:{}, dest_irq:{}", irq_override.irq, irq_override.gsi);
+    }
 
     // Now we need to find out which IOAPIC this irq belongs to
     let stat = IOAPIC_LIST.lock().iter().find(|item| {
@@ -78,10 +96,19 @@ pub fn add_redirection_entry(irq: usize, cpu_lapic_id: usize, vector: usize, act
 
         // Select IOAPIC Redirection entry
         unsafe {
-            write_volatile(iosel, IOAPIC_REDIR_START_OFFSET + 2 * (irq_override.gsi - item.gsi) as u32);
-            write_volatile(iowin, lower_dword);
-            write_volatile(iosel, IOAPIC_REDIR_START_OFFSET + 2 * (irq_override.gsi - item.gsi) as u32 + 1);
+            let redir = IOAPIC_REDIR_START_OFFSET + 2 * (irq_override.gsi - item.gsi) as u32;
+
+            // First mask the entry to avoid delivery while reprogramming.
+            write_volatile(iosel, redir);
+            write_volatile(iowin, masked_lower_dword);
+
+            // Update destination.
+            write_volatile(iosel, redir + 1);
             write_volatile(iowin, upper_dword);
+
+            // Update the full lower dword.
+            write_volatile(iosel, redir);
+            write_volatile(iowin, lower_dword);
         }
 
         Some(true)
@@ -90,7 +117,7 @@ pub fn add_redirection_entry(irq: usize, cpu_lapic_id: usize, vector: usize, act
     if stat.is_none() {
         panic!("No IOAPIC found for src_irq:{} with redirection entry:{}!", irq_override.irq, irq_override.gsi);
     }
-}  
+}
 
 
 #[cfg(feature="acpi")]

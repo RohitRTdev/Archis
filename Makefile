@@ -131,7 +131,7 @@ test:
 	@echo "Starting simulator..."
 	@qemu-system-x86_64 $(QEMU_CPU_ARGS_WITHOUT_ACCEL) \
 	-drive if=pflash,format=raw,readonly=on,file=scripts/OVMF.fd \
-	-drive file=$(OUTPUT_DIR)/archis_os.img,format=raw,if=ide -serial stdio | tee >(sed 's/\x1b\[[0-9;=]*[A-Za-z]//g' > $(OUTPUT_DIR)/con_log.txt)
+	-drive file=$(OUTPUT_DIR)/archis_os.img,format=raw,if=ide -m 512M -serial stdio | tee >(sed 's/\x1b\[[0-9;=]*[A-Za-z]//g' > $(OUTPUT_DIR)/con_log.txt)
 
 clean:
 	@echo "Cleaning all builds..."

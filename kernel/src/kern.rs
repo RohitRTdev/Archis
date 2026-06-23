@@ -94,7 +94,7 @@ extern "C" fn test_thread_runner() -> ! {
 //   1. Single kernel process create + wait + exit-code check.
 //   2. Three concurrent kernel processes, each waited individually.
 //   3. Three worker threads synchronised through a semaphore.
-#[kmod::test_function(true)]
+#[kmod::test_function(false)]
 fn run_proc_thread_tests() {
     // Test 1: single process with context_ptr; verify the module mutates it
     info!("--- proc/thread test 1: single process with context ---");
@@ -350,7 +350,7 @@ extern "C" fn state_io_once() -> ! {
     sched::exit_thread(0);
 }
 
-#[kmod::test_function(false)]
+#[kmod::test_function(true)]
 fn run_state_tests() {
     // Wait for PnP to bring up i8042.
     sched::delay_ms(500, false);

@@ -4,7 +4,7 @@ use core::ptr::NonNull;
 use kernel_intf::list::{DynList, List, ListNode};
 use kernel_intf::{InterruptHandle, InterruptRoutine, debug};
 use crate::Spinlock;
-use crate::hal::{disable_interrupts, enable_interrupts, register_interrupt_handler};
+use crate::hal::{disable_interrupts, enable_interrupts, register_interrupt_handler, unregister_interrupt_handler};
 
 struct InterruptDescriptor {
     context: *mut core::ffi::c_void,
@@ -113,9 +113,12 @@ pub extern "C" fn io_remove_interrupt_handler_ffi(handle: InterruptHandle) {
             }
         }
 
+        // The last handler that belongs to this irq has been removed
+        // We can tell hardware to not forward requests from this irq
         if let Some(vector) = remove_vector {
             desc.irq_mapping.remove(&handle.irq);
             desc.vector_mapping.remove(&vector);
+            unregister_interrupt_handler(handle.irq, vector);
         }
     }
 

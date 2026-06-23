@@ -15,7 +15,7 @@ use super::cpu::get_bsp_lapic_id;
 use super::MAX_INTERRUPT_VECTORS;
 use super::asm;
 use crate::hal::halt;
-use crate::devices::ioapic::add_redirection_entry;
+use crate::devices::ioapic::set_redirection_entry;
 use crate::mem::FixedList;
 use kernel_intf::list::List;
 use crate::mem::Regions::Region3;
@@ -52,8 +52,6 @@ struct InterruptContext {
     vector: usize
 }
 
-static NEXT_AVAILABLE_VECTOR: AtomicUsize = AtomicUsize::new(USER_VECTOR_START);
-
 const EXCEPTION_VECTOR_RANGE: usize = 32;
 
 // This is set at init time and then never changed
@@ -73,6 +71,8 @@ static IS_INTERRUPT_CONTEXT: PerCpu<Spinlock<InterruptContext>> = PerCpu::new_wi
 static IPI_REQUESTS: Spinlock<FixedList<IPIRequest, {Region3 as usize}>> = Spinlock::new(List::new());
 
 static mut VECTOR_TABLE: [fn(usize); MAX_INTERRUPT_VECTORS] = [default_handler; MAX_INTERRUPT_VECTORS];
+static VECTOR_STATUS_TABLE: Spinlock<[bool; MAX_INTERRUPT_VECTORS]> = Spinlock::new([true; MAX_INTERRUPT_VECTORS]);
+
 const UNDEFINED_STRING: &'static str = "Undefined";
 const EXCP_STRINGS: [&'static str; EXCEPTION_VECTOR_RANGE] = [
     "Divide by zero",
@@ -248,17 +248,47 @@ pub fn init() {
         VECTOR_TABLE[IPI_VECTOR] = ipi_handler;
         VECTOR_TABLE[SYS_VECTOR] = sys_handler;
     }
+
+    // Init the vector status table
+    let mut vec_stat = VECTOR_STATUS_TABLE.lock();
+    for i in 0..USER_VECTOR_START {
+        vec_stat[i] = false;
+    }
+
     info!("Initialized interrupt handlers");
+}
+
+fn fetch_available_vector() -> usize {
+    let mut vec_stat = VECTOR_STATUS_TABLE.lock();
+    for i in USER_VECTOR_START..MAX_INTERRUPT_VECTORS {
+        if vec_stat[i] {
+            vec_stat[i] = false;
+            return i;
+        }
+    }
+
+    panic!("Out of available vectors!");
+}
+
+fn free_vector(vector: usize) {
+    assert!(vector >= USER_VECTOR_START && vector < MAX_INTERRUPT_VECTORS);
+    let mut vec_stat = VECTOR_STATUS_TABLE.lock();
+    vec_stat[vector] = false;
 }
 
 // Interrupts must be disabled during this call
 pub fn register_interrupt_handler(irq: usize, active_high: bool, is_edge_triggered: bool) -> usize {
-    let vector = NEXT_AVAILABLE_VECTOR.fetch_add(1, Ordering::Relaxed);
+    let vector = fetch_available_vector();
 
     // We will tie up all IOAPIC interrupts to BSP
-    add_redirection_entry(irq, get_bsp_lapic_id(), vector, active_high, is_edge_triggered);    
+    set_redirection_entry(true, irq, get_bsp_lapic_id(), vector, active_high, is_edge_triggered);    
     
     vector
+}
+
+pub fn unregister_interrupt_handler(irq: usize, vector: usize) {
+    set_redirection_entry(false, irq, get_bsp_lapic_id(), vector, false, false);    
+    free_vector(vector);
 }
 
 fn spurious_handler(_vector: usize) {
