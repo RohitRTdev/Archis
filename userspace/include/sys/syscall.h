@@ -67,7 +67,12 @@ syscall_status_t sys_allocate_memory(size_t size, void **out);
 syscall_status_t sys_deallocate_memory(void *addr, size_t size);
 syscall_status_t sys_set_signal_handler(uint8_t signal, void (*handler)(void), void *user_ctx);
 syscall_status_t sys_sigreturn(void);
-syscall_status_t sys_create_sync_object(sync_type_t type, uint64_t init_count, uint64_t max_count);
-syscall_status_t sys_wait(uint64_t fd);
+syscall_status_t sys_create_sync_object(
+    sync_type_t type, 
+    uint64_t init_count, 
+    uint64_t max_count, 
+    uint8_t auto_reset 
+);
+syscall_status_t sys_wait(uint64_t fd, ssize_t timeout);
 syscall_status_t sys_signal(uint64_t fd);
 

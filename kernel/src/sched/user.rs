@@ -9,13 +9,16 @@ use crate::cpu::Stack;
 use crate::hal::{MAX_ARCH_ARGS, copy_user_memory, transfer_control_to_user};
 use crate::loader::load_user_image;
 use crate::mem::{self, PageDescriptor};
-use crate::sched;
-use crate::sched::Handle::{ProcessHandle, ThreadHandle};
+use crate::sched::{self, Handle::{ProcessHandle, SyncHandle, ThreadHandle}};
+use crate::sync::{KEvent, KSem, do_signal, do_wait};
 use super::*;
 use kernel_intf::*;
 
-const MAX_SYSCALLS: usize = 18;
+const MAX_SYSCALLS: usize = 21;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
+const SYNC_TYPE_SEMAPHORE: u64 = 0;
+const SYNC_TYPE_EVENT: u64 = 1;
+
 
 static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_exit_handler,
@@ -35,7 +38,10 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_allocate_memory_handler,
     sys_deallocate_memory_handler,
     sys_set_signal_handler,
-    sys_sigreturn_handler
+    sys_sigreturn_handler,
+    sys_create_sync_object_handler,
+    sys_wait_handler,
+    sys_signal_handler
 ];
 
 fn read_c_strlen(start: usize) -> Option<usize> {
@@ -511,4 +517,73 @@ fn sys_set_signal_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 
 fn sys_sigreturn_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     complete_signal();
+}
+
+// arg0 = sync type, arg1 = init count, arg2 = max count, arg3 = auto reset
+fn sys_create_sync_object_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    if args[0] == SYNC_TYPE_SEMAPHORE && args[2] == 0 {
+        // max count cannot be zero
+        return E_INVALID;
+    }
+
+    if args[0] == SYNC_TYPE_EVENT && args[3] != 0 && args[3] != 1 {
+        // auto_reset must be 0 or 1
+        return E_INVALID;
+    }
+
+    let obj = if args[0] == SYNC_TYPE_SEMAPHORE {
+        KSem::new(args[1] as isize, args[2] as isize).inner()   
+    }
+    else {
+        KEvent::new(args[3] == 1).inner()
+    };
+
+    add_new_handle(SyncHandle(obj)) as i64
+}
+
+// arg0 = waitable obj fd, arg1 = timeout
+// if timeout = -1, then infinite timeout
+fn sys_wait_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let timeout = if args[1] as i64 != -1 {
+        Some(args[1] as usize)
+    }
+    else {
+        None
+    };
+    let wait_sem = match get_handle(args[0] as usize) {
+        Some(h) => {
+            match h {
+                ProcessHandle(h1) => { h1.get_inner_sem() },
+                ThreadHandle(h2) => { h2.get_inner_sem() },
+                SyncHandle(h3) => { h3.clone() },
+                _ => { return E_INVALID; }
+            }
+        },
+        None => { return E_INVALID; }
+    };
+
+    let res = do_wait(&wait_sem, timeout, true);
+
+    match res {
+        Ok(()) => { E_SUCCESS },
+        Err(err) => { err.into() }
+    }
+}
+
+// arg0 = waitable obj fd
+fn sys_signal_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let wait_sem = match get_handle(args[0] as usize) {
+        Some(h) => {
+            match h {
+                ProcessHandle(h1) => { h1.get_inner_sem() },
+                ThreadHandle(h2) => { h2.get_inner_sem() },
+                SyncHandle(h3) => { h3.clone() },
+                _ => { return E_INVALID; }
+            }
+        },
+        None => { return E_INVALID; }
+    };
+
+    do_signal(&wait_sem);
+    E_SUCCESS
 }

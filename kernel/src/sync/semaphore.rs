@@ -31,7 +31,7 @@ enum Wake {
 // In case of success when timeout is set to 0, the semaphore count is decremented
 // If a task is killed when holding a semaphore, a hook is called by scheduler which removes the killed task
 // from the semaphore blocked list. For this reason, the semaphore is internally referenced by the task control block.
-fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>, is_interruptible: bool) -> Result<(), KError> {
+pub fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>, is_interruptible: bool) -> Result<(), KError> {
     let int_enabled = hal::are_interrupts_enabled();
     let preemption_enabled = is_preemption_enabled();
     let in_dw = sched::is_in_dw_mode();
@@ -163,7 +163,7 @@ fn do_wait(inner_arc: &KSemInnerType, timeout: Option<usize>, is_interruptible: 
 // signal could happen due to timeout and signal interruption too. In those cases, wake up the specific task that it 
 // wants to wake up and update the semaphore counters accordingly. If the task is already woken up by normal signal
 // and timeout is called by that point (before timers could be removed from the scheduler), then don't update the semaphore counts.
-fn do_signal(inner_arc: &KSemInnerType) {
+pub fn do_signal(inner_arc: &KSemInnerType) {
     let mut inner = inner_arc.lock();
 
     let wake = match &mut inner.state {
@@ -335,6 +335,10 @@ impl KSem {
             }
         }
     }
+
+    pub fn inner(&self) -> KSemInnerType {
+        self.inner.clone()
+    }
 }
 
 impl Clone for KSem {
@@ -379,6 +383,10 @@ impl KEvent {
         if let SemState::Event { signalled , .. } = &mut inner.state {
             *signalled = false;
         }
+    }
+
+    pub fn inner(&self) -> KSemInnerType {
+        self.inner.clone()
     }
 }
 

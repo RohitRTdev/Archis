@@ -13,7 +13,7 @@ use crate::loader::{LoadedImage, LoadedImageWeak, load_image};
 use crate::{KERNEL_PATH, hal};
 use crate::mem::{self, PageDescriptor, VCB, VirtMemConBlk, get_physical_address};
 use crate::sched::{self, *};
-use crate::sync::{KEvent, Spinlock};
+use crate::sync::{KEvent, KSemInnerType, Spinlock};
 use crate::io::OpenDeviceHandle;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
@@ -29,7 +29,8 @@ pub enum Handle {
     ImgHandle(LoadedImage),
     DeviceHandle(OpenDeviceHandle),
     ThreadHandle(KThread),
-    ProcessHandle(KProcess)
+    ProcessHandle(KProcess),
+    SyncHandle(KSemInnerType)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -728,5 +729,9 @@ impl Spinlock<Process> {
         };
 
         sem.wait(is_interruptible).is_ok()
+    }
+
+    pub(super) fn get_inner_sem(&self) -> KSemInnerType {
+        self.lock().get_notify_sem().inner()
     }
 }

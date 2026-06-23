@@ -2328,6 +2328,10 @@ impl Spinlock<Task> {
 
         sem.wait(is_interruptible).is_ok()
     }
+    
+    pub(super) fn get_inner_sem(&self) -> KSemInnerType {
+        self.lock().term_notify.inner()
+    }
 }
 
 #[unsafe(no_mangle)]

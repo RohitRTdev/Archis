@@ -59,12 +59,17 @@ syscall_status_t sys_sigreturn(void) {
     return do_syscall(SYSCALL_SIGRETURN, 0, 0, 0, 0, 0, 0);
 }
 
-syscall_status_t sys_create_sync_object(sync_type_t type, uint64_t init_count, uint64_t max_count) {
-    return do_syscall(SYSCALL_CREATE_SYNC_OBJECT, (uint64_t)type, init_count, max_count, 0, 0, 0);
+syscall_status_t sys_create_sync_object(
+    sync_type_t type, 
+    uint64_t init_count, 
+    uint64_t max_count,
+    uint8_t auto_reset
+) {
+    return do_syscall(SYSCALL_CREATE_SYNC_OBJECT, (uint64_t)type, init_count, max_count, auto_reset, 0, 0);
 }
 
-syscall_status_t sys_wait(uint64_t fd) {
-    return do_syscall(SYSCALL_WAIT, fd, 0, 0, 0, 0, 0);
+syscall_status_t sys_wait(uint64_t fd, ssize_t timeout) {
+    return do_syscall(SYSCALL_WAIT, fd, timeout, 0, 0, 0, 0);
 }
 
 syscall_status_t sys_signal(uint64_t fd) {
