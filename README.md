@@ -29,23 +29,24 @@ If you want release version, simply invoke
 The current state of project
 * UEFI bootloader is setup, which allows the OS to run in modern UEFI based platforms 
 * Hal for x86_64 and platform initialization is complete. 
-* Interrupt subsystem is ready. This allows any thread to now install interrupt handlers for any IRQ.
+* Interrupt subsystem is ready. This allows any thread to now install/uninstall interrupt handlers for any IRQ.
 * Kernel can now create/destroy processes/threads, have separate virtual address space for each.
 * Ability to allocate/deallocate, map/unmap virtual memory. The kernel half of memory is shared among all processes though. 
 * Load kernel modules dynamically (all drivers are planned to be currently loaded as dynamic modules instead of statically linked rust libraries). Each module may depend on other modules, in which case the kernel loads all dependencies first and patches the .plt sections of the ELF to ensure that the modules can call each other's functions
 * Process manager also has ability to load a user thread/process and kernel has established syscall handler which means that user mode processes can now talk to the kernel. 
-* Processes/threads can wait on semaphores and timers. Threads can signal each other. The blocked thread is put into sleep (not just busy waiting) and woken up accordingly. If thread which was waiting on timer or semaphore is killed (by another thread), then this thread is removed from the semaphore blocked list.
+* Processes/threads can wait on semaphores with/without timeout. Threads can signal each other. The blocked thread is put into sleep (not just busy waiting) and woken up accordingly. If thread which was waiting on timer or semaphore is killed (by another thread), then this thread is removed from the semaphore blocked list.
 * In ACPI-UEFI based x86_64 platform, Aris uses RTC to read the wall clock time and timestamps are read from the cpu's tsc counter (both these can be seen in every log that is printed by any kernel module). The delay_ns function uses the platform HPET timer (We use this because the frequency for it is configurable). The delay_ms uses the timer interrupt to note the elapsed time. 
 The timer interrupt is fired using the CPU's LAPIC timer. Also, the lapic timer's frequency is measured using HPET (see [hal/x86_64/timer.rs](kernel/src/hal/x86_64/timer.rs) init function). This also means that if the platform doesn't have HPET timer, then currently the kernel panics as we don't have another reliable way to measure the CPU LAPIC frequency.
 
 ## Todo
-* Init acpi system so that acpi driver can enumerate system devices. Already brought in the ACPICA code which is now built alongside the kernel code. However, the osl layer (The layer which allows aris(kernel) to talk to acpica code) is yet to be written.
-* Build a suitable driver model. Most of the inspiration for it comes from the windows driver model.
-* For now, write the keyboard, tty and filesystem drivers (FAT32, ext4) along with atleast an ahci driver.
-* USB driver is in pipeline.
-* Write user init process which registers the tty driver with system and starts the shell process
-
-Haven't yet worked out the details on whether I write my own shell process or if I'm going to port existing shells (bash, sh etc).
+* Implement shared memory, pipes
+* Implement acpi, pci driver
+* Start with virtio blk driver. If need be later look at usb
+* Fat32 file system driver and mount logic
+* Implement file ops in libc
+* Write init and shell process
+* Write basic userspace utilities
+* Logic to wait_for_multiple_semaphores
 
 ## Testing 
 Testing can be done by burning the image file to a flash drive (tools like rufus or balena etcher should be fine) and running it on real machine by choosing to boot through the flash drive in BIOS setup.

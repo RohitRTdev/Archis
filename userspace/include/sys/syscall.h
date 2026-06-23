@@ -20,8 +20,16 @@ enum syscall_t {
     SYSCALL_ALLOCATE_MEMORY,
     SYSCALL_DEALLOCATE_MEMORY,
     SYSCALL_SET_SIGNAL_HANDLER,
-    SYSCALL_SIGRETURN
+    SYSCALL_SIGRETURN,
+    SYSCALL_CREATE_SYNC_OBJECT,
+    SYSCALL_WAIT,
+    SYSCALL_SIGNAL
 };
+
+typedef enum {
+    SYNC_SEMAPHORE = 0,
+    SYNC_EVENT     = 1
+} sync_type_t;
 
 typedef enum {
     E_SUCCESS = 0,
@@ -59,4 +67,7 @@ syscall_status_t sys_allocate_memory(size_t size, void **out);
 syscall_status_t sys_deallocate_memory(void *addr, size_t size);
 syscall_status_t sys_set_signal_handler(uint8_t signal, void (*handler)(void), void *user_ctx);
 syscall_status_t sys_sigreturn(void);
+syscall_status_t sys_create_sync_object(sync_type_t type, uint64_t init_count, uint64_t max_count);
+syscall_status_t sys_wait(uint64_t fd);
+syscall_status_t sys_signal(uint64_t fd);
 
