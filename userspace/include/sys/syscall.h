@@ -23,7 +23,8 @@ enum syscall_t {
     SYSCALL_SIGRETURN,
     SYSCALL_CREATE_SYNC_OBJECT,
     SYSCALL_WAIT,
-    SYSCALL_SIGNAL
+    SYSCALL_SIGNAL,
+    SYSCALL_GET_TIME_MS
 };
 
 typedef enum {
@@ -40,7 +41,9 @@ typedef enum {
     E_DEV_STOPPED = -5,
     E_INVALID_MEMORY_RANGE = -6,
     E_PROCESS_TERMINATED = -7,
-    E_NOPERM = -8
+    E_NOPERM = -8,
+    E_WAIT_INTERRUPTED = -11,
+    E_TIMEOUT = -12
 } syscall_status_t;
 
 #define PROCESS_SUSPEND_FLAG ((uint64_t)1 << 0)
@@ -68,11 +71,17 @@ syscall_status_t sys_deallocate_memory(void *addr, size_t size);
 syscall_status_t sys_set_signal_handler(uint8_t signal, void (*handler)(void), void *user_ctx);
 syscall_status_t sys_sigreturn(void);
 syscall_status_t sys_create_sync_object(
-    sync_type_t type, 
-    uint64_t init_count, 
-    uint64_t max_count, 
-    uint8_t auto_reset 
+    sync_type_t type,
+    uint64_t init_count,
+    uint64_t max_count,
+    uint8_t auto_reset
 );
 syscall_status_t sys_wait(uint64_t fd, ssize_t timeout);
 syscall_status_t sys_signal(uint64_t fd);
+typedef enum {
+    CLOCK_MONOTONIC = 0,
+    CLOCK_WALL_TIME = 1
+} clock_type_t;
+
+syscall_status_t sys_get_time_ms(clock_type_t clock, uint64_t *out);
 

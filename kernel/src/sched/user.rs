@@ -6,7 +6,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use common::{PAGE_SIZE, align_up};
 use crate::cpu::Stack;
-use crate::hal::{MAX_ARCH_ARGS, copy_user_memory, transfer_control_to_user};
+use crate::hal::{MAX_ARCH_ARGS, copy_user_memory, get_time_ms, transfer_control_to_user};
+use crate::devices::read_realtime;
 use crate::loader::load_user_image;
 use crate::mem::{self, PageDescriptor};
 use crate::sched::{self, Handle::{ProcessHandle, SyncHandle, ThreadHandle}};
@@ -14,7 +15,7 @@ use crate::sync::{KEvent, KSem, do_signal, do_wait};
 use super::*;
 use kernel_intf::*;
 
-const MAX_SYSCALLS: usize = 21;
+const MAX_SYSCALLS: usize = 22;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 const SYNC_TYPE_SEMAPHORE: u64 = 0;
 const SYNC_TYPE_EVENT: u64 = 1;
@@ -41,7 +42,8 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_sigreturn_handler,
     sys_create_sync_object_handler,
     sys_wait_handler,
-    sys_signal_handler
+    sys_signal_handler,
+    sys_get_time_ms_handler
 ];
 
 fn read_c_strlen(start: usize) -> Option<usize> {
@@ -585,5 +587,49 @@ fn sys_signal_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     };
 
     do_signal(&wait_sem);
+    E_SUCCESS
+}
+
+const CLOCK_MONOTONIC: u64 = 0;
+const CLOCK_WALL_TIME: u64 = 1;
+
+fn rtc_to_unix_ms(t: kernel_intf::RtcTime) -> u64 {
+    // RTC year is 2-digit: 0 = 2000, 24 = 2024, etc.
+    let year = 2000u64 + t.year as u64;
+
+    // Leap years before `year` minus leap years before 1970 (= 477).
+    // Formula: floors of y/4 - y/100 + y/400 counts leap years up to and including y.
+    let leap_days = (year - 1) / 4 - (year - 1) / 100 + (year - 1) / 400 - 477;
+
+    let days_to_year = (year - 1970) * 365 + leap_days;
+
+    const MDAYS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut days_in_year: u64 = 0;
+    for m in 0..(t.month as usize).saturating_sub(1) {
+        days_in_year += MDAYS[m];
+    }
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    if t.month > 2 && is_leap {
+        days_in_year += 1;
+    }
+
+    let total_days = days_to_year + days_in_year + t.day as u64 - 1;
+    let total_secs = total_days * 86400
+        + t.hour as u64 * 3600
+        + t.minute as u64 * 60
+        + t.second as u64;
+    total_secs * 1000
+}
+
+// arg0 = clock type, arg1 = pointer to uint64_t to receive milliseconds
+fn sys_get_time_ms_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let ms = match args[0] {
+        CLOCK_MONOTONIC => get_time_ms(),
+        CLOCK_WALL_TIME => rtc_to_unix_ms(read_realtime()),
+        _ => return E_INVALID
+    };
+    if mem::copy_to_user(args[1] as usize, &ms as *const u64 as *const u8, size_of::<u64>()).is_err() {
+        return E_INVALID;
+    }
     E_SUCCESS
 }

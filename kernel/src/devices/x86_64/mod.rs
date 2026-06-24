@@ -1,4 +1,5 @@
 mod rtc;
+pub use rtc::read_realtime;
 
 pub mod uart;
 

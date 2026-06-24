@@ -75,3 +75,7 @@ syscall_status_t sys_wait(uint64_t fd, ssize_t timeout) {
 syscall_status_t sys_signal(uint64_t fd) {
     return do_syscall(SYSCALL_SIGNAL, fd, 0, 0, 0, 0, 0);
 }
+
+syscall_status_t sys_get_time_ms(clock_type_t clock, uint64_t *out) {
+    return do_syscall(SYSCALL_GET_TIME_MS, (uint64_t)clock, (uint64_t)out, 0, 0, 0, 0);
+}

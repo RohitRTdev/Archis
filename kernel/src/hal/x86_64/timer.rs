@@ -8,6 +8,7 @@ use super::lapic;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub static BASE_COUNT: PerCpu<AtomicUsize> = PerCpu::new_with([const {AtomicUsize::new(0)}; MAX_CPUS]);
+static TSC_FREQ_HZ: PerCpu<AtomicUsize> = PerCpu::new_with([const {AtomicUsize::new(0)}; MAX_CPUS]);
 static EXPECTED_VISITOR: AtomicUsize = AtomicUsize::new(0);
 
 // Smallest granularity timer
@@ -52,7 +53,8 @@ pub fn init() {
 
     let num_ticks_passed = new.wrapping_sub(old);
     let base_freq = num_ticks_passed * 1000;
-    
+    TSC_FREQ_HZ.local().store(base_freq as usize, Ordering::Relaxed);
+
     info!("CPU Base Clock frequency measured as {}Hz", base_freq);
     
     // Now measure APIC timer
@@ -76,7 +78,15 @@ pub fn init() {
     info!("Init count calculated as {:#X}", init_count);
 
     BASE_COUNT.local().store(init_count, Ordering::Relaxed);
-    
+
     lapic::setup_timer();
     EXPECTED_VISITOR.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn get_time_ms() -> u64 {
+    let freq = TSC_FREQ_HZ.local().load(Ordering::Relaxed) as u64;
+    if freq == 0 {
+        return 0;
+    }
+    asm::rdtsc() * 1000 / freq
 }

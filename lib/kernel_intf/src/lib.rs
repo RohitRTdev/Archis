@@ -54,6 +54,7 @@ pub const E_NOPERM: i64 = -8;
 pub const E_DEV_REMOVED: i64 = -9;
 pub const E_DEV_STARTED: i64 = -10;
 pub const E_WAIT_INTERRUPTED: i64 = -11;
+pub const E_TIMEOUT: i64 = -12;
 
 impl<T> From<Result<T, KError>> for KError {
     fn from(e: Result<T, KError>) -> Self {
@@ -73,7 +74,8 @@ impl From<KError> for i64 {
             KError::DeviceStarted => E_DEV_STARTED,
             KError::ProcessTerminated => E_PROCESS_TERMINATED,
             KError::WaitInterrupted => E_WAIT_INTERRUPTED,
-            KError::WaitFailed | KError::WaitTimedOut | KError::CircularDependency | KError::DriverLoadFailed |
+            KError::WaitTimedOut => E_TIMEOUT,
+            KError::WaitFailed | KError::CircularDependency | KError::DriverLoadFailed |
             KError::ModuleNotDriver | KError::ProcessInitFailed => E_INTERNAL_FAILURE
         }
     }

@@ -82,6 +82,7 @@ pub use asm::write_port_u16;
 pub use asm::read_port_u32;
 pub use asm::write_port_u32;
 pub use timer::delay_ns;
+pub use timer::get_time_ms;
 
 pub struct Spinlock {
     state: AtomicU64

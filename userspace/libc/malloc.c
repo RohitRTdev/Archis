@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
 #include <sys/syscall.h>
 
 #define ALIGN        16
@@ -30,15 +31,14 @@ typedef struct chunk {
 static chunk_t     *g_chunks    = (void *)0;
 static block_hdr_t *g_free_list = (void *)0;
 
-static uint64_t g_lock_fd = (uint64_t)-1;
-static int      g_lock_init_done = 0;
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void lock_acquire(void) {
-    sys_wait(g_lock_fd);
+    pthread_mutex_lock(&g_lock);
 }
 
 static void lock_release(void) {
-    sys_signal(g_lock_fd);
+    pthread_mutex_unlock(&g_lock);
 }
 
 static size_t round_up(size_t n, size_t align) {
@@ -94,17 +94,7 @@ static chunk_t *new_chunk(size_t min_data) {
     return c;
 }
 
-void malloc_init() {
-    if (!g_lock_init_done) {
-        syscall_status_t fd = sys_create_sync_object(SYNC_SEMAPHORE, 1, 1);
-        if (fd < 0) {
-            printf("Malloc init failed!");
-        }
-        else {
-            g_lock_init_done = 1;
-            g_lock_fd = fd;
-        }
-    }
+void malloc_init(void) {
 }
 
 void *malloc(size_t size) {
