@@ -33,6 +33,11 @@ pub enum Handle {
     SyncHandle(KSemInnerType)
 }
 
+pub struct HandleType {
+    handle_info: Handle,
+    is_inheritable: bool
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum ProcessStatus {
     Ready,
@@ -61,7 +66,7 @@ pub struct Process {
     init_notify: KEvent,
     init_status: bool,
 
-    file_table: Vec<Option<Handle>>,
+    handle_table: Vec<Option<HandleType>>,
 
     // Per-process registry of user modules mapped into this process's address space
     user_modules: Vec<LoadedImageWeak>,
@@ -122,7 +127,7 @@ impl Process {
             init_notify: KEvent::new(false),
             init_status: false,
             memory_list: List::new(),
-            file_table: Vec::new(),
+            handle_table: Vec::new(),
             user_modules: Vec::new(),
             signal_handlers: [None; MAX_SIGNALS],
             pending_signals: 0,
@@ -245,7 +250,7 @@ impl Process {
             self.id,
             self.addr_space,
             core::mem::take(&mut self.memory_list),
-            core::mem::take(&mut self.file_table)
+            core::mem::take(&mut self.handle_table)
         );
 
         // Its fine to clear this here since these are just weak pointers
@@ -258,7 +263,7 @@ impl Process {
     }
 
     pub fn get_num_handles(&self) -> usize {
-        self.file_table.len()
+        self.handle_table.len()
     }
 
     // Get all non-stale references of loadedImage from 
@@ -309,10 +314,10 @@ impl Process {
         let mut img_handles = 0;
         let mut device_handles = 0;
         let mut misc_handles = 0;
-        self.file_table.iter().for_each(|handle| {
+        self.handle_table.iter().for_each(|handle| {
             match handle.as_ref() {
                 Some(h) => {
-                    match h {
+                    match h.handle_info {
                         Handle::FileHandle(_) => {
                             file_handles += 1;
                         },
@@ -424,7 +429,7 @@ extern "C" fn kernel_init_handler() -> ! {
     };
 
     let entry = img.lock().kernel().info.entry;
-    add_new_handle(Handle::ImgHandle(img));
+    add_new_handle(Handle::ImgHandle(img), false);
 
     let entry_fn: DispatchRoutine = unsafe { core::mem::transmute(entry) };
     
@@ -625,9 +630,9 @@ pub fn get_handle(fd: usize) -> Option<Handle> {
     .expect("add_new_handle() called in idle task!");
 
     let guard = proc.lock();
-    if guard.file_table.len() > fd {
-        guard.file_table[fd].as_ref().map(|t| {
-            (*t).clone()
+    if guard.handle_table.len() > fd {
+        guard.handle_table[fd].as_ref().map(|t| {
+            (*t).handle_info.clone()
         })
     }
     else {
@@ -641,32 +646,33 @@ pub fn remove_handle(fd: usize) -> bool {
 
     let mut guard = proc.lock();
 
-    if guard.file_table.len() > fd && guard.file_table[fd].is_some() {
-        guard.file_table[fd] = None;
+    if guard.handle_table.len() > fd && guard.handle_table[fd].is_some() {
+        guard.handle_table[fd] = None;
         return true;
     }
 
     false
 }
 
-pub fn add_new_handle(handle: Handle) -> usize {
+pub fn add_new_handle(handle: Handle, is_inheritable: bool) -> usize {
+    let handle_info = HandleType { handle_info: handle, is_inheritable };
     let proc = get_current_process()
     .expect("add_new_handle() called in idle task!");
 
     let mut guard = proc.lock();
 
     // If we have free entry in table, then use that
-    for fd in 0..guard.file_table.len() {
-        if guard.file_table[fd].is_none() {
-            guard.file_table[fd] = Some(handle);
+    for fd in 0..guard.handle_table.len() {
+        if guard.handle_table[fd].is_none() {
+            guard.handle_table[fd] = Some(handle_info);
             return fd;
         }
     }
 
     // Otherwise, allocate new entry
-    guard.file_table.push(Some(handle));
+    guard.handle_table.push(Some(handle_info));
 
-    guard.file_table.len() - 1
+    guard.handle_table.len() - 1
 }
 
 #[unsafe(no_mangle)]

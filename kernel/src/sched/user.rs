@@ -181,7 +181,7 @@ pub extern "C" fn user_init_handler() -> ! {
 
         let rsp = push_args_to_user_stack(stack_top, &args);
         let entry = load_info.lock().user().entry;
-        add_new_handle(Handle::ImgHandle(load_info));
+        add_new_handle(Handle::ImgHandle(load_info), false);
 
         // Let parent process know that user init is complete
         let is_suspended = {
@@ -322,7 +322,7 @@ fn sys_create_thread_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let res = create_user_thread(args[0] as usize, args[1] as *mut c_void);
     match res {
         Ok(user_thread) => {
-            return add_new_handle(ThreadHandle(user_thread)) as i64;
+            return add_new_handle(ThreadHandle(user_thread), false) as i64;
         },
         Err(err) => {
             return err.into();
@@ -379,7 +379,7 @@ fn sys_create_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 
     match res {
         Ok(user_process) => {
-            return add_new_handle(ProcessHandle(user_process)) as i64;
+            return add_new_handle(ProcessHandle(user_process), false) as i64;
         },
         Err(err) => {
             return err.into();
@@ -521,7 +521,7 @@ fn sys_sigreturn_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     complete_signal();
 }
 
-// arg0 = sync type, arg1 = init count, arg2 = max count, arg3 = auto reset
+// arg0 = sync type, arg1 = init count, arg2 = max count, arg3 = auto reset, arg4 = is inheritable
 fn sys_create_sync_object_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     if args[0] == SYNC_TYPE_SEMAPHORE && args[2] == 0 {
         // max count cannot be zero
@@ -533,6 +533,10 @@ fn sys_create_sync_object_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
         return E_INVALID;
     }
 
+    if args[4] != 0 && args[4] != 1 {
+        return E_INVALID;
+    }
+
     let obj = if args[0] == SYNC_TYPE_SEMAPHORE {
         KSem::new(args[1] as isize, args[2] as isize).inner()   
     }
@@ -540,7 +544,7 @@ fn sys_create_sync_object_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
         KEvent::new(args[3] == 1).inner()
     };
 
-    add_new_handle(SyncHandle(obj)) as i64
+    add_new_handle(SyncHandle(obj), args[4] == 1) as i64
 }
 
 // arg0 = waitable obj fd, arg1 = timeout

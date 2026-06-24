@@ -273,7 +273,7 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
     let avail = ctx.ascii_ring.len();
     if avail > 0 {
         let give = avail.min(requested);
-        let dst = request.buffer.base_address as *mut u8;
+        let dst = unsafe { (request.buffer.base_address as *mut u8).add(request.offset) };
         unsafe { ctx.ascii_ring.dequeue_into(dst, give); }
         request.bytes_completed = give;
         release_spinlock(&mut ctx.lock);
@@ -341,7 +341,7 @@ unsafe extern "C" fn keystroke_received(
     while ctx.ascii_ring.len() > 0 && satisfied < ctx.pending_len {
         let entry = ctx.pending[satisfied];
         let give = ctx.ascii_ring.len().min(entry.requested);
-        let dst = unsafe { (*entry.irp).buffer.base_address as *mut u8 };
+        let dst = unsafe { ((*entry.irp).buffer.base_address as *mut u8).add((*entry.irp).offset) };
         unsafe { ctx.ascii_ring.dequeue_into(dst, give); }
         unsafe { (*entry.irp).bytes_completed = give; }
         collected[collected_len] = entry.irp;

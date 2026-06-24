@@ -9,13 +9,13 @@ use common::{MemoryRegion, PAGE_SIZE};
 use crate::mem::{VCB, VirtMemConBlk, deallocate_memory};
 use crate::sync::{KEvent, Once, Spinlock};
 use crate::sched::{self, DispatchRoutine};
-use super::proc::Handle;
+use super::proc::HandleType;
 
 pub struct ProcessCleanupWork {
     proc_id:     usize, 
     addr_space:  VCB,
     memory_list: DynList<MemoryRegion>,
-    handles:     Vec<Option<Handle>>
+    handles:     Vec<Option<HandleType>>
 }
 
 impl Default for ProcessCleanupWork {
@@ -34,7 +34,7 @@ impl ProcessCleanupWork {
         proc_id: usize,
         addr_space: VCB,
         memory_list: DynList<MemoryRegion>,
-        handles: Vec<Option<Handle>>
+        handles: Vec<Option<HandleType>>
     ) -> Self {
         Self {
             proc_id,

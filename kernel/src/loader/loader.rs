@@ -84,7 +84,7 @@ pub fn init() {
 
     let downgraded_ref = Arc::downgrade(&loaded_img);
 
-    add_new_handle(ImgHandle(loaded_img));
+    add_new_handle(ImgHandle(loaded_img), false);
     KERNEL_MODULES.lock().add_node(downgraded_ref)
     .expect("Failed to add kernel image module to Loaded images registry!");
 

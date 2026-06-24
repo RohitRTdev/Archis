@@ -1,4 +1,5 @@
 mod framebuffer_logger;
+pub mod kring;
 
 use framebuffer_logger::FRAMEBUFFER_LOGGER;
 use crate::{devices::uart, logger::framebuffer_logger::flush_log};
@@ -38,13 +39,18 @@ extern "C" fn serial_print_ffi(s: *const u8, len: usize) {
     let is_panic_core = PANIC_CORE.load(Ordering::Acquire) == hal::get_core() as u8;
     let tty = IS_TTY_MODE.load(Ordering::Acquire);
 
-    // Suppress output when in TTY mode, except for the panicking core during a panic.
-    if tty && !(panicking && is_panic_core) {
+    // Silent cores during a panic produce no output.
+    if panicking && !is_panic_core {
         return;
     }
 
-    // During kernel panic, only the panicking core logs.
-    if panicking && !is_panic_core {
+    // Always push to the kernel ring buffer except during a panic.
+    if !panicking {
+        kring::push(s);
+    }
+
+    // In TTY mode outside a panic, ring buffer only — skip serial and framebuffer.
+    if tty && !panicking {
         return;
     }
 

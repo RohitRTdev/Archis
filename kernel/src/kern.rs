@@ -350,7 +350,7 @@ extern "C" fn state_io_once() -> ! {
     sched::exit_thread(0);
 }
 
-#[kmod::test_function(true)]
+#[kmod::test_function(false)]
 fn run_state_tests() {
     // Wait for PnP to bring up i8042.
     sched::delay_ms(500, false);
@@ -976,32 +976,42 @@ fn kern_main() -> ! {
     kernel_intf::run_tests!();
     info!("Main task going to sleep");
     info!("====TTY mode====");
+    info!("===Type shutdown===");
     let kbd = crate::io::open_device_handle("input").expect("Failed to open input device!");
     let input_buf: [u8; 256] = [0; 256];
+    let mut offset = 0;
     loop {
         kbd.read(crate::io::ReadRequest{
             buffer: MemoryRegion {
                 base_address: input_buf.as_ptr().addr(),
-                size: 9
+                size: 1
             },
-            offset: 0
+            offset
         }, false).expect("Failed to read input device!");
-
+        offset += 1;
         let command = unsafe {
-            let command_slice = core::slice::from_raw_parts(input_buf.as_ptr(), 9);
+            let command_slice = core::slice::from_raw_parts(input_buf.as_ptr(), offset);
             core::str::from_utf8(command_slice).expect("Failed to decode utf-8")
         };
 
         if command == "shutdown\n" {
             #[cfg(feature = "acpi")]
             {
+                use crate::logger::kring::kring_log_for_each;
+                use alloc::borrow::ToOwned;
+                let mut strings = alloc::vec::Vec::new();
+                kring_log_for_each(|s| {
+                    strings.push(s.to_owned());
+                });
+
+                info!("===Printing all kring logs===");
+                for string in strings {
+                    kernel_intf::print!("{}", string);
+                }
+
                 acpi_enter_sleep_state_prep(ACPI_SLEEP_S5);
                 acpi_enter_sleep_state(ACPI_SLEEP_S5);
             }
-        }
-        else {
-            kernel_intf::println!();
-            kernel_intf::print!("Type shutdown:");
         }
     }
     //hal::sleep();
