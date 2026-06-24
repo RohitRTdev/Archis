@@ -92,12 +92,13 @@ pub struct ProcessInfo {
 
 impl Process {
     fn new(
-        clone_addr_space: bool, 
-        is_user: bool, 
-        is_suspended: bool, 
-        pid: usize, 
-        sid: usize, 
-        args: Vec<String>
+        clone_addr_space: bool,
+        is_user: bool,
+        is_suspended: bool,
+        pid: usize,
+        sid: usize,
+        args: Vec<String>,
+        handle_table: Vec<Option<HandleType>>
     ) -> Result<KProcess, KError> {
         let id = PROCESS_ID.fetch_add(1, Ordering::Relaxed);
         let kernel_addr_space = mem::get_kernel_addr_space();
@@ -127,7 +128,7 @@ impl Process {
             init_notify: KEvent::new(false),
             init_status: false,
             memory_list: List::new(),
-            handle_table: Vec::new(),
+            handle_table,
             user_modules: Vec::new(),
             signal_handlers: [None; MAX_SIGNALS],
             pending_signals: 0,
@@ -365,12 +366,13 @@ impl Drop for Process {
 pub fn init() {
     // Create init process and attach init task (task id = 0) to it
     let init_proc = Process::new(
-        false, 
-        false, 
-        false, 
-        0, 
+        false,
+        false,
+        false,
         0,
-        vec!(KERNEL_PATH.into()))
+        0,
+        vec!(KERNEL_PATH.into()),
+        Vec::new())
     .expect("Failed to create init process");
 
     PROCESSES.lock().insert(0, Arc::clone(&init_proc));
@@ -455,12 +457,19 @@ pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_us
         return Err(KError::InvalidArgument);
     }
 
-    let (pid, sid) = {
+    let (pid, sid, inherited_table) = {
         let proc = get_current_process().expect("create_process() called from idle process!");
         let guard = proc.lock();
-        
-        // Inherit parent's sid (session id)
-        (guard.id, guard.sid)
+        let table: Vec<Option<HandleType>> = guard.handle_table.iter().map(|entry| {
+            entry.as_ref().and_then(|h| {
+                if h.is_inheritable {
+                    Some(HandleType { handle_info: h.handle_info.clone(), is_inheritable: true })
+                } else {
+                    None
+                }
+            })
+        }).collect();
+        (guard.id, guard.sid, table)
     };
 
     disable_preemption();
@@ -470,12 +479,13 @@ pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_us
         .collect();
 
     let process = match Process::new(
-        true, 
-        is_user, 
-        is_suspended, 
+        true,
+        is_user,
+        is_suspended,
         pid,
         sid,
-        args) {
+        args,
+        inherited_table) {
         Ok(p) => p,
         Err(e) => {
             enable_preemption();
@@ -625,13 +635,13 @@ pub fn remove_memory_range_from_cur_process(virtual_base: usize, size: usize, is
     .expect("Failed to remove node from process memory list!");
 }
 
-pub fn get_handle(fd: usize) -> Option<Handle> {
+pub fn get_handle(handle: usize) -> Option<Handle> {
     let proc = get_current_process()
-    .expect("add_new_handle() called in idle task!");
+    .expect("get_handle() called in idle task!");
 
     let guard = proc.lock();
-    if guard.handle_table.len() > fd {
-        guard.handle_table[fd].as_ref().map(|t| {
+    if guard.handle_table.len() > handle {
+        guard.handle_table[handle].as_ref().map(|t| {
             (*t).handle_info.clone()
         })
     }
@@ -640,14 +650,14 @@ pub fn get_handle(fd: usize) -> Option<Handle> {
     }
 }
 
-pub fn remove_handle(fd: usize) -> bool {
+pub fn remove_handle(handle: usize) -> bool {
     let proc = get_current_process()
-    .expect("add_new_handle() called in idle task!");
+    .expect("remove_handle() called in idle task!");
 
     let mut guard = proc.lock();
 
-    if guard.handle_table.len() > fd && guard.handle_table[fd].is_some() {
-        guard.handle_table[fd] = None;
+    if guard.handle_table.len() > handle && guard.handle_table[handle].is_some() {
+        guard.handle_table[handle] = None;
         return true;
     }
 
@@ -661,18 +671,42 @@ pub fn add_new_handle(handle: Handle, is_inheritable: bool) -> usize {
 
     let mut guard = proc.lock();
 
-    // If we have free entry in table, then use that
-    for fd in 0..guard.handle_table.len() {
-        if guard.handle_table[fd].is_none() {
-            guard.handle_table[fd] = Some(handle_info);
-            return fd;
+    for idx in 0..guard.handle_table.len() {
+        if guard.handle_table[idx].is_none() {
+            guard.handle_table[idx] = Some(handle_info);
+            return idx;
         }
     }
 
-    // Otherwise, allocate new entry
     guard.handle_table.push(Some(handle_info));
 
     guard.handle_table.len() - 1
+}
+
+pub fn add_handle_to_proc(proc: &KProcess, handle: Handle, is_inheritable: bool) -> usize {
+    let handle_info = HandleType { handle_info: handle, is_inheritable };
+    let mut guard = proc.lock();
+
+    for idx in 0..guard.handle_table.len() {
+        if guard.handle_table[idx].is_none() {
+            guard.handle_table[idx] = Some(handle_info);
+            return idx;
+        }
+    }
+
+    guard.handle_table.push(Some(handle_info));
+    guard.handle_table.len() - 1
+}
+
+pub fn place_handle_in_proc(proc: &KProcess, index: usize, handle: Handle, is_inheritable: bool) {
+    let mut guard = proc.lock();
+    
+    // The index might be beyond the current allocated vector length
+    // So pad the locations inbetween with None
+    while guard.handle_table.len() <= index {
+        guard.handle_table.push(None);
+    }
+    guard.handle_table[index] = Some(HandleType { handle_info: handle, is_inheritable });
 }
 
 #[unsafe(no_mangle)]

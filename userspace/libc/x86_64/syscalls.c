@@ -15,7 +15,7 @@ syscall_status_t sys_delay_ms(size_t ms) {
     return do_syscall(SYSCALL_DELAY_MS, ms, 0, 0, 0, 0, 0);
 }
 
-syscall_status_t sys_create_process(char *const args[], size_t len, uint64_t flags) {
+handle_t sys_create_process(char *const args[], size_t len, uint64_t flags) {
     return do_syscall(SYSCALL_CREATE_PROCESS, (uint64_t)args, len, flags, 0, 0, 0);
 }
 
@@ -35,12 +35,12 @@ syscall_status_t sys_get_pid() {
     return do_syscall(SYSCALL_GET_PID, 0, 0, 0, 0, 0, 0);
 }
 
-syscall_status_t sys_get_process_info(uint64_t pid, process_info_t *const buf) {
-    return do_syscall(SYSCALL_GET_PROCESS_INFO, pid, (uint64_t)buf, 0, 0, 0, 0);
+syscall_status_t sys_get_process_info(handle_t handle, process_info_t *const buf) {
+    return do_syscall(SYSCALL_GET_PROCESS_INFO, (uint64_t)handle, (uint64_t)buf, 0, 0, 0, 0);
 }
 
-syscall_status_t sys_close(uint64_t fd) {
-    return do_syscall(SYSCALL_CLOSE, fd, 0, 0, 0, 0, 0);
+syscall_status_t sys_close(handle_t handle) {
+    return do_syscall(SYSCALL_CLOSE, (uint64_t)handle, 0, 0, 0, 0, 0);
 }
 
 syscall_status_t sys_allocate_memory(size_t size, void **out) {
@@ -68,12 +68,16 @@ syscall_status_t sys_create_sync_object(
     return do_syscall(SYSCALL_CREATE_SYNC_OBJECT, (uint64_t)type, init_count, max_count, auto_reset, 0, 0);
 }
 
-syscall_status_t sys_wait(uint64_t fd, ssize_t timeout) {
-    return do_syscall(SYSCALL_WAIT, fd, timeout, 0, 0, 0, 0);
+syscall_status_t sys_wait(handle_t handle, ssize_t timeout) {
+    return do_syscall(SYSCALL_WAIT, (uint64_t)handle, timeout, 0, 0, 0, 0);
 }
 
-syscall_status_t sys_signal(uint64_t fd) {
-    return do_syscall(SYSCALL_SIGNAL, fd, 0, 0, 0, 0, 0);
+syscall_status_t sys_signal(handle_t handle) {
+    return do_syscall(SYSCALL_SIGNAL, (uint64_t)handle, 0, 0, 0, 0, 0);
+}
+
+handle_t sys_duplicate_handle(handle_t target_proc, handle_t old, handle_t new, uint8_t is_inheritable) {
+    return do_syscall(SYSCALL_DUPLICATE_HANDLE, (uint64_t)target_proc, (uint64_t)old, (uint64_t)new, (uint64_t)is_inheritable, 0, 0);
 }
 
 syscall_status_t sys_get_time_ms(clock_type_t clock, uint64_t *out) {

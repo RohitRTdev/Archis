@@ -15,7 +15,7 @@ use crate::sync::{KEvent, KSem, do_signal, do_wait};
 use super::*;
 use kernel_intf::*;
 
-const MAX_SYSCALLS: usize = 22;
+const MAX_SYSCALLS: usize = 23;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 const SYNC_TYPE_SEMAPHORE: u64 = 0;
 const SYNC_TYPE_EVENT: u64 = 1;
@@ -43,7 +43,8 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_create_sync_object_handler,
     sys_wait_handler,
     sys_signal_handler,
-    sys_get_time_ms_handler
+    sys_get_time_ms_handler,
+    sys_duplicate_handler
 ];
 
 fn read_c_strlen(start: usize) -> Option<usize> {
@@ -253,7 +254,7 @@ fn sys_thread_exit_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     E_SUCCESS
 }
 
-// arg0 = fd
+// arg0 = handle
 fn sys_close_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     if !remove_handle(args[0] as usize) {
         E_INVALID
@@ -263,7 +264,7 @@ fn sys_close_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-// arg0 = fd, arg1 = user buffer, arg2 = length, arg3 = ptr to bytes written
+// arg0 = handle, arg1 = user buffer, arg2 = length, arg3 = ptr to bytes written
 fn sys_read_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     E_INVALID
 }
@@ -379,10 +380,10 @@ fn sys_create_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 
     match res {
         Ok(user_process) => {
-            return add_new_handle(ProcessHandle(user_process), false) as i64;
+            add_new_handle(ProcessHandle(user_process), false) as i64
         },
         Err(err) => {
-            return err.into();
+            err.into()
         }
     }
 }
@@ -420,8 +421,17 @@ fn sys_get_pid_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     cur_proc_id as i64
 }
 
-// arg0 = proc_fd, arg1 = process info ptr
+// arg0 = proc_handle (-1 = current process), arg1 = process info ptr
 fn sys_get_process_info_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    if args[0] as i64 == -1 {
+        let proc = get_current_process().expect("sys_get_process_info_handler called from idle task!");
+        let info = proc.lock().get_process_header();
+        if mem::copy_to_user(args[1] as usize, &info as *const _ as *const u8, size_of::<ProcessInfo>()).is_err() {
+            return E_INVALID_MEMORY_RANGE;
+        }
+        return E_SUCCESS;
+    }
+
     let res = get_handle(args[0] as usize);
     if res.is_none() {
         return E_INVALID;
@@ -547,7 +557,7 @@ fn sys_create_sync_object_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     add_new_handle(SyncHandle(obj), args[4] == 1) as i64
 }
 
-// arg0 = waitable obj fd, arg1 = timeout
+// arg0 = waitable obj handle, arg1 = timeout
 // if timeout = -1, then infinite timeout
 fn sys_wait_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let timeout = if args[1] as i64 != -1 {
@@ -576,7 +586,7 @@ fn sys_wait_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-// arg0 = waitable obj fd
+// arg0 = waitable obj handle
 fn sys_signal_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let wait_sem = match get_handle(args[0] as usize) {
         Some(h) => {
@@ -623,6 +633,51 @@ fn rtc_to_unix_ms(t: kernel_intf::RtcTime) -> u64 {
         + t.minute as u64 * 60
         + t.second as u64;
     total_secs * 1000
+}
+
+// arg0 = target_proc handle (-1 = current proc), arg1 = old handle (in current proc)
+// arg2 = new handle in target proc (-1 = allocate new slot), arg3 = is_inheritable
+fn sys_duplicate_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let target_proc_arg = args[0] as i64;
+    let old_handle = args[1] as usize;
+    let new_handle_arg = args[2] as i64;
+
+    if args[3] != 0 && args[3] != 1 {
+        return E_INVALID;
+    }
+    let is_inheritable = args[3] != 0;
+
+    let handle_to_dup = match get_handle(old_handle) {
+        Some(h) => h,
+        None => return E_INVALID
+    };
+
+    if target_proc_arg == -1 {
+        let cur_proc = get_current_process()
+            .expect("sys_duplicate_handler called from idle task!");
+        if new_handle_arg == -1 {
+            add_handle_to_proc(&cur_proc, handle_to_dup, is_inheritable) as i64
+        } else {
+            place_handle_in_proc(&cur_proc, new_handle_arg as usize, handle_to_dup, is_inheritable);
+            new_handle_arg
+        }
+    } else {
+        let target_proc = match get_handle(target_proc_arg as usize) {
+            Some(ProcessHandle(p)) => p,
+            _ => return E_INVALID
+        };
+
+        if target_proc.lock().get_status() != ProcessStatus::Suspended {
+            return E_NOPERM;
+        }
+
+        if new_handle_arg == -1 {
+            add_handle_to_proc(&target_proc, handle_to_dup, is_inheritable) as i64
+        } else {
+            place_handle_in_proc(&target_proc, new_handle_arg as usize, handle_to_dup, is_inheritable);
+            new_handle_arg
+        }
+    }
 }
 
 // arg0 = clock type, arg1 = pointer to uint64_t to receive milliseconds

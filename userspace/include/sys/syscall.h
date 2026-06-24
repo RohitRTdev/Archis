@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+typedef int64_t handle_t;
+
 enum syscall_t {
     SYSCALL_EXIT_PROCESS,
     SYSCALL_EXIT_THREAD,
@@ -24,7 +26,8 @@ enum syscall_t {
     SYSCALL_CREATE_SYNC_OBJECT,
     SYSCALL_WAIT,
     SYSCALL_SIGNAL,
-    SYSCALL_GET_TIME_MS
+    SYSCALL_GET_TIME_MS,
+    SYSCALL_DUPLICATE_HANDLE
 };
 
 typedef enum {
@@ -48,6 +51,11 @@ typedef enum {
 
 #define PROCESS_SUSPEND_FLAG ((uint64_t)1 << 0)
 
+typedef enum {
+    CLOCK_MONOTONIC = 0,
+    CLOCK_WALL_TIME = 1
+} clock_type_t;
+
 
 typedef struct {
     uint64_t id;
@@ -55,17 +63,16 @@ typedef struct {
     uint64_t sid;
 } process_info_t;
 
-
 syscall_status_t sys_exit(int64_t exit_code);
-syscall_status_t sys_close(uint64_t fd);
+syscall_status_t sys_close(handle_t handle);
 syscall_status_t sys_print(const char* msg);
 syscall_status_t sys_delay_ms(size_t ms);
-syscall_status_t sys_create_process(char *const args[], size_t len, uint64_t flags);
+handle_t sys_create_process(char *const args[], size_t len, uint64_t flags);
 syscall_status_t sys_create_thread(const void *context);
 syscall_status_t sys_resume_process(uint64_t pid);
 syscall_status_t sys_set_session_leader(uint64_t pid);
 syscall_status_t sys_get_pid();
-syscall_status_t sys_get_process_info(uint64_t pid, process_info_t *const buf);
+syscall_status_t sys_get_process_info(handle_t handle, process_info_t *const buf);
 syscall_status_t sys_allocate_memory(size_t size, void **out);
 syscall_status_t sys_deallocate_memory(void *addr, size_t size);
 syscall_status_t sys_set_signal_handler(uint8_t signal, void (*handler)(void), void *user_ctx);
@@ -76,12 +83,8 @@ syscall_status_t sys_create_sync_object(
     uint64_t max_count,
     uint8_t auto_reset
 );
-syscall_status_t sys_wait(uint64_t fd, ssize_t timeout);
-syscall_status_t sys_signal(uint64_t fd);
-typedef enum {
-    CLOCK_MONOTONIC = 0,
-    CLOCK_WALL_TIME = 1
-} clock_type_t;
-
+syscall_status_t sys_wait(handle_t handle, ssize_t timeout);
+syscall_status_t sys_signal(handle_t handle);
+handle_t sys_duplicate_handle(handle_t target_proc, handle_t old, handle_t new, uint8_t is_inheritable);
 syscall_status_t sys_get_time_ms(clock_type_t clock, uint64_t *out);
 
