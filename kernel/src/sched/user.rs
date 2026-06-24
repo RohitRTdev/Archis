@@ -15,7 +15,7 @@ use crate::sync::{KEvent, KSem, do_signal, do_wait};
 use super::*;
 use kernel_intf::*;
 
-const MAX_SYSCALLS: usize = 23;
+const MAX_SYSCALLS: usize = 24;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 const SYNC_TYPE_SEMAPHORE: u64 = 0;
 const SYNC_TYPE_EVENT: u64 = 1;
@@ -44,7 +44,8 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_wait_handler,
     sys_signal_handler,
     sys_get_time_ms_handler,
-    sys_duplicate_handler
+    sys_duplicate_handler,
+    sys_create_pgrp_handler
 ];
 
 fn read_c_strlen(start: usize) -> Option<usize> {
@@ -409,6 +410,21 @@ fn sys_set_session_leader_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 
     if proc::set_session_leader(args[0] as usize) {
+        E_SUCCESS
+    }
+    else {
+        E_NOPERM
+    }
+}
+
+// arg0 = pid
+fn sys_create_pgrp_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let res = get_process_info(args[0] as usize);
+    if res.is_none() {
+        return E_PROCESS_TERMINATED;
+    }
+
+    if proc::set_pgroup_leader(args[0] as usize) {
         E_SUCCESS
     }
     else {

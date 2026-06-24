@@ -16,6 +16,7 @@ use crate::sched::{self, *};
 use crate::sync::{KEvent, KSemInnerType, Spinlock};
 use crate::io::OpenDeviceHandle;
 use core::ffi::c_void;
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 
 static PROCESS_ID: AtomicUsize = AtomicUsize::new(0);
@@ -54,7 +55,8 @@ pub struct SignalHandler {
 pub struct Process {
     id: usize,
     pid: usize,
-    sid: usize,
+    session: KSession,
+    pgroup: KProcessGroup,
     // In current design, we will have the process struct holding weak pointers to the tasks.
     // Intuitively it should be the other way around, however this way it makes it easier code wise.
     // When tasks are dropped, the process struct will be automatically dropped
@@ -96,7 +98,8 @@ impl Process {
         is_user: bool,
         is_suspended: bool,
         pid: usize,
-        sid: usize,
+        session: KSession,
+        pgroup: KProcessGroup,
         args: Vec<String>,
         handle_table: Vec<Option<HandleType>>
     ) -> Result<KProcess, KError> {
@@ -119,7 +122,8 @@ impl Process {
         let proc = Arc::new_in(Spinlock::new(Self {
             id,
             pid,
-            sid,
+            session,
+            pgroup,
             threads: List::new(),
             addr_space: new_addr_space,
             status,
@@ -230,12 +234,12 @@ impl Process {
         ProcessInfo {
             id: self.id,
             pid: self.pid,
-            sid: self.sid
+            sid: self.session.lock().sid
         }
     }
 
     fn destroy_process(&mut self, exit_code: isize) -> ProcessCleanupWork {
-        // If kill/exit_process wasn't called, the 
+        // If kill/exit_process wasn't called, the
         // exit code will be same as exit code passed
         // to the last killed thread
         if self.status != ProcessStatus::Terminated {
@@ -243,6 +247,18 @@ impl Process {
             self.status = ProcessStatus::Terminated;
         }
         PROCESSES.lock().remove(&self.id);
+
+        {
+            let mut sess = self.session.lock();
+            sess.processes.find_and_remove(|&p| p == self.id);
+            if sess.leader == Some(self.id) {
+                sess.leader = None;
+            }
+        }
+        {
+            let mut pg = self.pgroup.lock();
+            pg.processes.find_and_remove(|&p| p == self.id);
+        }
         
         // This function is called in critical section
         // We want the cleanup code to execute in lock free code
@@ -281,32 +297,67 @@ impl Process {
     }
 
     // This operation is only allowed by the parent process
-    // and the process must have same sid as parent
-    // or must be done by the same process
+    // and the process must be in the same session as parent,
+    // or must be done by the same process.
     fn set_session_leader(&mut self, id: usize) -> bool {
         assert!(self.id != 0, "Attempted to change session id for system process!");
-        
-        // Same process attempting to change its session id. Allow it
-        if id == self.id {
-            // New session leader (Session leader has pid = sid)
-            self.sid = self.id;
-            return true;
-        } 
-        
-        let res = get_process_info(self.pid);
-        // This is not parent process or parent process got killed
-        if id != self.pid || res.is_none() {
-            return false;
-        } 
 
-        let parent = res.unwrap();
-        if parent.lock().sid == self.sid {
-            self.sid = self.id;
+        if self.session.lock().leader == Some(self.id) {
+            return false;
+        }
+
+        let allowed = if id == self.id {
             true
+        } else {
+            let res = get_process_info(self.pid);
+            if id != self.pid || res.is_none() {
+                return false;
+            }
+            let parent = res.unwrap();
+            let parent_guard = parent.lock();
+            Arc::ptr_eq(&parent_guard.session, &self.session)
+        };
+
+        if allowed {
+            self.session.lock().processes.find_and_remove(|&p| p == self.id);
+            let new_sess = Session::new(self.id);
+            new_sess.lock().processes.add_node(self.id).expect("set_session_leader: add to new session failed");
+            new_sess.lock().leader = Some(self.id);
+            self.session = new_sess;
         }
-        else {
-            false
+
+        allowed
+    }
+
+    fn set_pgroup_leader(&mut self, id: usize) -> bool {
+        assert!(self.id != 0, "Attempted to change pgroup for system process!");
+
+        // This process is already part of a different pgrp
+        if self.pgroup.lock().pgid == self.id {
+            return false;
         }
+
+        // Only allowed if same process or parent process belonging to same process group
+        let allowed = if id == self.id {
+            true
+        } else {
+            let res = get_process_info(self.pid);
+            if id != self.pid || res.is_none() {
+                return false;
+            }
+            let parent = res.unwrap();
+            let parent_guard = parent.lock();
+            Arc::ptr_eq(&parent_guard.pgroup, &self.pgroup)
+        };
+
+        if allowed {
+            self.pgroup.lock().processes.find_and_remove(|&p| p == self.id);
+            let new_pg = ProcessGroup::new(self.id);
+            new_pg.lock().processes.add_node(self.id).expect("set_pgroup_leader: add to new pgroup failed");
+            self.pgroup = new_pg;
+        }
+
+        allowed
     }
 
 #[cfg(debug_assertions)]
@@ -364,13 +415,19 @@ impl Drop for Process {
 }
 
 pub fn init() {
+    let sess = Session::new(0);
+    let pgrp = ProcessGroup::new(0);
+    sess.lock().processes.add_node(0).expect("init: session add failed");
+    pgrp.lock().processes.add_node(0).expect("init: pgroup add failed");
+
     // Create init process and attach init task (task id = 0) to it
     let init_proc = Process::new(
         false,
         false,
         false,
         0,
-        0,
+        sess,
+        pgrp,
         vec!(KERNEL_PATH.into()),
         Vec::new())
     .expect("Failed to create init process");
@@ -406,13 +463,24 @@ pub fn set_session_leader(pid: usize) -> bool {
     let cur_proc_id = get_current_process_id().expect("set_sid() called from idle process!");
     let res = get_process_info(pid);
 
-    // Process likely got killed / doesn't exist
     if res.is_none() {
         return false;
     }
 
     let this_proc = res.unwrap();
     this_proc.lock().set_session_leader(cur_proc_id)
+}
+
+pub fn set_pgroup_leader(pid: usize) -> bool {
+    let cur_proc_id = get_current_process_id().expect("set_pgroup_leader() called from idle process!");
+    let res = get_process_info(pid);
+
+    if res.is_none() {
+        return false;
+    }
+
+    let this_proc = res.unwrap();
+    this_proc.lock().set_pgroup_leader(cur_proc_id)
 }
 
 extern "C" fn kernel_init_handler() -> ! {
@@ -457,7 +525,7 @@ pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_us
         return Err(KError::InvalidArgument);
     }
 
-    let (pid, sid, inherited_table) = {
+    let (pid, session, pgroup, inherited_table) = {
         let proc = get_current_process().expect("create_process() called from idle process!");
         let guard = proc.lock();
         let table: Vec<Option<HandleType>> = guard.handle_table.iter().map(|entry| {
@@ -469,7 +537,7 @@ pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_us
                 }
             })
         }).collect();
-        (guard.id, guard.sid, table)
+        (guard.id, Arc::clone(&guard.session), Arc::clone(&guard.pgroup), table)
     };
 
     disable_preemption();
@@ -483,7 +551,8 @@ pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_us
         is_user,
         is_suspended,
         pid,
-        sid,
+        Arc::clone(&session),
+        Arc::clone(&pgroup),
         args,
         inherited_table) {
         Ok(p) => p,
@@ -492,6 +561,10 @@ pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_us
             return Err(e);
         }
     };
+
+    let new_id = process.lock().get_id();
+    session.lock().processes.add_node(new_id).expect("create_process: session add failed");
+    pgroup.lock().processes.add_node(new_id).expect("create_process: pgroup add failed");
 
     let init_notify_sem = process.lock().init_notify.clone();
 
@@ -758,6 +831,86 @@ extern "C" fn sched_wait_process_ffi(proc_id: usize) {
 #[unsafe(no_mangle)]
 extern "C" fn sched_kill_process_ffi(proc_id: usize, exit_code: isize) {
     kill_process(proc_id, exit_code);
+}
+
+pub fn issue_pgrp(pgrp: &KProcessGroup, signal: u8) {
+    let pids: Vec<usize> = pgrp.lock().processes.iter().map(|p| **p).collect();
+    for pid in pids {
+        issue_signal(pid, signal);
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn proc_get_session_ffi(pid: usize) -> usize {
+    match get_process_info(pid) {
+        None => 0,
+        Some(p) => {
+            let session = Arc::clone(&p.lock().session);
+            let ptr = Arc::as_ptr(&session);
+            core::mem::forget(session);
+            ptr as usize
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn proc_drop_session_ffi(val: usize) {
+    if val == 0 { return; }
+    unsafe { drop(Arc::from_raw_in(val as *const Spinlock<Session>, PoolAllocatorGlobal)) };
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn proc_is_session_active_ffi(val: usize) -> bool {
+    let arc = ManuallyDrop::new(unsafe { Arc::from_raw_in(val as *const Spinlock<Session>, PoolAllocatorGlobal) });
+    arc.lock().processes.get_nodes() > 0
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn proc_is_session_leader_ffi(pid: usize, val: usize) -> bool {
+    let arc = ManuallyDrop::new(unsafe { Arc::from_raw_in(val as *const Spinlock<Session>, PoolAllocatorGlobal) });
+    arc.lock().leader == Some(pid)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn proc_get_pgrp_ffi(pid: usize) -> usize {
+    match get_process_info(pid) {
+        None => 0,
+        Some(p) => {
+            let pgroup = Arc::clone(&p.lock().pgroup);
+            let ptr = Arc::as_ptr(&pgroup);
+            core::mem::forget(pgroup);
+            ptr as usize
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn proc_drop_pgrp_ffi(val: usize) {
+    if val == 0 { return; }
+    unsafe { drop(Arc::from_raw_in(val as *const Spinlock<ProcessGroup>, PoolAllocatorGlobal)) };
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn proc_is_pgrp_active_ffi(val: usize) -> bool {
+    let arc = ManuallyDrop::new(unsafe { Arc::from_raw_in(val as *const Spinlock<ProcessGroup>, PoolAllocatorGlobal) });
+    arc.lock().processes.get_nodes() > 0
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn proc_is_foreground_pgrp_ffi(pid: usize, val: usize) -> bool {
+    let arc = ManuallyDrop::new(unsafe { Arc::from_raw_in(val as *const Spinlock<ProcessGroup>, PoolAllocatorGlobal) });
+    arc.lock().processes.iter().any(|p| **p == pid)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn proc_issue_signal_ffi(pid: usize, signal: u8) {
+    issue_signal(pid, signal);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn proc_issue_pgrp_ffi(val: usize, signal: u8) {
+    let arc = ManuallyDrop::new(unsafe { Arc::from_raw_in(val as *const Spinlock<ProcessGroup>, PoolAllocatorGlobal) });
+    issue_pgrp(&arc, signal);
 }
 
 impl Spinlock<Process> {

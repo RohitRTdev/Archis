@@ -14,6 +14,8 @@ use common::StrRef;
 use alloc::vec::Vec;
 
 pub type InterruptRoutine = extern "C" fn(*mut core::ffi::c_void) -> bool;
+pub type SessionType      = usize;
+pub type ProcessGroupType = usize;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -221,6 +223,17 @@ unsafe extern "C" {
         routine: extern "C" fn(*mut c_void),
         context: *mut c_void,
     ) -> KError;
+
+    fn proc_get_session_ffi(pid: usize) -> SessionType;
+    fn proc_drop_session_ffi(val: SessionType);
+    fn proc_is_session_active_ffi(val: SessionType) -> bool;
+    fn proc_is_session_leader_ffi(pid: usize, val: SessionType) -> bool;
+    fn proc_get_pgrp_ffi(pid: usize) -> ProcessGroupType;
+    fn proc_drop_pgrp_ffi(val: ProcessGroupType);
+    fn proc_is_pgrp_active_ffi(val: ProcessGroupType) -> bool;
+    fn proc_is_foreground_pgrp_ffi(pid: usize, val: ProcessGroupType) -> bool;
+    fn proc_issue_signal_ffi(pid: usize, signal: u8);
+    fn proc_issue_pgrp_ffi(val: ProcessGroupType, signal: u8);
 }
 
 pub fn io_create_driver_worker(
@@ -372,6 +385,46 @@ pub fn disable_tty_mode() {
 
 pub fn tty_print(s: &str) {
     unsafe { tty_print_ffi(s.as_ptr(), s.len()); }
+}
+
+pub fn proc_get_session(pid: usize) -> SessionType {
+    unsafe { proc_get_session_ffi(pid) }
+}
+
+pub fn proc_drop_session(val: SessionType) {
+    unsafe { proc_drop_session_ffi(val) }
+}
+
+pub fn proc_is_session_active(val: SessionType) -> bool {
+    unsafe { proc_is_session_active_ffi(val) }
+}
+
+pub fn proc_is_session_leader(pid: usize, val: SessionType) -> bool {
+    unsafe { proc_is_session_leader_ffi(pid, val) }
+}
+
+pub fn proc_get_pgrp(pid: usize) -> ProcessGroupType {
+    unsafe { proc_get_pgrp_ffi(pid) }
+}
+
+pub fn proc_drop_pgrp(val: ProcessGroupType) {
+    unsafe { proc_drop_pgrp_ffi(val) }
+}
+
+pub fn proc_is_pgrp_active(val: ProcessGroupType) -> bool {
+    unsafe { proc_is_pgrp_active_ffi(val) }
+}
+
+pub fn proc_is_foreground_pgrp(pid: usize, val: ProcessGroupType) -> bool {
+    unsafe { proc_is_foreground_pgrp_ffi(pid, val) }
+}
+
+pub fn proc_issue_signal(pid: usize, signal: u8) {
+    unsafe { proc_issue_signal_ffi(pid, signal) }
+}
+
+pub fn proc_issue_pgrp(val: ProcessGroupType, signal: u8) {
+    unsafe { proc_issue_pgrp_ffi(val, signal) }
 }
 
 #[macro_export]

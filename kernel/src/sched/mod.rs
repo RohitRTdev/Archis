@@ -2,11 +2,13 @@ mod scheduler;
 mod proc;
 mod user;
 mod cleanup;
+mod job;
 
 pub use proc::*;
 pub use scheduler::*;
 pub use user::*;
 pub use cleanup::*;
+pub use job::*;
 
 pub type DispatchRoutine = extern "C" fn() -> !;
 
