@@ -15,7 +15,7 @@ use crate::sync::{KEvent, KSem, do_signal, do_wait};
 use super::*;
 use kernel_intf::*;
 
-const MAX_SYSCALLS: usize = 24;
+const MAX_SYSCALLS: usize = 26;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 const SYNC_TYPE_SEMAPHORE: u64 = 0;
 const SYNC_TYPE_EVENT: u64 = 1;
@@ -45,7 +45,9 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_signal_handler,
     sys_get_time_ms_handler,
     sys_duplicate_handler,
-    sys_create_pgrp_handler
+    sys_create_pgrp_handler,
+    sys_get_tid_handler,
+    sys_get_thread_info_handler
 ];
 
 fn read_c_strlen(start: usize) -> Option<usize> {
@@ -216,12 +218,13 @@ pub extern "C" fn user_thread_init_handler() -> ! {
         (user_fn as usize, guard.get_arg_context() as usize)
     };
 
-    // Place the context pointer as the first item on the user stack; the user
-    // function reads it from [rsp]
+    // Place the context pointer at [rsp - 8]
     #[cfg(target_arch = "x86_64")]
-    let rsp = (stack_top - 16) & !0xF;
+    assert!(stack_top & 0xF == 0, "user stack base must be 16-byte aligned");
+    #[cfg(target_arch = "x86_64")]
+    let rsp = stack_top;
     unsafe {
-        copy_user_memory(rsp as *mut u8, &context as *const usize as *const u8, size_of::<usize>());
+        copy_user_memory((rsp - size_of::<usize>()) as *mut u8, &context as *const usize as *const u8, size_of::<usize>());
     }
 
     debug!("Starting user thread at:{:#X} with context:{:#X} and stack:{:#X}", user_fn_addr, context, rsp);
@@ -435,6 +438,32 @@ fn sys_create_pgrp_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 fn sys_get_pid_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let cur_proc_id = get_current_process_id().expect("syscall in idle process??");
     cur_proc_id as i64
+}
+
+fn sys_get_tid_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let task = get_current_task().expect("sys_get_tid called from idle task!");
+    task.lock().get_id() as i64
+}
+
+// arg0 = thread handle, arg1 = ptr to thread_info_t
+fn sys_get_thread_info_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let res = get_handle(args[0] as usize);
+    if let Some(ThreadHandle(thread)) = res {
+        let info = {
+            let guard = thread.lock();
+            ThreadInfo {
+                id: guard.get_id() as u64,
+                exit_code: guard.get_exit_code() as i64
+            }
+        };
+        if mem::copy_to_user(args[1] as usize, &info as *const _ as *const u8, size_of::<ThreadInfo>()).is_err() {
+            return E_INVALID_MEMORY_RANGE;
+        }
+        E_SUCCESS
+    }
+    else {
+        E_INVALID
+    }
 }
 
 // arg0 = proc_handle (-1 = current process), arg1 = process info ptr

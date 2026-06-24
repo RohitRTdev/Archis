@@ -19,9 +19,13 @@ handle_t sys_create_process(char *const args[], size_t len, uint64_t flags) {
     return do_syscall(SYSCALL_CREATE_PROCESS, (uint64_t)args, len, flags, 0, 0, 0);
 }
 
-//syscall_status_t sys_create_thread(const void *context) {
-//    return do_syscall(SYSCALL_CREATE_THREAD, (uint64_t)context, 0, 0, 0, 0, 0);
-//}
+syscall_status_t sys_create_thread(uint64_t fn_addr, void *context) {
+    return do_syscall(SYSCALL_CREATE_THREAD, fn_addr, (uint64_t)context, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_exit_thread(void) {
+    return do_syscall(SYSCALL_EXIT_THREAD, 0, 0, 0, 0, 0, 0);
+}
 
 syscall_status_t sys_resume_process(uint64_t pid) {
     return do_syscall(SYSCALL_RESUME_PROCESS, pid, 0, 0, 0, 0, 0);
@@ -51,8 +55,8 @@ syscall_status_t sys_deallocate_memory(void *addr, size_t size) {
     return do_syscall(SYSCALL_DEALLOCATE_MEMORY, (uint64_t)addr, size, 0, 0, 0, 0);
 }
 
-syscall_status_t sys_set_signal_handler(uint8_t signal, void (*handler)(void), void *user_ctx) {
-    return do_syscall(SYSCALL_SET_SIGNAL_HANDLER, signal, (uint64_t)handler, (uint64_t)user_ctx, 0, 0, 0);
+syscall_status_t sys_set_signal_handler(uint8_t signal, uint64_t handler_addr, void *user_ctx) {
+    return do_syscall(SYSCALL_SET_SIGNAL_HANDLER, signal, handler_addr, (uint64_t)user_ctx, 0, 0, 0);
 }
 
 syscall_status_t sys_sigreturn(void) {
@@ -82,4 +86,12 @@ handle_t sys_duplicate_handle(handle_t target_proc, handle_t old, handle_t new, 
 
 syscall_status_t sys_get_time_ms(clock_type_t clock, uint64_t *out) {
     return do_syscall(SYSCALL_GET_TIME_MS, (uint64_t)clock, (uint64_t)out, 0, 0, 0, 0);
+}
+
+uint64_t sys_get_tid(void) {
+    return (uint64_t)do_syscall(SYSCALL_GET_TID, 0, 0, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_get_thread_info(handle_t handle, thread_info_t *out) {
+    return do_syscall(SYSCALL_GET_THREAD_INFO, (uint64_t)handle, (uint64_t)out, 0, 0, 0, 0);
 }

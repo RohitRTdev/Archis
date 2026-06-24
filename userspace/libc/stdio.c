@@ -137,3 +137,15 @@ int printf(const char *fmt, ...) {
     va_end(ap);
     return ret;
 }
+
+unsigned int sleep(unsigned int seconds) {
+    uint64_t old = 0, now = 0;
+    sys_get_time_ms(CLOCK_MONOTONIC, &old);
+    syscall_status_t res = sys_delay_ms(seconds * 1000);
+    if (res != E_SUCCESS) {
+        sys_get_time_ms(CLOCK_MONOTONIC, &now);
+        return (now - old) / 1000;
+    }
+
+    return 0;
+}

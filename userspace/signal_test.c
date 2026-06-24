@@ -1,34 +1,41 @@
-#include <sys/syscall.h>
 #include <stdio.h>
 #include <signal.h>
+#include <unistd.h>
 
-void my_signal_handler_sig_kill(void) {
-    printf("signal_test: handler invoked for sigkill! calling sigreturn");
+typedef struct {
+    const char *signal_name;
+    int id;
+} signal_test_ctx_t;
+
+void my_signal_handler_sig_kill(void *ctx) {
+    signal_test_ctx_t *c = (signal_test_ctx_t *)ctx;
+    printf("signal_test: sigkill handler: name=%s id=%d", c->signal_name, c->id);
     sys_delay_ms(10000);
-    sys_sigreturn();
-    while(1) {}
 }
 
-void my_signal_handler_sig_segv(void) {
-    printf("signal_test: handler invoked for sigsegv! calling sigreturn");
-    sys_sigreturn();
-    while(1) {}
+void my_signal_handler_sig_segv(void *ctx) {
+    signal_test_ctx_t *c = (signal_test_ctx_t *)ctx;
+    printf("signal_test: sigsegv handler: name=%s id=%d", c->signal_name, c->id);
 }
 
-void my_signal_handler_sig_ill(void) {
-    printf("signal_test: handler invoked for sigill! calling sigreturn");
-    sys_sigreturn();
-    while(1) {}
+void my_signal_handler_sig_ill(void *ctx) {
+    signal_test_ctx_t *c = (signal_test_ctx_t *)ctx;
+    printf("signal_test: sigill handler: name=%s id=%d", c->signal_name, c->id);
 }
 
 int main(void) {
     printf("signal_test: starting, registering handler for signals");
-    sys_set_signal_handler(SIGKILL, my_signal_handler_sig_kill, 0);
-    sys_set_signal_handler(SIGSEGV, my_signal_handler_sig_segv, 0);
-    sys_set_signal_handler(SIGILL, my_signal_handler_sig_ill, 0);
+
+    signal_test_ctx_t kill_ctx = { "SIGKILL", SIGKILL };
+    signal_test_ctx_t segv_ctx = { "SIGSEGV", SIGSEGV };
+    signal_test_ctx_t ill_ctx  = { "SIGILL",  SIGILL  };
+
+    set_signal_handler(SIGKILL, my_signal_handler_sig_kill, &kill_ctx);
+    set_signal_handler(SIGSEGV, my_signal_handler_sig_segv, &segv_ctx);
+    set_signal_handler(SIGILL,  my_signal_handler_sig_ill,  &ill_ctx);
 
     printf("signal_test: waiting for signal...");
-    int res = sys_delay_ms(10000);
-    printf("signal_test: delay completed with res %d, exiting", res);
+    int remaining = sleep(10);
+    printf("signal_test: delay completed with remaining %ds, exiting", remaining);
     return 0;
 }

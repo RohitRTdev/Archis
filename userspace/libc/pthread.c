@@ -1,6 +1,8 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <sys/syscall.h>
+#include <stdlib.h>
+#include <stdint.h>
 
 /* Retries sys_wait on signal interruption. Used wherever POSIX forbids EINTR. */
 static syscall_status_t wait_uninterruptible(uint64_t fd) {
@@ -248,4 +250,127 @@ int sem_trywait(sem_t *sem) {
         return -1;
     syscall_status_t res = sys_wait(sem->fd, 0);
     return res == E_SUCCESS ? 0 : -1;
+}
+
+typedef struct {
+    void *(*start)(void *);
+    void *arg;
+} libc_pthread_ctx_t;
+
+extern void _libc_pthread_thread_start(void);
+
+// tid -> handle mapping
+#define _PTHREAD_MAX_THREADS 64
+
+typedef struct {
+    pthread_t tid;
+    handle_t  handle;
+} pthread_thread_entry_t;
+
+static pthread_thread_entry_t _pthread_table[_PTHREAD_MAX_THREADS];
+static pthread_mutex_t _pthread_table_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void _pthread_register(pthread_t tid, handle_t handle) {
+    pthread_mutex_lock(&_pthread_table_lock);
+    for (int i = 0; i < _PTHREAD_MAX_THREADS; i++) {
+        if (_pthread_table[i].tid == 0) {
+            _pthread_table[i].tid    = tid;
+            _pthread_table[i].handle = handle;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&_pthread_table_lock);
+}
+
+static handle_t _pthread_take(pthread_t tid) {
+    handle_t h = -1;
+    pthread_mutex_lock(&_pthread_table_lock);
+    for (int i = 0; i < _PTHREAD_MAX_THREADS; i++) {
+        if (_pthread_table[i].tid == tid) {
+            h = _pthread_table[i].handle;
+            _pthread_table[i].tid = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&_pthread_table_lock);
+    return h;
+}
+
+void _libc_pthread_thread_handler(libc_pthread_ctx_t *ctx) {
+    void *(*start)(void *) = ctx->start;
+    void *arg = ctx->arg;
+    free(ctx);
+    start(arg);
+    sys_exit_thread();
+    while (1) {}
+}
+
+int pthread_attr_init(pthread_attr_t *attr) {
+    (void)attr;
+    return 0;
+}
+
+int pthread_attr_destroy(pthread_attr_t *attr) {
+    (void)attr;
+    return 0;
+}
+
+int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                   void *(*start_routine)(void *), void *arg) {
+    (void)attr;
+    libc_pthread_ctx_t *ctx = malloc(sizeof(libc_pthread_ctx_t));
+    if (!ctx)
+        return ENOMEM;
+    ctx->start = start_routine;
+    ctx->arg   = arg;
+
+    handle_t h = sys_create_thread((uint64_t)_libc_pthread_thread_start, ctx);
+    if (h < 0) {
+        free(ctx);
+        return EINVAL;
+    }
+
+    thread_info_t info;
+    if (sys_get_thread_info(h, &info) < 0) {
+        sys_close(h);
+        free(ctx);
+        return EINVAL;
+    }
+
+    *thread = (pthread_t)info.id;
+    _pthread_register((pthread_t)info.id, h);
+    return 0;
+}
+
+int pthread_join(pthread_t thread, void **retval) {
+    handle_t h = _pthread_take(thread);
+    if (h < 0)
+        return EINVAL;
+    wait_uninterruptible((uint64_t)h);
+    if (retval)
+        *retval = (void *)0;
+    sys_close(h);
+    return 0;
+}
+
+int pthread_detach(pthread_t thread) {
+    handle_t h = _pthread_take(thread);
+    if (h < 0)
+        return EINVAL;
+    sys_close(h);
+    return 0;
+}
+
+void pthread_exit(void *retval) {
+    (void)retval;
+    sys_exit_thread();
+    while (1) {}
+}
+
+pthread_t pthread_self(void) {
+    return (pthread_t)sys_get_tid();
+}
+
+int pthread_equal(pthread_t t1, pthread_t t2) {
+    return t1 == t2;
 }

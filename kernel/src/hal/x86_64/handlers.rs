@@ -383,17 +383,28 @@ pub fn switch_context(new_context: usize) {
     PER_CPU_GLOBAL_CONTEXT.local().store(new_context, Ordering::Release);
 }
 
-pub fn create_context_from(handler: extern "C" fn() -> !, stack_base: *mut u8, actual_base: usize, context: usize) -> usize {
+pub fn create_context_from(
+    handler: extern "C" fn() -> !, 
+    stack_base: *mut u8, 
+    actual_base: usize, 
+    context: usize,
+    user_ctx: usize
+) -> usize {
     let mut sp = stack_base as usize;
     assert!(sp & 0xF == 0, "create_context_from() -> unaligned stack pointer!");
     assert!(actual_base & 0xF == 0, "create_context_from() -> unaligned stack pointer!");
 
-    sp -= core::mem::size_of::<CPUContext>();
+    // We allocate 16 extra bytes so that we can place the user_ctx at base of the stack
+    // We allocate 16 instead of 8 in order to maintain 16 byte alignment
+    sp -= core::mem::size_of::<CPUContext>() + 2 * size_of::<usize>();
     let new_context = sp as *mut CPUContext;
     let context = context as *const CPUContext;
 
     unsafe {
         core::ptr::copy_nonoverlapping(context as *const u8, new_context as *mut u8, size_of::<CPUContext>());
+        
+        // Write the user_ctx ptr at base of stack
+        *(stack_base.sub(8) as *mut u64) = user_ctx as u64;
         let new_context = &mut *new_context;
         new_context.rip = handler as u64;
         new_context.rsp = actual_base as u64;
@@ -403,13 +414,18 @@ pub fn create_context_from(handler: extern "C" fn() -> !, stack_base: *mut u8, a
     sp
 }
 
-pub fn create_user_context(handler: extern "C" fn() -> !, stack_base: *mut u8, actual_base: usize) -> usize {
+pub fn create_user_context(
+    handler: extern "C" fn() -> !, 
+    stack_base: *mut u8, 
+    actual_base: usize,
+    user_ctx: usize
+) -> usize {
     let mut sp = stack_base as usize;
     assert!(sp & 0xF == 0, "create_context() -> unaligned stack pointer!");
     assert!(actual_base & 0xF == 0, "create_context_from() -> unaligned stack pointer!");
 
     // 16 byte alignment is maintained since stack_base already aligned to 4096 bytes
-    sp -= core::mem::size_of::<CPUContext>();
+    sp -= core::mem::size_of::<CPUContext>() + 2 * size_of::<usize>();
 
     let mut context = CPUContext::new();
     context.rip = handler as u64;
@@ -424,8 +440,9 @@ pub fn create_user_context(handler: extern "C" fn() -> !, stack_base: *mut u8, a
         super::cpu_regs::INIT_RFLAGS
     };
 
-
     unsafe {
+        // Write user_ctx ptr
+        *(stack_base.sub(8) as *mut u64) = user_ctx as u64;
         (sp as *mut CPUContext).write(context);
     };
 

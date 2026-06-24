@@ -917,7 +917,7 @@ fn run_user_tests() {
     info!("=== run_user_tests: PASSED ===");
 }
 
-#[kmod::test_function(false)]
+#[kmod::test_function(true)]
 fn run_signal_tests() {
     static SEM: Once<KEvent> = Once::new();
     static PID: AtomicUsize = AtomicUsize::new(0);
@@ -997,17 +997,17 @@ fn kern_main() -> ! {
         if command == "shutdown\n" {
             #[cfg(feature = "acpi")]
             {
-                use crate::logger::kring::kring_log_for_each;
-                use alloc::borrow::ToOwned;
-                let mut strings = alloc::vec::Vec::new();
-                kring_log_for_each(|s| {
-                    strings.push(s.to_owned());
-                });
+                //use crate::logger::kring::kring_log_for_each;
+                //use alloc::borrow::ToOwned;
+                //let mut strings = alloc::vec::Vec::new();
+                //kring_log_for_each(|s| {
+                //    strings.push(s.to_owned());
+                //});
 
-                info!("===Printing all kring logs===");
-                for string in strings {
-                    kernel_intf::print!("{}", string);
-                }
+                //info!("===Printing all kring logs===");
+                //for string in strings {
+                //    kernel_intf::print!("{}", string);
+                //}
 
                 acpi_enter_sleep_state_prep(ACPI_SLEEP_S5);
                 acpi_enter_sleep_state(ACPI_SLEEP_S5);

@@ -89,7 +89,14 @@ unsafe impl Send for Process {}
 pub struct ProcessInfo {
     pub id: usize,
     pub pid: usize,
-    pub sid: usize
+    pub sid: usize,
+    pub exit_code: isize
+}
+
+#[repr(C)]
+pub struct ThreadInfo {
+    pub id: u64,
+    pub exit_code: i64
 }
 
 impl Process {
@@ -234,7 +241,8 @@ impl Process {
         ProcessInfo {
             id: self.id,
             pid: self.pid,
-            sid: self.session.lock().sid
+            sid: self.session.lock().sid,
+            exit_code: self.get_exit_code()
         }
     }
 
