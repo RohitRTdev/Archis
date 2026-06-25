@@ -358,7 +358,9 @@ fn allowed_in_state(state: DeviceState, major: IrpMajor, minor: IrpMinor, is_cla
         (IrpMajor::Pnp, IrpMinor::Stop)               => state == DeviceState::Stopping,
         (IrpMajor::Pnp, IrpMinor::Remove)             => state == DeviceState::Removing,
         (IrpMajor::Pnp, IrpMinor::None)
-        | (IrpMajor::Pnp, IrpMinor::RegisterKeyboardHandler) => false,
+        | (IrpMajor::Pnp, IrpMinor::RegisterKeyboardHandler)
+        | (IrpMajor::Pnp, IrpMinor::SetForegroundPgrp)
+        | (IrpMajor::Pnp, IrpMinor::SetControllingTty) => false,
     }
 }
 

@@ -4,19 +4,23 @@ use core::alloc::Layout;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use common::{PAGE_SIZE, align_up};
+use common::{PAGE_SIZE, MemoryRegion, align_up};
+use kernel_intf::KError::ProcessTerminated;
 use crate::cpu::Stack;
 use crate::hal::{MAX_ARCH_ARGS, copy_user_memory, get_time_ms, transfer_control_to_user};
 use crate::devices::read_realtime;
 use crate::loader::load_user_image;
 use crate::mem::{self, PageDescriptor};
-use crate::sched::{self, Handle::{ProcessHandle, SyncHandle, ThreadHandle}};
+use crate::io::{io_request_sync, open_device_handle};
+use crate::sched::{self, Handle::{ProcessHandle, SyncHandle, ThreadHandle, DeviceHandle}};
 use crate::sync::{KEvent, KSem, do_signal, do_wait};
 use super::*;
 use kernel_intf::*;
+use kernel_intf::driver::{IrpMajor, IrpMinor, ReqInfo, TtyControlInfo, EMPTY_REGION, Status};
 
-const MAX_SYSCALLS: usize = 26;
+const MAX_SYSCALLS: usize = 27;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
+const OPEN_INHERITABLE_FLAG: u64 = 1 << 0;
 const SYNC_TYPE_SEMAPHORE: u64 = 0;
 const SYNC_TYPE_EVENT: u64 = 1;
 
@@ -47,7 +51,8 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_duplicate_handler,
     sys_create_pgrp_handler,
     sys_get_tid_handler,
-    sys_get_thread_info_handler
+    sys_get_thread_info_handler,
+    sys_device_control_handler
 ];
 
 fn read_c_strlen(start: usize) -> Option<usize> {
@@ -185,11 +190,11 @@ pub extern "C" fn user_init_handler() -> ! {
 
         let rsp = push_args_to_user_stack(stack_top, &args);
         let entry = load_info.lock().user().entry;
-        add_new_handle(Handle::ImgHandle(load_info), false);
 
         // Let parent process know that user init is complete
         let is_suspended = {
             let proc = get_current_process().expect("This shouldn't have happened??");
+            proc.lock().set_image(load_info);
             proc.lock().complete_init(true);
             proc.lock().get_status() == ProcessStatus::Suspended
         };
@@ -268,47 +273,143 @@ fn sys_close_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-// arg0 = handle, arg1 = user buffer, arg2 = length, arg3 = ptr to bytes written
-fn sys_read_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    E_INVALID
+// arg0 = handle, arg1 = user buf ptr, arg2 = len, arg3 = ptr to bytes read
+fn sys_read_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let handle = match get_handle(args[0] as usize) {
+        Some(DeviceHandle(h)) => h,
+        _ => return E_INVALID
+    };
+    let len = args[2] as usize;
+    if len == 0 {
+        return E_SUCCESS;
+    }
+    let mut kbuf = vec![0u8; len];
+    let region = MemoryRegion { base_address: kbuf.as_mut_ptr() as usize, size: len };
+    let result = match io_request_sync(&**handle, IrpMajor::Read, IrpMinor::None, region, 0, None, true) {
+        Ok(r) => r,
+        Err(_) => return E_INVALID
+    };
+    if result.status != Status::Success {
+        return E_INVALID;
+    }
+    let completed = result.bytes_completed;
+    if mem::copy_to_user(args[1] as usize, kbuf.as_ptr(), completed).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    if mem::copy_to_user(args[3] as usize, &completed as *const usize as *const u8, size_of::<usize>()).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    E_SUCCESS
 }
 
-// arg0 = pointer to string
+#[cfg(feature = "kunit-test")]
 fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    if args[0] == 0 {
-        return E_INVALID;
-    }
-
-    let res = read_c_strlen(args[0] as usize);
-    if res.is_none() {
-        return E_INVALID_MEMORY_RANGE; 
-    }
-    let len = res.unwrap();
-    if len == 0 {
-        return E_INVALID;
-    }
-
-    let mut str_buf = vec![0u8; len];
-    if mem::copy_from_user(str_buf.as_mut_ptr(), args[0] as usize, len).is_err() {
+    let mut kbuf = vec![0u8; args[2] as usize];
+    if mem::copy_from_user(kbuf.as_mut_ptr(), args[1] as usize, args[2] as usize).is_err() {
         return E_INVALID_MEMORY_RANGE;
     }
 
-    let user_str_raw = core::str::from_utf8(&str_buf);
-    match user_str_raw {
-        Ok(s) => {
-            info!("{}", s);
-            E_SUCCESS
-        }
-        Err(_) => E_INVALID
-    }
+    let utf_str = match str::from_utf8(kbuf.as_slice()) {
+        Ok(s) => { s },
+        Err(_) => { return E_INVALID; }
+    };
+
+    kernel_intf::print!("{}", utf_str);
+    E_SUCCESS
 }
 
-fn sys_open_device_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    E_INVALID
+// arg0 = handle, arg1 = user buf ptr, arg2 = len, arg3 = ptr to bytes written
+#[cfg(not(feature = "kunit-test"))]
+fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let handle = match get_handle(args[0] as usize) {
+        Some(DeviceHandle(h)) => h,
+        _ => return E_INVALID
+    };
+    let len = args[2] as usize;
+    if len == 0 {
+        return E_SUCCESS;
+    }
+    let mut kbuf = vec![0u8; len];
+    if mem::copy_from_user(kbuf.as_mut_ptr(), args[1] as usize, len).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    let region = MemoryRegion { base_address: kbuf.as_ptr() as usize, size: len };
+    let result = match io_request_sync(&**handle, IrpMajor::Write, IrpMinor::None, region, 0, None, false) {
+        Ok(r) => r,
+        Err(_) => return E_INVALID
+    };
+    if result.status != Status::Success {
+        return E_INVALID;
+    }
+    let completed = result.bytes_completed;
+    if mem::copy_to_user(args[3] as usize, &completed as *const usize as *const u8, size_of::<usize>()).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    E_SUCCESS
+}
+
+// arg0 = device name C-string ptr, arg1 = flags (bit 0 = IS_INHERITABLE)
+fn sys_open_device_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    if args[0] == 0 {
+        return E_INVALID;
+    }
+    let len = match read_c_strlen(args[0] as usize) {
+        Some(l) => l,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    if len == 0 {
+        return E_INVALID;
+    }
+    let mut name_buf = vec![0u8; len];
+    if mem::copy_from_user(name_buf.as_mut_ptr(), args[0] as usize, len).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    let name = match String::from_utf8(name_buf) {
+        Ok(s) => s,
+        Err(_) => return E_INVALID
+    };
+    let is_inheritable = args[1] & OPEN_INHERITABLE_FLAG != 0;
+    match open_device_handle(&name) {
+        Ok(handle) => add_new_handle(DeviceHandle(handle), is_inheritable) as i64,
+        Err(e) => e.into()
+    }
 }
 
 fn sys_open_file_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     E_INVALID
+}
+
+// arg0 = device handle, arg1 = minor code, arg2 = command (Depends on the minor code)
+fn sys_device_control_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let handle = match get_handle(args[0] as usize) {
+        Some(DeviceHandle(h)) => h,
+        _ => return E_INVALID
+    };
+    let minor = match IrpMinor::from_usize(args[1] as usize) {
+        Some(m) => m,
+        None => return E_INVALID
+    };
+    // For now
+    assert!(minor == IrpMinor::SetForegroundPgrp || minor == IrpMinor::SetControllingTty);
+
+    let pid = match get_current_process_id() {
+        Some(p) => p,
+        None => return E_INVALID
+    };
+
+    // For SetForegroundPgrp and SetControllingTty, the command should a value of 1 or 0
+    // To indicate whether to set/unset the pgrp/ctty    
+    let info = TtyControlInfo { pid, value: args[2] as usize };
+    let req_info = ReqInfo { tty_control: info };
+    let result = match io_request_sync(&**handle, IrpMajor::Control, minor, EMPTY_REGION, 0, Some(req_info), false) {
+        Ok(r) => r,
+        Err(_) => return E_INVALID
+    };
+    if result.status == Status::Success {
+        E_SUCCESS
+    } else {
+        E_NOPERM
+    }
 }
 
 // arg 1 = delay in ms
@@ -392,12 +493,22 @@ fn sys_create_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-// arg0 = pid
+// arg0 = process_handle
 fn sys_resume_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let pid = match get_handle(args[0] as usize) {
+        Some(h) => {
+            match h {
+                ProcessHandle(p) => { p.lock().get_id() },
+                _ => { return E_INVALID; }
+            }
+        },
+        None => { return E_INVALID; }
+    };
+
     // We are not able to distinguish between cases where a process just got killed
     // vs when a process never existed at all. So, we just send same error code in 
     // both those cases
-    if resume_process(args[0] as usize) {
+    if resume_process(pid) {
         E_SUCCESS
     }
     else {
@@ -405,14 +516,30 @@ fn sys_resume_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-// arg0 = pid
+// arg0 = process_handle (-1 if current process)
 fn sys_set_session_leader_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    let res = get_process_info(args[0] as usize);
-    if res.is_none() {
-        return E_PROCESS_TERMINATED;
+    let pid = if args[0] as i64 == -1 {
+        get_current_process_id().expect("syscall called from idle task!")
     }
+    else {
+        let res = get_handle(args[0] as usize);
+        if res.is_none() {
+            return E_INVALID;
+        }
 
-    if proc::set_session_leader(args[0] as usize) {
+        match res.unwrap() {
+            ProcessHandle(p) => {
+                if p.lock().get_status() == ProcessStatus::Terminated {
+                    return E_PROCESS_TERMINATED;
+                }
+
+                p.lock().get_id()
+            },
+            _ => { return E_INVALID; }
+        }
+    };
+
+    if proc::set_session_leader(pid) {
         E_SUCCESS
     }
     else {
@@ -420,14 +547,30 @@ fn sys_set_session_leader_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-// arg0 = pid
+// arg0 = process_handle (-1 if current process)
 fn sys_create_pgrp_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    let res = get_process_info(args[0] as usize);
-    if res.is_none() {
-        return E_PROCESS_TERMINATED;
+    let pid = if args[0] as i64 == -1 {
+        get_current_process_id().expect("syscall called from idle task!")
     }
+    else {
+        let res = get_handle(args[0] as usize);
+        if res.is_none() {
+            return E_INVALID;
+        }
 
-    if proc::set_pgroup_leader(args[0] as usize) {
+        match res.unwrap() {
+            ProcessHandle(p) => {
+                if p.lock().get_status() == ProcessStatus::Terminated {
+                    return E_PROCESS_TERMINATED;
+                }
+
+                p.lock().get_id()
+            },
+            _ => { return E_INVALID; }
+        }
+    };
+
+    if proc::set_pgroup_leader(pid) {
         E_SUCCESS
     }
     else {

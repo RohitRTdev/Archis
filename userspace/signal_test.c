@@ -9,22 +9,22 @@ typedef struct {
 
 void my_signal_handler_sig_kill(void *ctx) {
     signal_test_ctx_t *c = (signal_test_ctx_t *)ctx;
-    printf("signal_test: sigkill handler: name=%s id=%d", c->signal_name, c->id);
+    printf("signal_test: sigkill handler: name=%s id=%d\n", c->signal_name, c->id);
     sys_delay_ms(10000);
 }
 
 void my_signal_handler_sig_segv(void *ctx) {
     signal_test_ctx_t *c = (signal_test_ctx_t *)ctx;
-    printf("signal_test: sigsegv handler: name=%s id=%d", c->signal_name, c->id);
+    printf("signal_test: sigsegv handler: name=%s id=%d\n", c->signal_name, c->id);
 }
 
 void my_signal_handler_sig_ill(void *ctx) {
     signal_test_ctx_t *c = (signal_test_ctx_t *)ctx;
-    printf("signal_test: sigill handler: name=%s id=%d", c->signal_name, c->id);
+    printf("signal_test: sigill handler: name=%s id=%d\n", c->signal_name, c->id);
 }
 
 int main(void) {
-    printf("signal_test: starting, registering handler for signals");
+    printf("signal_test: starting, registering handler for signals\n");
 
     signal_test_ctx_t kill_ctx = { "SIGKILL", SIGKILL };
     signal_test_ctx_t segv_ctx = { "SIGSEGV", SIGSEGV };
@@ -34,8 +34,8 @@ int main(void) {
     set_signal_handler(SIGSEGV, my_signal_handler_sig_segv, &segv_ctx);
     set_signal_handler(SIGILL,  my_signal_handler_sig_ill,  &ill_ctx);
 
-    printf("signal_test: waiting for signal...");
+    printf("signal_test: waiting for signal...\n");
     int remaining = sleep(10);
-    printf("signal_test: delay completed with remaining %ds, exiting", remaining);
+    printf("signal_test: delay completed with remaining %ds, exiting\n", remaining);
     return 0;
 }

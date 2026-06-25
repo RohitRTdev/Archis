@@ -27,7 +27,6 @@ pub type KProcess = Arc<Spinlock<Process>, PoolAllocatorGlobal>;
 #[derive(Clone)]
 pub enum Handle {
     FileHandle(FileInstance),
-    ImgHandle(LoadedImage),
     DeviceHandle(OpenDeviceHandle),
     ThreadHandle(KThread),
     ProcessHandle(KProcess),
@@ -35,8 +34,8 @@ pub enum Handle {
 }
 
 pub struct HandleType {
-    handle_info: Handle,
-    is_inheritable: bool
+    pub handle_info: Handle,
+    pub is_inheritable: bool
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -80,7 +79,8 @@ pub struct Process {
     pending_signals: u8,
     signal_guard: Arc<Spinlock<bool>>,
     args: Vec<String>,
-    exit_code: AtomicIsize
+    exit_code: AtomicIsize,
+    image: Option<LoadedImage>
 }
 
 unsafe impl Send for Process {}
@@ -145,7 +145,8 @@ impl Process {
             pending_signals: 0,
             signal_guard: Arc::new(Spinlock::new(true)),
             args,
-            exit_code: AtomicIsize::new(0)
+            exit_code: AtomicIsize::new(0),
+            image: None
         }), PoolAllocatorGlobal);
 
         crate::sched_log!("Creating new process with id {}", id);
@@ -155,6 +156,10 @@ impl Process {
 
     pub fn get_args(&self) -> &[String] {
         &self.args
+    }
+
+    pub fn set_image(&mut self, img: LoadedImage) {
+        self.image = Some(img);
     }
 
     pub fn get_exit_code(&self) -> isize {
@@ -327,11 +332,18 @@ impl Process {
         };
 
         if allowed {
+            // Remove this process from previous session and allocate new session for this
             self.session.lock().processes.find_and_remove(|&p| p == self.id);
             let new_sess = Session::new(self.id);
             new_sess.lock().processes.add_node(self.id).expect("set_session_leader: add to new session failed");
             new_sess.lock().leader = Some(self.id);
             self.session = new_sess;
+            
+            // Create new process group too
+            self.pgroup.lock().processes.find_and_remove(|&p| p == self.id);
+            let new_pg = ProcessGroup::new(self.id);
+            new_pg.lock().processes.add_node(self.id).expect("set_pgroup_leader: add to new pgroup failed");
+            self.pgroup = new_pg;
         }
 
         allowed
@@ -371,7 +383,6 @@ impl Process {
 #[cfg(debug_assertions)]
     pub fn print_handles(&self) {
         let mut file_handles = 0;
-        let mut img_handles = 0;
         let mut device_handles = 0;
         let mut misc_handles = 0;
         self.handle_table.iter().for_each(|handle| {
@@ -380,9 +391,6 @@ impl Process {
                     match h.handle_info {
                         Handle::FileHandle(_) => {
                             file_handles += 1;
-                        },
-                        Handle::ImgHandle(_) => {
-                            img_handles += 1;
                         },
                         Handle::DeviceHandle(_) => {
                             device_handles += 1;
@@ -396,11 +404,10 @@ impl Process {
             }
         });
 
-        debug!("proc_id = {}, 
+        debug!("proc_id = {},
         File handles = {},
-        image handles = {}, 
         device handles = {},
-        misc handles = {}", self.id, file_handles, img_handles, device_handles, misc_handles);
+        misc handles = {}", self.id, file_handles, device_handles, misc_handles);
     }
 
     pub(super) fn get_pending_signals(&self) -> u8 {
@@ -507,7 +514,7 @@ extern "C" fn kernel_init_handler() -> ! {
     };
 
     let entry = img.lock().kernel().info.entry;
-    add_new_handle(Handle::ImgHandle(img), false);
+    get_current_process().unwrap().lock().set_image(img);
 
     let entry_fn: DispatchRoutine = unsafe { core::mem::transmute(entry) };
     
@@ -826,6 +833,14 @@ extern "C" fn sched_create_process_ffi(
     match create_process(args_vec.as_slice(), context_ptr, false, false) {
         Ok(proc) => proc.lock().get_id(),
         Err(_) => usize::MAX,
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn sched_get_current_pid_ffi(tid: usize) -> isize {
+    match get_current_process_id() {
+        Some(t) => t as isize,
+        None => return -1
     }
 }
 

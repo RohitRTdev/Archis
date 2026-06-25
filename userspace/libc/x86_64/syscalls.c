@@ -3,12 +3,20 @@
 
 syscall_status_t do_syscall(uint64_t number, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6);
 
-syscall_status_t sys_exit(int64_t exit_code) {
+syscall_status_t sys_exit(ssize_t exit_code) {
     return do_syscall(SYSCALL_EXIT_PROCESS, (uint64_t)exit_code, 0, 0, 0, 0, 0);
 }
 
-syscall_status_t sys_print(const char* msg) {
-    return do_syscall(SYSCALL_PRINT, (uint64_t)msg, 0, 0, 0, 0, 0);
+handle_t sys_open_device(const char *name, uint64_t flags) {
+    return do_syscall(SYSCALL_OPEN_DEVICE, (uint64_t)name, flags, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_read(handle_t handle, void *buf, size_t len, size_t *bytes_read) {
+    return do_syscall(SYSCALL_READ, (uint64_t)handle, (uint64_t)buf, (uint64_t)len, (uint64_t)bytes_read, 0, 0);
+}
+
+syscall_status_t sys_write(handle_t handle, const void *buf, size_t len, size_t *bytes_written) {
+    return do_syscall(SYSCALL_WRITE, (uint64_t)handle, (uint64_t)buf, (uint64_t)len, (uint64_t)bytes_written, 0, 0);
 }
 
 syscall_status_t sys_delay_ms(size_t ms) {
@@ -27,12 +35,12 @@ syscall_status_t sys_exit_thread(void) {
     return do_syscall(SYSCALL_EXIT_THREAD, 0, 0, 0, 0, 0, 0);
 }
 
-syscall_status_t sys_resume_process(uint64_t pid) {
-    return do_syscall(SYSCALL_RESUME_PROCESS, pid, 0, 0, 0, 0, 0);
+syscall_status_t sys_resume_process(handle_t process_handle) {
+    return do_syscall(SYSCALL_RESUME_PROCESS, process_handle, 0, 0, 0, 0, 0);
 }
 
-syscall_status_t sys_set_session_leader(uint64_t pid) {
-    return do_syscall(SYSCALL_SET_SESSION_LEADER, pid, 0, 0, 0, 0, 0);
+syscall_status_t sys_set_session_leader(handle_t process_handle) {
+    return do_syscall(SYSCALL_SET_SESSION_LEADER, process_handle, 0, 0, 0, 0, 0);
 }
 
 syscall_status_t sys_get_pid() {
@@ -80,11 +88,15 @@ syscall_status_t sys_signal(handle_t handle) {
     return do_syscall(SYSCALL_SIGNAL, (uint64_t)handle, 0, 0, 0, 0, 0);
 }
 
-handle_t sys_duplicate_handle(handle_t target_proc, handle_t old, handle_t new, uint8_t is_inheritable) {
+handle_t sys_duplicate_handle(handle_t target_proc, handle_t old, handle_t new, boolean_t is_inheritable) {
     return do_syscall(SYSCALL_DUPLICATE_HANDLE, (uint64_t)target_proc, (uint64_t)old, (uint64_t)new, (uint64_t)is_inheritable, 0, 0);
 }
 
-syscall_status_t sys_get_time_ms(clock_type_t clock, uint64_t *out) {
+syscall_status_t sys_create_pgrp(handle_t process_handle) {
+    return do_syscall(SYSCALL_CREATE_PGRP, (uint64_t)process_handle, 0, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_get_time_ms(clock_type_t clock, size_t *out) {
     return do_syscall(SYSCALL_GET_TIME_MS, (uint64_t)clock, (uint64_t)out, 0, 0, 0, 0);
 }
 
@@ -94,4 +106,8 @@ uint64_t sys_get_tid(void) {
 
 syscall_status_t sys_get_thread_info(handle_t handle, thread_info_t *out) {
     return do_syscall(SYSCALL_GET_THREAD_INFO, (uint64_t)handle, (uint64_t)out, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_device_control(handle_t handle, size_t minor_code, void* command) {
+    return do_syscall(SYSCALL_DEVICE_CONTROL, (uint64_t)handle, minor_code, (uint64_t)command, 0, 0, 0);
 }

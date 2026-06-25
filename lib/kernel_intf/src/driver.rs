@@ -40,6 +40,8 @@ pub enum IrpMinor {
     Stop                    = 4,
     Remove                  = 5,
     RegisterKeyboardHandler = 6,
+    SetForegroundPgrp       = 7,
+    SetControllingTty       = 8
 }
 
 impl IrpMinor {
@@ -52,6 +54,8 @@ impl IrpMinor {
             4 => Some(Self::Stop),
             5 => Some(Self::Remove),
             6 => Some(Self::RegisterKeyboardHandler),
+            7 => Some(Self::SetForegroundPgrp),
+            8 => Some(Self::SetControllingTty),
             _ => None
         }
     }
@@ -85,6 +89,13 @@ pub struct RegisterHandlerInfo {
     pub context: *mut c_void,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TtyControlInfo {
+    pub pid:   usize,
+    pub value: usize
+}
+
 // Request-specific parameters placed on the IRP before dispatch.
 // Drivers read the relevant variant based on the major/minor code they handle.
 #[repr(C)]
@@ -92,6 +103,7 @@ pub struct RegisterHandlerInfo {
 pub union ReqInfo {
     pub _unused:          [usize; 2],
     pub register_handler: RegisterHandlerInfo,
+    pub tty_control:      TtyControlInfo
 }
 
 #[repr(C)]

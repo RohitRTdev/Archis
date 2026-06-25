@@ -27,7 +27,7 @@ use crate::hal::{get_per_cpu_kernel_base_for_core, set_tss_stack};
 // This is in milliseconds
 pub const QUANTUM: usize = 10;
 const INIT_QUANTA: usize = 10;
-pub const MAX_SIGNALS: usize = 4;
+pub const MAX_SIGNALS: usize = 6;
 
 pub type KThread = Arc<Spinlock<Task>, PoolAllocatorGlobal>;
 
@@ -46,10 +46,6 @@ pub enum SignalCause {
     Interruption
 }
 
-pub const SIGFPE:  u8 = 0;
-pub const SIGSEGV: u8 = 1;
-pub const SIGILL:  u8 = 2;
-pub const SIGKILL: u8 = 3;
 
 #[derive(Clone, Copy)]
 struct SignalFrame {

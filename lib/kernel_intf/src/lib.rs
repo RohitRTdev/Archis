@@ -17,6 +17,13 @@ pub type InterruptRoutine = extern "C" fn(*mut core::ffi::c_void) -> bool;
 pub type SessionType      = usize;
 pub type ProcessGroupType = usize;
 
+pub const SIGINT:  u8 = 0;
+pub const SIGFPE:  u8 = 1;
+pub const SIGSEGV: u8 = 2;
+pub const SIGILL:  u8 = 3;
+pub const SIGKILL: u8 = 4;
+pub const SIGTTIN: u8 = 5;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct InterruptHandle {
@@ -213,6 +220,7 @@ unsafe extern "C" {
     fn sched_get_cur_thread_id_ffi() -> usize;
 
     fn sched_create_process_ffi(args: *const StrRef, args_len: usize, context_ptr: *mut c_void) -> usize;
+    fn sched_get_current_pid_ffi() -> isize;
     fn sched_wait_process_ffi(proc_id: usize);
     fn sched_kill_process_ffi(proc_id: usize, exit_code: isize);
     fn sched_create_thread_ffi(handler: extern "C" fn() -> !, context_ptr: *mut c_void) -> usize;
@@ -309,6 +317,10 @@ pub fn sched_create_process(args: &[&str], context_ptr: *mut c_void) -> Option<u
     else {
         Some(res)
     }
+}
+
+pub fn sched_get_current_pid() -> isize {
+    unsafe { sched_get_current_pid_ffi() }
 }
 
 pub fn sched_wait_process(proc_id: usize) {

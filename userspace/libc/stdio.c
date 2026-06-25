@@ -126,7 +126,11 @@ int snprintf(char *buf, size_t size, const char *fmt, ...) {
 int vprintf(const char *fmt, va_list ap) {
     char buf[512];
     int ret = vsnprintf(buf, sizeof(buf), fmt, ap);
-    sys_print(buf);
+    if (ret > 0) {
+        size_t bw = 0;
+        size_t len = (ret < (int)sizeof(buf)) ? (size_t)ret : sizeof(buf) - 1;
+        sys_write(STDOUT_FILENO, buf, len, &bw);
+    }
     return ret;
 }
 

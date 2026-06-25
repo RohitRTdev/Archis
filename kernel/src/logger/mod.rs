@@ -48,15 +48,24 @@ extern "C" fn serial_print_ffi(s: *const u8, len: usize) {
     if !panicking {
         kring::push(s);
     }
-
-    // In TTY mode outside a panic, ring buffer only — skip serial and framebuffer.
-    if tty && !panicking {
-        return;
+    
+    uart::SERIAL.lock().write(s);
+    
+    // In TTY mode outside a panic, ring buffer + serial only — skip framebuffer.
+    #[cfg(feature = "kunit-test")]
+    {
+        FRAMEBUFFER_LOGGER.lock().write(s);
+        flush_log();
+    }
+    #[cfg(not(feature = "kunit-test"))]
+    {
+        if tty && !panicking {
+            return;
+        }
+        FRAMEBUFFER_LOGGER.lock().write(s);
+        flush_log();
     }
 
-    uart::SERIAL.lock().write(s);
-    FRAMEBUFFER_LOGGER.lock().write(s);
-    flush_log();
 }
 
 // Write to framebuffer only when TTY mode is active and there is no ongoing panic.
@@ -69,6 +78,7 @@ extern "C" fn tty_print_ffi(s: *const u8, len: usize) {
         let slice = core::slice::from_raw_parts(s, len);
         core::str::from_utf8_unchecked(slice)
     };
+    uart::SERIAL.lock().write(s);
     FRAMEBUFFER_LOGGER.lock().write(s);
     flush_log();
 }

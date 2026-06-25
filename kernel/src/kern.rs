@@ -834,89 +834,6 @@ fn run_sync_tests() {
     info!("=== run_sync_tests: PASSED ===");
 }
 
-// === User loader & userspace tests ===
-//
-// Test 1: basic load — single cat process (exercises ELF parsing,
-//         dependency loading of libc.so, relocations, all syscalls).
-//         spawns tester process internally.
-// Test 2: warm load — two concurrent cat processes share the
-//         read-only pages of libc.so.
-// Test 3: shared dep — cat and ls launched concurrently,
-//         both pull in libc.so (warm-loads the shared dependency).
-// Test 4: ls test — spawn ls internally only.
-#[kmod::test_function(false)]
-fn run_user_tests() {
-    // Test 1: basic user process with dependency
-    info!("--- user test 1: basic load (cat) ---");
-    let p1 = sched::create_process(
-        &["cat"],
-        core::ptr::null_mut(),
-        true,
-        false
-    ).expect("user test 1: failed to create process");
-    p1.wait(false);
-    let code1 = p1.lock().get_exit_code();
-    info!("user test 1: cat exited with code {}", code1);
-
-    // Test 2: warm load — same image in two concurrent processes
-    info!("--- user test 2: warm load (2x cat) ---");
-    let p2a = sched::create_process(
-        &["cat"],
-        core::ptr::null_mut(),
-        true,
-        false
-    ).expect("user test 2: failed to create process A");
-    let p2b = sched::create_process(
-        &["cat"],
-        core::ptr::null_mut(),
-        true,
-        false
-    ).expect("user test 2: failed to create process B");
-    p2a.wait(false);
-    p2b.wait(false);
-    info!(
-        "user test 2: process A exited with code {}, B with code {}",
-        p2a.lock().get_exit_code(),
-        p2b.lock().get_exit_code()
-    );
-
-    drop(p1);drop(p2a);drop(p2b);
-    // Test 3: different images, shared dependency
-    info!("--- user test 3: shared dep (cat + ls) ---");
-    let p3a = sched::create_process(
-        &["cat"],
-        core::ptr::null_mut(),
-        true,
-        false
-    ).expect("user test 3: failed to create cat process");
-    let p3b = sched::create_process(
-        &["ls"],
-        core::ptr::null_mut(),
-        true,
-        false
-    ).expect("user test 3: failed to create ls process");
-    p3a.wait(false);
-    p3b.wait(false);
-    info!(
-        "user test 3: cat exited with code {}, cat with code {}",
-        p3a.lock().get_exit_code(),
-        p3b.lock().get_exit_code()
-    );
-
-    // Test 4: user-initiated process spawn
-    info!("--- user test 4: ls test ---");
-    let p4 = sched::create_process(
-        &["ls"],
-        core::ptr::null_mut(),
-        true,
-        false
-    ).expect("user test 4: failed to create ls process");
-    p4.wait(false);
-    info!("user test 4: ls exited with code {}", p4.lock().get_exit_code());
-
-    info!("=== run_user_tests: PASSED ===");
-}
-
 #[kmod::test_function(true)]
 fn run_signal_tests() {
     static SEM: Once<KEvent> = Once::new();
@@ -943,8 +860,6 @@ fn run_signal_tests() {
         false
     ).expect("signal test 1: failed to create signal_test process");
 
-
-
     let pid = p1.lock().get_id();
     info!("signal test 1: created process pid={}", pid);
 
@@ -953,8 +868,8 @@ fn run_signal_tests() {
     SEM.get().unwrap().signal();
 
     info!("signal test 1: issuing signals to pid={}", pid);
-    sched::issue_signal(pid, sched::SIGSEGV);
-    sched::issue_signal(pid, sched::SIGILL);
+    sched::issue_signal(pid, kernel_intf::SIGSEGV);
+    sched::issue_signal(pid, kernel_intf::SIGILL);
 
     p1.wait(false);
     info!("signal test 1: process exited with code {}", p1.lock().get_exit_code());
@@ -974,47 +889,16 @@ fn kern_main() -> ! {
 #[cfg(feature = "acpi")]
     acpica::init();
     kernel_intf::run_tests!();
-    info!("Main task going to sleep");
-    info!("====TTY mode====");
-    info!("===Type shutdown===");
-    let kbd = crate::io::open_device_handle("input").expect("Failed to open input device!");
-    let input_buf: [u8; 256] = [0; 256];
-    let mut offset = 0;
-    loop {
-        kbd.read(crate::io::ReadRequest{
-            buffer: MemoryRegion {
-                base_address: input_buf.as_ptr().addr(),
-                size: 1
-            },
-            offset
-        }, false).expect("Failed to read input device!");
-        offset += 1;
-        let command = unsafe {
-            let command_slice = core::slice::from_raw_parts(input_buf.as_ptr(), offset);
-            core::str::from_utf8(command_slice).expect("Failed to decode utf-8")
-        };
+    info!("Launching init...");
+    let init_proc = sched::create_process(
+        &["/bin/init"],
+        core::ptr::null_mut(),
+        true,
+        false
+    ).expect("Failed to create init process!");
 
-        if command == "shutdown\n" {
-            #[cfg(feature = "acpi")]
-            {
-                //use crate::logger::kring::kring_log_for_each;
-                //use alloc::borrow::ToOwned;
-                //let mut strings = alloc::vec::Vec::new();
-                //kring_log_for_each(|s| {
-                //    strings.push(s.to_owned());
-                //});
-
-                //info!("===Printing all kring logs===");
-                //for string in strings {
-                //    kernel_intf::print!("{}", string);
-                //}
-
-                acpi_enter_sleep_state_prep(ACPI_SLEEP_S5);
-                acpi_enter_sleep_state(ACPI_SLEEP_S5);
-            }
-        }
-    }
-    //hal::sleep();
+    init_proc.wait(false);
+    panic!("init process returned!");
 }
 
 // === Driver worker (DPC) tests ===
@@ -1030,7 +914,7 @@ fn kern_main() -> ! {
 #[cfg(feature = "kunit-test")]
 use { 
     core::sync::atomic::AtomicI64,
-    crate::sched::SIGKILL,
+    kernel_intf::SIGKILL,
     crate::sync::KEvent
 };
 

@@ -8,7 +8,7 @@ enum syscall_t {
     SYSCALL_EXIT_PROCESS,
     SYSCALL_EXIT_THREAD,
     SYSCALL_READ,
-    SYSCALL_PRINT,
+    SYSCALL_WRITE,
     SYSCALL_CLOSE,
     SYSCALL_OPEN_FILE,
     SYSCALL_OPEN_DEVICE,
@@ -28,8 +28,10 @@ enum syscall_t {
     SYSCALL_SIGNAL,
     SYSCALL_GET_TIME_MS,
     SYSCALL_DUPLICATE_HANDLE,
-    SYSCALL_GET_TID = 24,
-    SYSCALL_GET_THREAD_INFO = 25
+    SYSCALL_CREATE_PGRP,
+    SYSCALL_GET_TID,
+    SYSCALL_GET_THREAD_INFO,
+    SYSCALL_DEVICE_CONTROL
 };
 
 typedef enum {
@@ -51,12 +53,16 @@ typedef enum {
     E_TIMEOUT = -12
 } syscall_status_t;
 
-#define PROCESS_SUSPEND_FLAG ((uint64_t)1 << 0)
+#define PROCESS_SUSPEND_FLAG  ((uint64_t)1 << 0)
+#define OPEN_INHERITABLE_FLAG ((uint64_t)1 << 0)
 
 typedef enum {
     CLOCK_MONOTONIC = 0,
     CLOCK_WALL_TIME = 1
 } clock_type_t;
+
+#define SET_FOREGROUND_PGRP (7)
+#define SET_CTTY (8)
 
 
 typedef struct {
@@ -71,15 +77,17 @@ typedef struct {
     int64_t  exit_code;
 } thread_info_t;
 
-syscall_status_t sys_exit(int64_t exit_code);
+syscall_status_t sys_exit(ssize_t exit_code);
 syscall_status_t sys_close(handle_t handle);
-syscall_status_t sys_print(const char* msg);
+handle_t         sys_open_device(const char *name, uint64_t flags);
+syscall_status_t sys_read(handle_t handle, void *buf, size_t len, size_t *bytes_read);
+syscall_status_t sys_write(handle_t handle, const void *buf, size_t len, size_t *bytes_written);
 syscall_status_t sys_delay_ms(size_t ms);
-handle_t sys_create_process(char *const args[], size_t len, uint64_t flags);
+handle_t         sys_create_process(char *const args[], size_t len, uint64_t flags);
 syscall_status_t sys_create_thread(uint64_t fn_addr, void *context);
 syscall_status_t sys_exit_thread(void);
-syscall_status_t sys_resume_process(uint64_t pid);
-syscall_status_t sys_set_session_leader(uint64_t pid);
+syscall_status_t sys_resume_process(handle_t process_handle);
+syscall_status_t sys_set_session_leader(handle_t process_handle);
 syscall_status_t sys_get_pid();
 syscall_status_t sys_get_process_info(handle_t handle, process_info_t *const buf);
 syscall_status_t sys_allocate_memory(size_t size, void **out);
@@ -94,8 +102,9 @@ syscall_status_t sys_create_sync_object(
 );
 syscall_status_t sys_wait(handle_t handle, ssize_t timeout);
 syscall_status_t sys_signal(handle_t handle);
-handle_t sys_duplicate_handle(handle_t target_proc, handle_t old, handle_t new, uint8_t is_inheritable);
-syscall_status_t sys_get_time_ms(clock_type_t clock, uint64_t *out);
-uint64_t sys_get_tid(void);
+handle_t         sys_duplicate_handle(handle_t target_proc, handle_t old, handle_t new, boolean_t is_inheritable);
+syscall_status_t sys_create_pgrp(handle_t process_handle);
+syscall_status_t sys_get_time_ms(clock_type_t clock, size_t *out);
+uint64_t         sys_get_tid(void);
 syscall_status_t sys_get_thread_info(handle_t handle, thread_info_t *out);
-
+syscall_status_t sys_device_control(handle_t handle, size_t minor_code, void* command);

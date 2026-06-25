@@ -17,9 +17,8 @@ use crate::infra::disable_preloader_phase;
 use crate::loader::module::{KernelModule, ModuleDescriptor, ModuleType};
 use crate::loader::user_loader::load_user_image;
 use crate::mem::{PageDescriptor, allocate_memory, deallocate_memory};
+use crate::sched::get_current_process;
 use kernel_intf::mem::PoolAllocatorGlobal;
-use crate::sched::Handle::ImgHandle;
-use crate::sched::add_new_handle;
 use crate::sync::{KSem, Once, Spinlock, semaphore_guard};
 use kernel_intf::list::{List, DynList};
 use super::module;
@@ -83,8 +82,7 @@ pub fn init() {
     );
 
     let downgraded_ref = Arc::downgrade(&loaded_img);
-
-    add_new_handle(ImgHandle(loaded_img), false);
+    get_current_process().unwrap().lock().set_image(loaded_img);
     KERNEL_MODULES.lock().add_node(downgraded_ref)
     .expect("Failed to add kernel image module to Loaded images registry!");
 

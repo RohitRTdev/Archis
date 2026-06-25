@@ -1,12 +1,12 @@
 use common::{MemoryRegion, PAGE_SIZE};
-use kernel_intf::{debug, info};
+use kernel_intf::{debug, info, SIGILL, SIGSEGV, SIGFPE};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::ptr::NonNull;
 use crate::cpu::{self, MAX_CPUS, PerCpu, general_interrupt_handler};
 use crate::hal::x86_64::asm::switch_context_force;
 use crate::hal::{enable_scheduler_timer, get_core, get_per_cpu_base, get_per_cpu_kernel_base};
 use crate::infra;
-use crate::sched::{SIGFPE, SIGILL, SIGSEGV, issue_signal_to_thread};
+use crate::sched::issue_signal_to_thread;
 use crate::sync::Spinlock;
 use super::{lapic, timer};
 use crate::mem::on_page_fault;

@@ -6,21 +6,18 @@ use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kernel_intf::{
-    info,
-    Lock,
-    create_spinlock, acquire_spinlock, release_spinlock,
-    io_complete_irp, io_set_cancel_routine, io_start_processing,
-    tty_print, enable_tty_mode, disable_tty_mode
+    Lock, ProcessGroupType, SIGINT, SIGTTIN, SessionType, acquire_spinlock, create_spinlock, disable_tty_mode, enable_tty_mode, info, io_complete_irp, io_set_cancel_routine, io_start_processing, proc_drop_pgrp, proc_drop_session, proc_get_pgrp, proc_get_session, proc_is_foreground_pgrp, proc_is_pgrp_active, proc_is_session_active, proc_is_session_leader, proc_issue_pgrp, release_spinlock, sched_get_current_pid, tty_print
 };
 use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
     DeviceObject, DriverObject, Irp, IrpMinor, Status,
-    create_device
+    TtyControlInfo, create_device
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
 
 const INPUT_BUF_SIZE: usize = 256;
 const MAX_PENDING:    usize = 16;
+const CTRL_C:         u8    = 0x1b;
 
 static TTY_CREATED: AtomicUsize = AtomicUsize::new(0);
 static TTY_CTX_PTR: AtomicUsize = AtomicUsize::new(0);
@@ -32,16 +29,26 @@ struct PendingEntry {
     requested: usize
 }
 
+struct TtyJobInfo {
+    session: SessionType,
+    pgrp:    ProcessGroupType
+}
+
 struct TtyCtx {
     lock:        Lock,
     input_ring:  RingBuffer<u8, INPUT_BUF_SIZE>,
     pending:     [PendingEntry; MAX_PENDING],
     pending_len: usize,
-    enabled:     bool
+    enabled:     bool,
+    mode:        u8,
+    job:         TtyJobInfo
 }
 
 unsafe impl Send for TtyCtx {}
 unsafe impl Sync for TtyCtx {}
+
+const LINE_BUFFERED: u8 = 1 << 1;
+const ECHO: u8 = 1 << 0;
 
 impl TtyCtx {
     const fn zeroed() -> Self {
@@ -50,7 +57,9 @@ impl TtyCtx {
             input_ring:  RingBuffer::new(0u8),
             pending:     [PendingEntry { irp: null_mut(), requested: 0 }; MAX_PENDING],
             pending_len: 0,
-            enabled:     false
+            enabled:     false,
+            mode:        LINE_BUFFERED | ECHO,
+            job:         TtyJobInfo { session: 0, pgrp: 0 }
         }
     }
 
@@ -72,7 +81,7 @@ impl TtyCtx {
 #[kmod::init(driver)]
 fn driver_init(driver: &mut DriverObject) -> Status {
     info!("{} initializing (id={})...", driver.get_name(), driver.id);
-    kmod::dispatch_init!(driver, dispatch_open, dispatch_close, dispatch_add, dispatch_pnp, dispatch_read, dispatch_write);
+    kmod::dispatch_init!(driver, dispatch_open, dispatch_close, dispatch_add, dispatch_pnp, dispatch_read, dispatch_write, dispatch_control);
     Status::Success
 }
 
@@ -134,6 +143,15 @@ fn do_remove(device: &DeviceObject, request: &mut Irp) -> Status {
 
     if !device.ctx.is_null() {
         unsafe {
+            let ctx = &mut *(device.ctx as *mut TtyCtx);
+            if ctx.job.session != 0 {
+                proc_drop_session(ctx.job.session);
+                ctx.job.session = 0;
+            }
+            if ctx.job.pgrp != 0 {
+                proc_drop_pgrp(ctx.job.pgrp);
+                ctx.job.pgrp = 0;
+            }
             drop(alloc::boxed::Box::from_raw_in(
                 device.ctx as *mut TtyCtx,
                 PoolAllocatorGlobal
@@ -217,6 +235,33 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
 
     let ctx = unsafe { &mut *(device.ctx as *mut TtyCtx) };
 
+    let pid = sched_get_current_pid();
+    if pid == -1 {
+        // Idle task
+        info!("Received read request from idle task!");
+        request.complete_irp(Status::Failed);
+        return Status::Failed;
+    }
+    let pid = pid as usize;
+    let fgrp = {
+        acquire_spinlock(&mut ctx.lock);
+        let p = ctx.job.pgrp;
+        release_spinlock(&mut ctx.lock);
+        p
+    };
+
+    // Only the current foreground process group can read/write to tty (if it exists)
+    if fgrp != 0 && pid != 0 && !proc_is_foreground_pgrp(pid, fgrp) {
+        let caller_pgrp = proc_get_pgrp(pid);
+        if caller_pgrp != 0 {
+            info!("Not foreground process group!");
+            proc_issue_pgrp(caller_pgrp, SIGTTIN);
+            proc_drop_pgrp(caller_pgrp);
+        }
+        request.complete_irp(Status::Failed);
+        return Status::Failed;
+    }
+
     acquire_spinlock(&mut ctx.lock);
 
     let avail = ctx.input_ring.len();
@@ -247,7 +292,34 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
 }
 
 #[kmod::dispatch_handler]
-fn dispatch_write(_device: &DeviceObject, request: &mut Irp) -> Status {
+fn dispatch_write(device: &DeviceObject, request: &mut Irp) -> Status {
+    let ctx = unsafe { &mut *(device.ctx as *mut TtyCtx) };
+    let pid = sched_get_current_pid();
+    if pid == -1 {
+        // Idle task
+        request.complete_irp(Status::Failed);
+        return Status::Failed;
+    }
+
+    let pid = pid as usize;
+
+    let fgrp = {
+        acquire_spinlock(&mut ctx.lock);
+        let p = ctx.job.pgrp;
+        release_spinlock(&mut ctx.lock);
+        p
+    };
+    if fgrp != 0 && pid != 0 && !proc_is_foreground_pgrp(pid, fgrp) {
+        let caller_pgrp = proc_get_pgrp(pid);
+        if caller_pgrp != 0 {
+            info!("Not foreground process group");
+            proc_issue_pgrp(caller_pgrp, SIGTTIN);
+            proc_drop_pgrp(caller_pgrp);
+        }
+        request.complete_irp(Status::Failed);
+        return Status::Failed;
+    }
+
     let size = request.buffer.size;
     if size > 0 {
         let bytes = unsafe {
@@ -260,6 +332,99 @@ fn dispatch_write(_device: &DeviceObject, request: &mut Irp) -> Status {
     request.bytes_completed = size;
     request.complete_irp(Status::Success);
     Status::Success
+}
+
+#[kmod::dispatch_handler]
+fn dispatch_control(device: &DeviceObject, request: &mut Irp) -> Status {
+    let info: TtyControlInfo = unsafe { request.req_info.tty_control };
+    let ctx = unsafe { &mut *(device.ctx as *mut TtyCtx) };
+
+    match request.minor_code {
+        IrpMinor::SetForegroundPgrp => {
+            // Check caller is session leader of TTY's session (if session active)
+            let session = {
+                acquire_spinlock(&mut ctx.lock);
+                let s = ctx.job.session;
+                release_spinlock(&mut ctx.lock);
+                s
+            };
+            if session != 0 && proc_is_session_active(session) {
+                if !proc_is_session_leader(info.pid, session) {
+                    request.complete_irp(Status::Failed);
+                    return Status::Failed;
+                }
+            }
+
+            let new_pgrp = if info.value != 0 { proc_get_pgrp(info.value) } else { 0 };
+
+            acquire_spinlock(&mut ctx.lock);
+            let old_pgrp = ctx.job.pgrp;
+            ctx.job.pgrp = new_pgrp;
+            release_spinlock(&mut ctx.lock);
+
+            if old_pgrp != 0 {
+                proc_drop_pgrp(old_pgrp);
+            }
+
+            request.complete_irp(Status::Success);
+            Status::Success
+        }
+        IrpMinor::SetControllingTty => {
+            let caller_session = proc_get_session(info.pid);
+            if caller_session == 0 {
+                request.complete_irp(Status::Failed);
+                return Status::Failed;
+            }
+            if !proc_is_session_leader(info.pid, caller_session) {
+                proc_drop_session(caller_session);
+                request.complete_irp(Status::Failed);
+                return Status::Failed;
+            }
+
+            if info.value == 1 {
+                acquire_spinlock(&mut ctx.lock);
+                if ctx.job.session == 0 {
+                    // Transfer Arc in — do not drop caller_session
+                    ctx.job.session = caller_session;
+                    release_spinlock(&mut ctx.lock);
+                } else if proc_is_session_leader(info.pid, ctx.job.session) {
+                    // Caller already owns this TTY
+                    release_spinlock(&mut ctx.lock);
+                    proc_drop_session(caller_session);
+                } else {
+                    info!("tty already owned by another session!");
+                    release_spinlock(&mut ctx.lock);
+                    proc_drop_session(caller_session);
+                    request.complete_irp(Status::Failed);
+                    return Status::Failed;
+                }
+            } else {
+                acquire_spinlock(&mut ctx.lock);
+                let old_session = ctx.job.session;
+                let old_pgrp = ctx.job.pgrp;
+                if old_session != 0 && proc_is_session_leader(info.pid, old_session) {
+                    ctx.job.session = 0;
+                    ctx.job.pgrp = 0;
+                    release_spinlock(&mut ctx.lock);
+                    proc_drop_session(old_session);
+                    if old_pgrp != 0 {
+                        proc_drop_pgrp(old_pgrp);
+                    }
+                } else {
+                    info!("Only owning session leader can unset the controlling tty!");
+                    release_spinlock(&mut ctx.lock);
+                }
+                proc_drop_session(caller_session);
+            }
+
+            request.complete_irp(Status::Success);
+            Status::Success
+        }
+        _ => {
+            request.complete_irp(Status::Unsupported);
+            Status::Unsupported
+        }
+    }
 }
 
 extern "C" fn tty_cancel(dev: *const DeviceObject, irp: *mut Irp) {
@@ -284,10 +449,26 @@ fn tty_input(bytes: *const u8, count: usize) {
     }
     let ctx = unsafe { &mut *(ctx_ptr as *mut TtyCtx) };
 
+    let slice = unsafe { core::slice::from_raw_parts(bytes, count) };
+    match str::from_utf8(slice) {
+        Ok(utf_str) => {
+            tty_print(utf_str);
+        },
+        _ => {}
+    }
+
     acquire_spinlock(&mut ctx.lock);
 
-    let slice = unsafe { core::slice::from_raw_parts(bytes, count) };
     for &b in slice {
+        if b == CTRL_C {
+            // Skip this byte stream processing and issue signal to foreground pgrp
+            let pgrp = ctx.job.pgrp;
+            release_spinlock(&mut ctx.lock);
+            if pgrp != 0 && proc_is_pgrp_active(pgrp) {
+                proc_issue_pgrp(pgrp, SIGINT);
+            }
+            return;
+        }
         ctx.input_ring.push(b);
     }
 

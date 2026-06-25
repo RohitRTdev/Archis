@@ -14,3 +14,12 @@ typedef int64_t  ssize_t;
 
 typedef uint64_t uintptr_t;
 typedef int64_t  intptr_t;
+
+typedef uint8_t boolean_t;
+
+#define TRUE ((boolean_t)1)
+#define FALSE ((boolean_t)0)
+
+#ifndef NULL
+#define NULL ((void*)0)
+#endif

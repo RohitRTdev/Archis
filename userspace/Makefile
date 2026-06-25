@@ -30,8 +30,7 @@ COMMON_CFLAGS := -target $(TARGET) -ffreestanding -fPIC -fPIE -nostdinc -Wall -W
 CRT_SRCS := crt/$(ARCH)/*
 
 # Mention the binaries to be compiled in this list 
-# (The names of these binaries don't correspond to the actual program you're used to)
-BINARIES := cat ls tester signal_test
+BINARIES := signal_test init sh
 
 # Shared libraries (dynamically loaded) and static libraries(.a archives) are to be mentioned here
 SHARED_LIBS := c
@@ -39,17 +38,14 @@ STATIC_LIBS :=
 
 # Write down the src files and lib dependencies of each binary
 # in following format -> <bin_name>_SRCS := <src_list>, <bin_name>_LIBS := <static_and_shared_lib_list>
-tester_SRCS := tester.c
-tester_LIBS := c
-
-cat_SRCS := cat.c string.c
-cat_LIBS := c
-
-ls_SRCS := ls.c string.c
-ls_LIBS := c
-
 signal_test_SRCS := signal_test.c
 signal_test_LIBS := c
+
+init_SRCS := init.c
+init_LIBS := c
+
+sh_SRCS := sh.c
+sh_LIBS := c
 
 c_SRCS := libc/*.c libc/*.s libc/$(ARCH)/*
 
