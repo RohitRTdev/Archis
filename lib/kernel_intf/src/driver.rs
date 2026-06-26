@@ -4,6 +4,7 @@ use crate::io_complete_irp;
 use super::{Lock, StrRef};
 
 pub const EMPTY_REGION: MemoryRegion = MemoryRegion { base_address: 0, size: 0 };
+pub const MAX_RESOURCE_ENTRIES: usize = 16;
 
 #[repr(usize)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,12 +37,13 @@ pub enum IrpMinor {
     None                    = 0,
     Enumerate               = 1,
     Query                   = 2,
-    Start                   = 3,
-    Stop                    = 4,
-    Remove                  = 5,
-    RegisterKeyboardHandler = 6,
-    SetForegroundPgrp       = 7,
-    SetControllingTty       = 8
+    Resources               = 3,
+    Start                   = 4,
+    Stop                    = 5,
+    Remove                  = 6,
+    RegisterKeyboardHandler = 7,
+    SetForegroundPgrp       = 8,
+    SetControllingTty       = 9
 }
 
 impl IrpMinor {
@@ -95,6 +97,61 @@ pub struct TtyControlInfo {
     pub pid:   usize
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IntDesc {
+    pub irq: usize,
+    pub vector: usize
+}
+
+#[repr(usize)]
+#[derive(PartialEq, Clone, Copy)]
+pub enum ResType {
+    Memory,
+    Port,
+    Interrupt
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PortDesc {
+    pub base: usize,
+    pub range: usize
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union ResTypeDesc {
+    pub mem: MemoryRegion,
+    pub port: PortDesc,
+    pub interrupt: IntDesc
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ResEntry {
+    pub res_type: ResType, 
+    pub desc: ResTypeDesc
+}
+
+impl Default for ResEntry {
+    fn default() -> Self {
+        Self {
+            res_type: ResType::Memory,
+            desc: ResTypeDesc {
+                mem: MemoryRegion { base_address: 0, size: 0 }
+            }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ResList {
+    pub base: *mut ResEntry,
+    pub count: usize
+}
+
 // Request-specific parameters placed on the IRP before dispatch.
 // Drivers read the relevant variant based on the major/minor code they handle.
 #[repr(C)]
@@ -102,7 +159,8 @@ pub struct TtyControlInfo {
 pub union ReqInfo {
     pub _unused:          [usize; 2],
     pub register_handler: RegisterHandlerInfo,
-    pub tty_control:      TtyControlInfo
+    pub tty_control:      TtyControlInfo,
+    pub res_list:         ResList
 }
 
 #[repr(C)]
@@ -135,6 +193,7 @@ pub struct IrpResult {
     pub offset: usize,
     pub status: Status,
     pub bytes_completed: usize,
+    pub req_info: ReqInfo
 }
 
 impl Default for IrpResult {
@@ -146,6 +205,7 @@ impl Default for IrpResult {
             offset: 0,
             status: Status::Pending,
             bytes_completed: 0,
+            req_info: unsafe { core::mem::zeroed() }
         }
     }
 }
@@ -189,6 +249,7 @@ impl Irp {
             offset: self.offset,
             status: self.status,
             bytes_completed: self.bytes_completed,
+            req_info: self.req_info
         }
     }
 

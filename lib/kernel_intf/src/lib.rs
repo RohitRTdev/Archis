@@ -27,8 +27,19 @@ pub const SIGTTIN: u8 = 5;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct InterruptHandle {
-    pub irq:      usize,
+    pub irq:      isize,
+    pub vector:   usize,
     pub node_ptr: usize
+}
+
+impl InterruptHandle {
+    pub const fn new() -> Self {
+        Self {
+            irq: 0,
+            vector: 0,
+            node_ptr: 0
+        }
+    }
 }
 
 #[repr(C)]
@@ -242,6 +253,9 @@ unsafe extern "C" {
     fn proc_is_foreground_pgrp_ffi(pid: usize, val: ProcessGroupType) -> bool;
     fn proc_issue_signal_ffi(pid: usize, signal: u8);
     fn proc_issue_pgrp_ffi(val: ProcessGroupType, signal: u8);
+
+    fn allocate_vector_ffi() -> usize;
+    fn free_vector_ffi(vector: usize);
 }
 
 pub fn io_create_driver_worker(
@@ -437,6 +451,14 @@ pub fn proc_issue_signal(pid: usize, signal: u8) {
 
 pub fn proc_issue_pgrp(val: ProcessGroupType, signal: u8) {
     unsafe { proc_issue_pgrp_ffi(val, signal) }
+}
+    
+pub fn io_allocate_vector() -> usize {
+    unsafe { allocate_vector_ffi() }
+}
+
+pub fn io_free_vector(vector: usize) {
+    unsafe { free_vector_ffi(vector); }
 }
 
 #[macro_export]

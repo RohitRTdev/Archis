@@ -258,7 +258,7 @@ pub fn init() {
     info!("Initialized interrupt handlers");
 }
 
-fn fetch_available_vector() -> usize {
+pub fn allocate_vector() -> usize {
     let mut vec_stat = VECTOR_STATUS_TABLE.lock();
     for i in USER_VECTOR_START..MAX_INTERRUPT_VECTORS {
         if vec_stat[i] {
@@ -270,25 +270,29 @@ fn fetch_available_vector() -> usize {
     panic!("Out of available vectors!");
 }
 
-fn free_vector(vector: usize) {
+extern "C" fn allocate_vector_ffi() -> usize {
+    allocate_vector()
+}
+
+extern "C" fn free_vector_ffi(vector: usize) {
+    free_vector(vector);
+}
+
+pub fn free_vector(vector: usize) {
     assert!(vector >= USER_VECTOR_START && vector < MAX_INTERRUPT_VECTORS);
     let mut vec_stat = VECTOR_STATUS_TABLE.lock();
+    assert!(vec_stat[vector]);
     vec_stat[vector] = false;
 }
 
 // Interrupts must be disabled during this call
-pub fn register_interrupt_handler(irq: usize, active_high: bool, is_edge_triggered: bool) -> usize {
-    let vector = fetch_available_vector();
-
+pub fn register_interrupt_handler(vector: usize, irq: usize, active_high: bool, is_edge_triggered: bool) {
     // We will tie up all IOAPIC interrupts to BSP
     set_redirection_entry(true, irq, get_bsp_lapic_id(), vector, active_high, is_edge_triggered);    
-    
-    vector
 }
 
 pub fn unregister_interrupt_handler(irq: usize, vector: usize) {
     set_redirection_entry(false, irq, get_bsp_lapic_id(), vector, false, false);    
-    free_vector(vector);
 }
 
 fn spurious_handler(_vector: usize) {

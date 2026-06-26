@@ -8,13 +8,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use common::{MemoryRegion, StrRef};
 use kernel_intf::driver::{
-    DeviceObject, DriverObject, EMPTY_REGION, Irp, IrpMajor, IrpMinor, IrpResult, ReqInfo, Status
+    DeviceObject, DriverObject, EMPTY_REGION, Irp, IrpMajor, IrpMinor, IrpResult, ReqInfo, ResList, Status
 };
 use kernel_intf::{acquire_spinlock, io_complete_irp, release_spinlock};
 use kernel_intf::list::{DynList, List};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::{KError, info};
 
+use crate::io::stack::deallocate_device_resources;
 use crate::loader::{LoadedImage, load_image};
 use crate::sched::{self, cancel_irp, AsyncCtx, allocate_irp, disable_preemption, enable_preemption};
 use crate::sync::{ConfigGuard, KEvent, KSem, Once, Spinlock, semaphore_guard};
@@ -109,7 +110,8 @@ pub struct DeviceObjectK {
     // Serializes start/stop/query/enumerate/remove/add for this device.
     // Read/write mutual exclusion is left to driver writer.
     config_sem: KSem,
-    pending_irps: Spinlock<DynList<IrpPtr>>
+    pending_irps: Spinlock<DynList<IrpPtr>>,
+    resource_list: Spinlock<Option<ResList>>
 }
 
 unsafe impl Send for DeviceObjectK {}
@@ -188,6 +190,14 @@ impl DeviceObjectK {
         *slot = Some((stack, level));
     }
 
+    pub fn set_resources(&self, resource_list: ResList) {
+        *self.resource_list.lock() = Some(resource_list);
+    }
+    
+    pub fn get_resources(&self) -> Option<ResList> {
+        *self.resource_list.lock()
+    }
+
     // PDOs are created by a bus during enumerate and are always started — they
     // only carry bus resource info and never receive start/stop dispatches.
     pub fn mark_started_pdo(&self) {
@@ -241,7 +251,8 @@ impl DeviceObjectK {
 
         // PDO's are implicitly started
         let status = if !self.is_pdo() {
-            let irp = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Start, EMPTY_REGION, 0, None, false)?;
+            let res_list = self.resource_list.lock().clone().map(|r| {ReqInfo{ res_list: r }});
+            let irp = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Start, EMPTY_REGION, 0, res_list, false)?;
             if irp.status == Status::Success {
                 self.set_state(DeviceState::Started);
                 self.update_stack_state(LevelState::Started);
@@ -353,7 +364,8 @@ fn allowed_in_state(state: DeviceState, major: IrpMajor, minor: IrpMinor, is_cla
         | (IrpMajor::Open, _)
         | (IrpMajor::Close, _)                        => state == DeviceState::Started,
         (IrpMajor::Pnp, IrpMinor::Enumerate)
-        | (IrpMajor::Pnp, IrpMinor::Query)            => state == DeviceState::Started,
+        | (IrpMajor::Pnp, IrpMinor::Query)
+        | (IrpMajor::Pnp, IrpMinor::Resources)        => state == DeviceState::Started,
         (IrpMajor::Pnp, IrpMinor::Start)              => state == DeviceState::Stopped,
         (IrpMajor::Pnp, IrpMinor::Stop)               => state == DeviceState::Stopping,
         (IrpMajor::Pnp, IrpMinor::Remove)             => state == DeviceState::Removing,
@@ -483,7 +495,8 @@ fn create_root_device() -> DeviceHandleK {
             children: Spinlock::new(Vec::new()),
             stack: Spinlock::new(None),
             config_sem: KSem::new(1, 1),
-            pending_irps: Spinlock::new(List::new())
+            pending_irps: Spinlock::new(List::new()),
+            resource_list: Spinlock::new(None)
         },
         PoolAllocatorGlobal
     );
@@ -637,7 +650,8 @@ pub extern "C" fn io_create_device(
             children: Spinlock::new(Vec::new()),
             stack: Spinlock::new(None),
             config_sem: KSem::new(1, 1),
-            pending_irps: Spinlock::new(List::new())
+            pending_irps: Spinlock::new(List::new()),
+            resource_list: Spinlock::new(None)
         },
         PoolAllocatorGlobal
     );
@@ -743,6 +757,8 @@ pub fn remove_device(dev: &DeviceObjectK) {
             parent.children.lock().retain(|&c| c != dev.id);
         }
     }
+
+    deallocate_device_resources(dev);
 
     // Remove device from driver
     let driver = dev.driver.as_ref().expect("No driver found for device object!");

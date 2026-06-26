@@ -154,7 +154,7 @@ impl I8042Ctx {
             pending:          [PendingEntry { irp: core::ptr::null_mut(), requested: 0 }; MAX_PENDING],
             pending_len:      0,
             keystroke_handler: None,
-            interrupt_handle: InterruptHandle { irq: 0, node_ptr: 0 },
+            interrupt_handle: InterruptHandle::new()
         }
     }
 

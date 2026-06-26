@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use common::{MemoryRegion, StrRef};
-use kernel_intf::driver::{DeviceObject, EMPTY_REGION, IrpMajor, IrpMinor, Status};
+use kernel_intf::driver::{DeviceObject, EMPTY_REGION, IrpMajor, IrpMinor, MAX_RESOURCE_ENTRIES, ReqInfo, ResEntry, ResList, ResType, ResTypeDesc, Status};
 
 // Max devices a bus can report from a single Enumerate IRP. The caller
 // pre-allocates a buffer this big; the driver writes pointers and sets
@@ -15,6 +15,8 @@ use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::info;
 
 use crate::fs::{FileBuffer, open};
+use crate::hal::{allocate_vector, free_vector};
+use crate::io::DeviceObjectK;
 use crate::sync::{KSem, Once, Spinlock, semaphore_guard};
 
 use super::driver::{
@@ -451,6 +453,14 @@ fn continue_stack(stack: &Arc<DeviceStack>, from_level: usize) {
         fdo.set_stack(stack.clone(), level);
         stack.set_level_device(level, fdo_id);
 
+        // Allocate the resources once for the device stack
+        // and issue it to the lowest device on the stack
+        // id = 0 refers to the root device
+        if level == 0 && parent.id() != 0 {
+            get_resources(&parent, &fdo);
+            allocate_device_resources(&fdo);
+        }
+
         if fdo.start() != Ok(Status::Success) {
             info!("stack '{}': start failed at level {} ('{}')", stack.match_id(), level, name);
             stack.set_level_state(level, LevelState::Failed);
@@ -464,6 +474,71 @@ fn continue_stack(stack: &Arc<DeviceStack>, from_level: usize) {
     }
 
     crate::io_log!("stack '{}' fully loaded", stack.match_id());
+}
+
+fn get_resources(parent: &DeviceHandleK, dev: &DeviceHandleK) {
+    let mut res_entries: [ResEntry; MAX_RESOURCE_ENTRIES] = [ResEntry::default(); MAX_RESOURCE_ENTRIES];
+    
+    let req_info = ReqInfo {
+        res_list: ResList {
+            base: res_entries.as_mut_ptr(),
+            count: MAX_RESOURCE_ENTRIES
+        }
+    };
+    
+    let res = io_request_sync(
+        parent, 
+        IrpMajor::Pnp, 
+        IrpMinor::Resources, 
+        EMPTY_REGION, 
+        0, 
+        Some(req_info), 
+        false
+    );
+
+    if res.is_err() {
+        return;
+    }
+
+    let res = res.unwrap();
+    if res.status != Status::Success {
+        return;
+    }
+
+    dev.set_resources(unsafe { res.req_info.res_list });
+}
+
+pub fn allocate_device_resources(dev: &DeviceHandleK) {
+    if let Some(res_list) = dev.get_resources() {
+        let res_slice = unsafe { core::slice::from_raw_parts_mut(res_list.base, res_list.count) };
+        
+        // For now, we only allocate the interrupt vectors
+        // Rest of the resources is assumed to have been mapped by the firmware
+        for entry in res_slice {
+            match entry.res_type {
+                ResType::Interrupt => {
+                    let vector = allocate_vector();
+                    entry.desc.interrupt.vector = vector;
+                },
+                _ => {}
+            }
+        }
+    }
+}
+
+pub fn deallocate_device_resources(dev: &DeviceObjectK) {
+    if let Some(res_list) = dev.get_resources() {
+        let res_slice = unsafe { core::slice::from_raw_parts_mut(res_list.base, res_list.count) };
+        
+        for entry in res_slice {
+            match entry.res_type {
+                ResType::Interrupt => {
+                    free_vector(unsafe { entry.desc.interrupt.vector });
+                },
+                _ => {}
+            }
+        }
+    }
 }
 
 // Parse the bus-written enumerate buffer back into a slice of device pointers.
