@@ -5,7 +5,7 @@ IMAGE_NAME = disk-tools
 OUTPUT_DIR = output
 ENV_PLACEHOLDER = placeholder.txt
 KERN_PLACEHOLDER = kernel/placeholder_test.txt
-QEMU_CPU_ARGS_WITH_ACCEL = -M q35,accel=whpx -cpu qemu64 -smp sockets=1,cores=6,threads=2  
+QEMU_CPU_ARGS_WITH_ACCEL = -M q35,accel=kvm -cpu host
 QEMU_CPU_ARGS_WITHOUT_ACCEL = -smp sockets=1,cores=2,threads=6 -cpu Skylake-Client,+smap,+smep,+umip,+pge
 GEN_MSG = "Automatically generated file..\nDo not remove manually.."
 USERSPACE_FLAGS = ARCH=$(KERNEL_ARCH) ARCH_TARGET=$(KERNEL_TARGET_TRIPLE) USER_LINKER_SCRIPT=../$(USER_LINKER_SCRIPT) OBJDIR=../target/userspace OUTDIR=../$(OUTPUT_DIR)/bin 
@@ -67,6 +67,7 @@ build_kernel_template: config/initfs.conf
 	@echo "Building kernel..."
 	@(cd kernel && RUSTFLAGS="$(KERNEL_FLAGS)" \
 		cargo build $(BUILD_OPTIONS) $(KERNEL_OPTIONS) \
+		-Z json-target-spec \
 		-Z build-std=core,compiler_builtins,alloc \
 		-Z build-std-features=compiler-builtins-mem \
 		--target ../$(KERNEL_TARGET) \
@@ -94,6 +95,7 @@ build_drivers: build_kernel
 			(cd $$driver_path && \
 				RUSTFLAGS="$(MODULE_FLAGS)" \
 				cargo build $(BUILD_OPTIONS) \
+				-Z json-target-spec \
 				-Z build-std=core,compiler_builtins,alloc \
 				-Z build-std-features=compiler-builtins-mem \
 				--target ../../../../$(KERNEL_TARGET)); \
@@ -111,6 +113,7 @@ build_modules: build_kernel
 			(cd "$$module_path" && \
 				RUSTFLAGS="$(MODULE_FLAGS)" \
 				cargo build $(BUILD_OPTIONS) \
+				-Z json-target-spec \
 				-Z build-std=core,compiler_builtins,alloc \
 				-Z build-std-features=compiler-builtins-mem \
 				--target ../../$(KERNEL_TARGET)); \
@@ -129,7 +132,7 @@ run_unit_test: build_kernel_test
 
 test:
 	@echo "Starting simulator..."
-	@qemu-system-x86_64 $(QEMU_CPU_ARGS_WITHOUT_ACCEL) \
+	@qemu-system-x86_64 $(QEMU_CPU_ARGS_WITH_ACCEL) \
 	-drive if=pflash,format=raw,readonly=on,file=scripts/OVMF.fd \
 	-drive file=$(OUTPUT_DIR)/archis_os.img,format=raw,if=ide -m 512M -serial stdio | tee >(sed 's/\x1b\[[0-9;=]*[A-Za-z]//g' > $(OUTPUT_DIR)/con_log.txt)
 

@@ -19,5 +19,5 @@ BLR_OPTIONS = --features acpi
 ifeq ($(OS),Windows_NT)
     RUN_DOCKER_SCRIPT = @./scripts/docker.bat
 else
-    RUN_DOCKER_SCRIPT = @docker run -it --privileged -v "$$(pwd)":/workspace -w /workspace $(IMAGE_NAME) ./scripts/create_image_uefi.sh
+    RUN_DOCKER_SCRIPT = @sudo ./scripts/create_image_uefi.sh
 endif
