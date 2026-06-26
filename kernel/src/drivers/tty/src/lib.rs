@@ -18,6 +18,7 @@ use kernel_intf::mem::PoolAllocatorGlobal;
 const INPUT_BUF_SIZE: usize = 256;
 const MAX_PENDING:    usize = 16;
 const CTRL_C:         u8    = 0x1b;
+const MAX_TMP_CHARS:  usize = 16;
 
 static TTY_CREATED: AtomicUsize = AtomicUsize::new(0);
 static TTY_CTX_PTR: AtomicUsize = AtomicUsize::new(0);
@@ -178,11 +179,11 @@ fn disable_and_fail_pending(device: &DeviceObject) {
     ctx.pending_len = 0;
     let was_enabled = ctx.enabled;
     ctx.enabled = false;
-    release_spinlock(&mut ctx.lock);
 
     if was_enabled {
         disable_tty_mode();
     }
+    release_spinlock(&mut ctx.lock);
 
     for i in 0..to_fail_len {
         io_complete_irp(to_fail[i], Status::Failed);
@@ -198,10 +199,10 @@ fn dispatch_open(device: &DeviceObject, request: &mut Irp) -> Status {
         if !already_enabled {
             ctx.enabled = true;
         }
-        release_spinlock(&mut ctx.lock);
         if !already_enabled {
             enable_tty_mode();
         }
+        release_spinlock(&mut ctx.lock);
     }
     request.complete_irp(Status::Success);
     Status::Success
@@ -216,10 +217,10 @@ fn dispatch_close(device: &DeviceObject, request: &mut Irp) -> Status {
         if was_enabled {
             ctx.enabled = false;
         }
-        release_spinlock(&mut ctx.lock);
         if was_enabled {
             disable_tty_mode();
         }
+        release_spinlock(&mut ctx.lock);
     }
     request.complete_irp(Status::Success);
     Status::Success
@@ -251,6 +252,7 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
     };
 
     // Only the current foreground process group can read/write to tty (if it exists)
+    // Otherwise issue SIGTTIN to that entire process group
     if fgrp != 0 && pid != 0 && !proc_is_foreground_pgrp(pid, fgrp) {
         let caller_pgrp = proc_get_pgrp(pid);
         if caller_pgrp != 0 {
@@ -309,6 +311,7 @@ fn dispatch_write(device: &DeviceObject, request: &mut Irp) -> Status {
         release_spinlock(&mut ctx.lock);
         p
     };
+
     if fgrp != 0 && pid != 0 && !proc_is_foreground_pgrp(pid, fgrp) {
         let caller_pgrp = proc_get_pgrp(pid);
         if caller_pgrp != 0 {
@@ -338,93 +341,83 @@ fn dispatch_write(device: &DeviceObject, request: &mut Irp) -> Status {
 fn dispatch_control(device: &DeviceObject, request: &mut Irp) -> Status {
     let info: TtyControlInfo = unsafe { request.req_info.tty_control };
     let ctx = unsafe { &mut *(device.ctx as *mut TtyCtx) };
+    let cur_pid = sched_get_current_pid();
+    if cur_pid == -1 {
+        info!("Control request sent from idle task!");
+        request.complete_irp(Status::Failed);
+        return Status::Failed;
+    }
+    let cur_pid = cur_pid as usize;
+    acquire_spinlock(&mut ctx.lock);
 
     match request.minor_code {
         IrpMinor::SetForegroundPgrp => {
-            // Check caller is session leader of TTY's session (if session active)
-            let session = {
-                acquire_spinlock(&mut ctx.lock);
-                let s = ctx.job.session;
-                release_spinlock(&mut ctx.lock);
-                s
-            };
-            if session != 0 && proc_is_session_active(session) {
-                if !proc_is_session_leader(info.pid, session) {
+            let cur_session = ctx.job.session;
+
+            // Only the session leader of the controlling tty can set the foreground process group
+            // We check if the session is active since it could be case that all processes from old session are dead
+            // In this case, tty allows a new session leader to set the foreground process group
+            if cur_session != 0 {
+                if proc_is_session_active(cur_session) {
+                    if !proc_is_session_leader(cur_pid, cur_session) {
+                        info!("Process that is not session leader tried to set foreground process group!");
+                        release_spinlock(&mut ctx.lock);
+                        request.complete_irp(Status::Failed);
+                        return Status::Failed;
+                    }
+                } 
+                else {
+                    // We don't have a session that owns this tty yet, so fail the request
+                    info!("No session owns tty yet. Try issuing CTTY request first");
+                    release_spinlock(&mut ctx.lock);
                     request.complete_irp(Status::Failed);
                     return Status::Failed;
                 }
             }
 
-            let new_pgrp = if info.value != 0 { proc_get_pgrp(info.value) } else { 0 };
-
-            acquire_spinlock(&mut ctx.lock);
+            // Get the process group for the process that the caller requested
+            let new_pgrp = if info.pid != 0 { proc_get_pgrp(info.pid) } else { 0 };
             let old_pgrp = ctx.job.pgrp;
             ctx.job.pgrp = new_pgrp;
-            release_spinlock(&mut ctx.lock);
 
             if old_pgrp != 0 {
                 proc_drop_pgrp(old_pgrp);
             }
-
-            request.complete_irp(Status::Success);
-            Status::Success
-        }
+        },
         IrpMinor::SetControllingTty => {
-            let caller_session = proc_get_session(info.pid);
-            if caller_session == 0 {
+            let new_session = proc_get_session(info.pid);
+            if new_session == 0 {
+                release_spinlock(&mut ctx.lock);
                 request.complete_irp(Status::Failed);
                 return Status::Failed;
             }
-            if !proc_is_session_leader(info.pid, caller_session) {
-                proc_drop_session(caller_session);
+            let old_session = ctx.job.session;
+
+            // There must either have been no active session or the requestor must be 
+            // session leader of owning session
+            if old_session == 0 || !proc_is_session_active(old_session) ||
+            proc_is_session_leader(cur_pid, old_session) {
+                ctx.job.session = new_session;
+                proc_drop_session(old_session);
+            }
+            else {
+                // Requestor doesn't have permission to set ctty
+                info!("No permission to set ctty!");
+                release_spinlock(&mut ctx.lock);
                 request.complete_irp(Status::Failed);
                 return Status::Failed;
             }
-
-            if info.value == 1 {
-                acquire_spinlock(&mut ctx.lock);
-                if ctx.job.session == 0 {
-                    // Transfer Arc in — do not drop caller_session
-                    ctx.job.session = caller_session;
-                    release_spinlock(&mut ctx.lock);
-                } else if proc_is_session_leader(info.pid, ctx.job.session) {
-                    // Caller already owns this TTY
-                    release_spinlock(&mut ctx.lock);
-                    proc_drop_session(caller_session);
-                } else {
-                    info!("tty already owned by another session!");
-                    release_spinlock(&mut ctx.lock);
-                    proc_drop_session(caller_session);
-                    request.complete_irp(Status::Failed);
-                    return Status::Failed;
-                }
-            } else {
-                acquire_spinlock(&mut ctx.lock);
-                let old_session = ctx.job.session;
-                let old_pgrp = ctx.job.pgrp;
-                if old_session != 0 && proc_is_session_leader(info.pid, old_session) {
-                    ctx.job.session = 0;
-                    ctx.job.pgrp = 0;
-                    release_spinlock(&mut ctx.lock);
-                    proc_drop_session(old_session);
-                    if old_pgrp != 0 {
-                        proc_drop_pgrp(old_pgrp);
-                    }
-                } else {
-                    info!("Only owning session leader can unset the controlling tty!");
-                    release_spinlock(&mut ctx.lock);
-                }
-                proc_drop_session(caller_session);
-            }
-
-            request.complete_irp(Status::Success);
-            Status::Success
         }
         _ => {
-            request.complete_irp(Status::Unsupported);
-            Status::Unsupported
+            release_spinlock(&mut ctx.lock);
+            // Don't call complete_request for Status::Unsupported 
+            return Status::Unsupported;
         }
     }
+    
+    release_spinlock(&mut ctx.lock);
+    request.complete_irp(Status::Success);
+    Status::Success
 }
 
 extern "C" fn tty_cancel(dev: *const DeviceObject, irp: *mut Irp) {
@@ -458,7 +451,8 @@ fn tty_input(bytes: *const u8, count: usize) {
     }
 
     acquire_spinlock(&mut ctx.lock);
-
+    let mut tmp_buffer: [u8; MAX_TMP_CHARS] = [0; MAX_TMP_CHARS];
+    let mut tmp_offset = 0;
     for &b in slice {
         if b == CTRL_C {
             // Skip this byte stream processing and issue signal to foreground pgrp
@@ -469,7 +463,15 @@ fn tty_input(bytes: *const u8, count: usize) {
             }
             return;
         }
-        ctx.input_ring.push(b);
+        tmp_buffer[tmp_offset] = b;
+        tmp_offset += 1;
+        if tmp_offset >= MAX_TMP_CHARS {
+            break;
+        }
+    }
+
+    for idx in 0..tmp_offset {
+        ctx.input_ring.push(tmp_buffer[idx]);
     }
 
     let mut collected     = [null_mut::<Irp>(); MAX_PENDING];

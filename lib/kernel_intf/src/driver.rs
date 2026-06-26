@@ -92,8 +92,7 @@ pub struct RegisterHandlerInfo {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TtyControlInfo {
-    pub pid:   usize,
-    pub value: usize
+    pub pid:   usize
 }
 
 // Request-specific parameters placed on the IRP before dispatch.
@@ -123,7 +122,8 @@ pub struct Irp {
     pub is_cancelled: bool,
     pub cancel_routine: Option<extern "C" fn(*const DeviceObject, *mut Irp)>,
     pub cancel_lock: Lock,
-    pub thread_id: usize
+    pub thread_id: usize,
+    pub is_completed: bool
 }
 
 #[repr(C)]
@@ -176,7 +176,8 @@ impl Irp {
             is_cancelled: false,
             cancel_routine: None,
             cancel_lock,
-            thread_id
+            thread_id,
+            is_completed: false
         }
     }
 

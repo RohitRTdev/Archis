@@ -392,14 +392,9 @@ fn sys_device_control_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     // For now
     assert!(minor == IrpMinor::SetForegroundPgrp || minor == IrpMinor::SetControllingTty);
 
-    let pid = match get_current_process_id() {
-        Some(p) => p,
-        None => return E_INVALID
-    };
-
-    // For SetForegroundPgrp and SetControllingTty, the command should a value of 1 or 0
-    // To indicate whether to set/unset the pgrp/ctty    
-    let info = TtyControlInfo { pid, value: args[2] as usize };
+    // For SetForegroundPgrp and SetControllingTty, the command is the pid of process 
+    // whose process grp / session we want to set
+    let info = TtyControlInfo { pid: args[2] as usize };
     let req_info = ReqInfo { tty_control: info };
     let result = match io_request_sync(&**handle, IrpMajor::Control, minor, EMPTY_REGION, 0, Some(req_info), false) {
         Ok(r) => r,

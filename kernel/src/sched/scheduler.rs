@@ -826,6 +826,7 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
 extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
     disable_preemption();
     let status = unsafe { (*irp).status };
+    assert!(!unsafe{ (*irp).is_completed});
     crate::io_log!("io_complete: status_code {} on irp {:#X} by thread {}", status as isize, irp.addr(), unsafe{(*irp).thread_id});
     let ctx_ptr = ctx as *mut AsyncCtx;
     let ctx = unsafe { &mut *ctx_ptr };
@@ -865,6 +866,8 @@ extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
             (*irp).is_cancelled = true;
         }
     }
+
+    unsafe { (*irp).is_completed = true }
     enable_preemption();
 }
 

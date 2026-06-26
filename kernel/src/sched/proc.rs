@@ -315,7 +315,10 @@ impl Process {
     fn set_session_leader(&mut self, id: usize) -> bool {
         assert!(self.id != 0, "Attempted to change session id for system process!");
 
-        if self.session.lock().leader == Some(self.id) {
+        // If this process is already a session leader or process group leader
+        // we cannot allow it to create a new session
+        if self.session.lock().leader == Some(self.id) || 
+        self.pgroup.lock().pgid == self.id {
             return false;
         }
 
@@ -352,7 +355,7 @@ impl Process {
     fn set_pgroup_leader(&mut self, id: usize) -> bool {
         assert!(self.id != 0, "Attempted to change pgroup for system process!");
 
-        // This process is already part of a different pgrp
+        // This process is already process group leader (pgid == process id)
         if self.pgroup.lock().pgid == self.id {
             return false;
         }

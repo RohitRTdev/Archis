@@ -37,6 +37,18 @@ Free-list allocator backed by `sys_allocate_memory` / `sys_deallocate_memory`. R
 
 Return values follow POSIX: 0 on success, positive error code (`EINVAL`, `EBUSY`, `ENOMEM`, `ETIMEDOUT`) on failure.
 
+## `<pthread.h>` — Thread lifecycle
+
+**Thread management:** `pthread_create`, `pthread_join`, `pthread_detach`, `pthread_exit`, `pthread_self`, `pthread_equal`
+
+**Attribute stubs:** `pthread_attr_init`, `pthread_attr_destroy` (no-ops; thread attributes are not yet supported)
+
+## `<signal.h>` — Signal handlers
+
+`set_signal_handler(signal, handler, user_ctx)` — registers a user-level signal handler. Internally allocates a libc context struct (holding the handler pointer and `user_ctx`), then registers an asm trampoline with the kernel via `sys_set_signal_handler`. When the signal fires, the trampoline recovers the libc context from `[rsp-8]` (placed there by the kernel), calls `handler(user_ctx)`, frees the libc context, and calls `sys_sigreturn`. Callers do **not** call `sys_sigreturn` themselves.
+
+Signal numbers: `SIGINT (0)`, `SIGFPE (1)`, `SIGSEGV (2)`, `SIGILL (3)`, `SIGKILL (4)`, `SIGTTIN (5)`
+
 ## `<semaphore.h>` — POSIX semaphores
 
 `sem_init`, `sem_destroy`, `sem_wait`, `sem_post`, `sem_trywait`
@@ -45,9 +57,11 @@ Direct wrappers over the kernel `SYNC_SEMAPHORE` primitive. `sem_init` ignores t
 
 ## `<sys/syscall.h>` — Kernel syscall wrappers
 
-`sys_print`, `sys_delay_ms`, `sys_close`, `sys_create_process`, `sys_create_thread`, `sys_resume_process`, `sys_set_session_leader`, `sys_get_pid`, `sys_get_process_info`, `sys_allocate_memory`, `sys_deallocate_memory`
+`sys_print`, `sys_delay_ms`, `sys_close`, `sys_create_process`, `sys_create_thread`, `sys_exit_thread`, `sys_resume_process`, `sys_set_session_leader`, `sys_get_pid`, `sys_get_process_info`, `sys_get_tid`, `sys_get_thread_info`, `sys_allocate_memory`, `sys_deallocate_memory`, `sys_set_signal_handler`, `sys_sigreturn`
 
 **Sync primitives:** `sys_create_sync_object(type, init_count, max_count, auto_reset)`, `sys_wait(fd, timeout_ms)`, `sys_signal(fd)` — `type` is `SYNC_SEMAPHORE` or `SYNC_EVENT`. `timeout_ms = -1` waits indefinitely; `timeout_ms = 0` is a non-blocking poll that returns `E_TIMEOUT` if the object is not immediately available.
+
+**Thread info:** `sys_get_tid()` returns the calling thread's TID. `sys_get_thread_info(handle, thread_info_t *out)` fills a `thread_info_t` (`id`, `exit_code`) from a thread handle.
 
 **Time:** `sys_get_time_ms(uint64_t *out)` — writes milliseconds since boot to `*out`
 
