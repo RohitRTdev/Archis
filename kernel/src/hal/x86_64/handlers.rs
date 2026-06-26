@@ -270,15 +270,12 @@ pub fn allocate_vector() -> usize {
     panic!("Out of available vectors!");
 }
 
+#[unsafe(no_mangle)]
 extern "C" fn allocate_vector_ffi() -> usize {
     allocate_vector()
 }
 
-extern "C" fn free_vector_ffi(vector: usize) {
-    free_vector(vector);
-}
-
-pub fn free_vector(vector: usize) {
+pub fn deallocate_vector(vector: usize) {
     assert!(vector >= USER_VECTOR_START && vector < MAX_INTERRUPT_VECTORS);
     let mut vec_stat = VECTOR_STATUS_TABLE.lock();
     assert!(vec_stat[vector]);

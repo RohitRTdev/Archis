@@ -23,7 +23,7 @@ use acpi_intf::*;
 
 use crate::acpica_log;
 use crate::devices::HPET;
-use crate::hal::{self, Spinlock as HalSpinlock};
+use crate::hal::{self, Spinlock as HalSpinlock, allocate_vector};
 use crate::mem::{
     allocate_memory, deallocate_memory, get_physical_address, map_memory, unmap_memory,
     PageDescriptor,
@@ -723,8 +723,10 @@ extern "C" fn AcpiOsInstallInterruptHandler(
     // context so the wrapper can look us up; the real ACPICA context is held
     // by us in SciHandler.context.
     let int_stat = hal::disable_interrupts();
+    let vector = allocate_vector();
     let kernel_handle = io_install_interrupt_handler(
-        interrupt_number as usize,
+        vector,
+        interrupt_number as isize,
         interrupt_number as usize as *mut c_void,
         sci_irq_wrapper,
         true,  // SCI is active-high

@@ -398,7 +398,9 @@ fn dispatch_control(device: &DeviceObject, request: &mut Irp) -> Status {
             if old_session == 0 || !proc_is_session_active(old_session) ||
             proc_is_session_leader(cur_pid, old_session) {
                 ctx.job.session = new_session;
-                proc_drop_session(old_session);
+                if old_session != 0 {
+                    proc_drop_session(old_session);
+                }
             }
             else {
                 // Requestor doesn't have permission to set ctty

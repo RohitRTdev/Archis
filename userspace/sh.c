@@ -22,22 +22,22 @@ int main(int argc, char* argv[]) {
     printf("Opened tty handle: %d by pid: %d\n", tty_dev, pid);
 
     if (sys_set_session_leader(-1) < 0) {
-        printf("sh: Unable to create new session!");
+        printf("sh: Unable to create new session!\n");
         return -1;
     }
 
     if (sys_device_control(tty_dev, SET_CTTY, (void*)pid) < 0) {
-        printf("sh: Unable to set controlling tty for this session!");
+        printf("sh: Unable to set controlling tty for this session!\n");
         return -1;
     } 
 
     if (sys_device_control(tty_dev, SET_FOREGROUND_PGRP, (void*)pid) < 0) {
-        printf("sh: Unable to set sh as foreground process!");
+        printf("sh: Unable to set sh as foreground process!\n");
         return -1;
     } 
 
     if (set_signal_handler(SIGINT, sigint_handler, NULL) < 0) {
-        printf("sh: Unable to set signal handler!");
+        printf("sh: Unable to set signal handler!\n");
         return -1;
     }
 

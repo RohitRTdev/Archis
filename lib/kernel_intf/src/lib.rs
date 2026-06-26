@@ -216,7 +216,8 @@ unsafe extern "C" {
 
     fn sched_delay_ms_ffi(value: usize);
     fn io_install_interrupt_handler_ffi(
-        irq: usize,
+        vector: usize,
+        irq: isize,
         context: *mut core::ffi::c_void,
         handler: InterruptRoutine,
         active_high: bool,
@@ -255,6 +256,7 @@ unsafe extern "C" {
     fn proc_issue_pgrp_ffi(val: ProcessGroupType, signal: u8);
 
     fn allocate_vector_ffi() -> usize;
+    fn allocate_vector_for_irq_ffi(irq: usize) -> usize; 
     fn free_vector_ffi(vector: usize);
 }
 
@@ -282,13 +284,14 @@ pub fn io_complete_irp(irp: *mut driver::Irp, status: driver::Status) {
 }
 
 pub fn io_install_interrupt_handler(
-    irq: usize,
+    vector: usize,
+    irq: isize,
     context: *mut core::ffi::c_void,
     handler: InterruptRoutine,
     active_high: bool,
     is_edge_triggered: bool,
 ) -> InterruptHandle {
-    unsafe { io_install_interrupt_handler_ffi(irq, context, handler, active_high, is_edge_triggered) }
+    unsafe { io_install_interrupt_handler_ffi(vector, irq, context, handler, active_high, is_edge_triggered) }
 }
 
 pub fn io_remove_interrupt_handler(handle: InterruptHandle) {
@@ -460,6 +463,10 @@ pub fn io_allocate_vector() -> usize {
 pub fn io_free_vector(vector: usize) {
     unsafe { free_vector_ffi(vector); }
 }
+
+pub fn io_allocate_vector_for_irq(irq: usize) -> usize {
+    unsafe { allocate_vector_for_irq_ffi(irq) } 
+} 
 
 #[macro_export]
 macro_rules! run_tests {

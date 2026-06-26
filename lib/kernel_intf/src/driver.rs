@@ -52,12 +52,13 @@ impl IrpMinor {
             0 => Some(Self::None),
             1 => Some(Self::Enumerate),
             2 => Some(Self::Query),
-            3 => Some(Self::Start),
-            4 => Some(Self::Stop),
-            5 => Some(Self::Remove),
-            6 => Some(Self::RegisterKeyboardHandler),
-            7 => Some(Self::SetForegroundPgrp),
-            8 => Some(Self::SetControllingTty),
+            3 => Some(Self::Resources),
+            4 => Some(Self::Start),
+            5 => Some(Self::Stop),
+            6 => Some(Self::Remove),
+            7 => Some(Self::RegisterKeyboardHandler),
+            8 => Some(Self::SetForegroundPgrp),
+            9 => Some(Self::SetControllingTty),
             _ => None
         }
     }

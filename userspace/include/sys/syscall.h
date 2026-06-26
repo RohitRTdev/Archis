@@ -61,8 +61,8 @@ typedef enum {
     CLOCK_WALL_TIME = 1
 } clock_type_t;
 
-#define SET_FOREGROUND_PGRP (7)
-#define SET_CTTY (8)
+#define SET_FOREGROUND_PGRP (8)
+#define SET_CTTY (9)
 
 
 typedef struct {

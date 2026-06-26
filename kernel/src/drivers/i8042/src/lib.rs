@@ -6,12 +6,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_intf::{
-    info, debug,
-    Lock, InterruptHandle,
-    create_spinlock, acquire_spinlock, release_spinlock,
-    io_complete_irp, io_set_cancel_routine, io_start_processing,
-    io_install_interrupt_handler, io_remove_interrupt_handler,
-    io_create_driver_worker
+    InterruptHandle, Lock, acquire_spinlock, create_spinlock, debug, info, io_allocate_vector_for_irq, io_complete_irp, io_create_driver_worker, io_free_vector, io_install_interrupt_handler, io_remove_interrupt_handler, io_set_cancel_routine, io_start_processing, release_spinlock
 };
 use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
@@ -139,7 +134,8 @@ struct I8042Ctx {
     pending:          [PendingEntry; MAX_PENDING],
     pending_len:      usize,
     keystroke_handler: Option<RegisterHandlerInfo>,
-    interrupt_handle: InterruptHandle
+    interrupt_handle: InterruptHandle,
+    vector:           usize
 }
 
 unsafe impl Send for I8042Ctx {}
@@ -154,7 +150,8 @@ impl I8042Ctx {
             pending:          [PendingEntry { irp: core::ptr::null_mut(), requested: 0 }; MAX_PENDING],
             pending_len:      0,
             keystroke_handler: None,
-            interrupt_handle: InterruptHandle::new()
+            interrupt_handle: InterruptHandle::new(),
+            vector:           0 
         }
     }
 
@@ -227,6 +224,7 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
     ctx.ks_ring    = RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 });
     ctx.sc_pending = RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 });
     ctx.pending_len = 0;
+    ctx.vector = io_allocate_vector_for_irq(1); 
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -243,7 +241,7 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
         }
     }
 
-    ctx.interrupt_handle = io_install_interrupt_handler(1, device.ctx, keyboard_isr, true, true);
+    ctx.interrupt_handle = io_install_interrupt_handler(ctx.vector, 1, device.ctx, keyboard_isr, true, true);
 
     request.complete_irp(Status::Success);
     Status::Success
@@ -255,6 +253,7 @@ fn do_stop(device: &DeviceObject, request: &mut Irp) -> Status {
     let ctx = unsafe { &mut *(device.ctx as *mut I8042Ctx) };
 
     io_remove_interrupt_handler(ctx.interrupt_handle);
+    io_free_vector(ctx.vector);
 
     let mut to_fail = [core::ptr::null_mut::<Irp>(); MAX_PENDING];
     let to_fail_len;

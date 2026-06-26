@@ -4,7 +4,7 @@ use core::ptr::NonNull;
 use kernel_intf::list::{DynList, List, ListNode};
 use kernel_intf::{InterruptHandle, InterruptRoutine, debug};
 use crate::Spinlock;
-use crate::hal::{disable_interrupts, enable_interrupts, register_interrupt_handler, unregister_interrupt_handler};
+use crate::hal::{allocate_vector, disable_interrupts, enable_interrupts, deallocate_vector, register_interrupt_handler, unregister_interrupt_handler};
 
 struct InterruptDescriptor {
     context: *mut core::ffi::c_void,
@@ -56,7 +56,9 @@ pub fn install_interrupt_handler(
     active_high: bool,
     is_edge_triggered: bool,
 ) -> InterruptHandle {
+
     let descriptor = InterruptDescriptor { handler, context };
+    debug!("Installing interrupt handler {}, {}", vector, irq);
 
     let node: NonNull<ListNode<InterruptDescriptor>> = {
         let mut desc = INTERRUPT_HANDLERS.lock();
@@ -85,7 +87,7 @@ pub fn install_interrupt_handler(
     InterruptHandle {
         irq: irq as isize,
         vector,
-        node_ptr: node.as_ptr() as usize,
+        node_ptr: node.as_ptr() as usize
     }
 }
 
@@ -153,4 +155,26 @@ pub extern "C" fn io_remove_interrupt_handler_ffi(handle: InterruptHandle) {
     }
 
     enable_interrupts(int_stat);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn allocate_vector_for_irq_ffi(irq: usize) -> usize {
+    // If irq is shared, then get the vector used for it
+    // Otherwise allocate a new vector
+    let int_handlers = INTERRUPT_HANDLERS.lock();
+    match int_handlers.irq_mapping.get(&irq) {
+        Some((vector, _)) => {
+            *vector
+        },
+        None => { allocate_vector() }
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn free_vector_ffi(vector: usize) {
+    // Check if any irq is using this vector. If not, then free it
+    let int_handlers = INTERRUPT_HANDLERS.lock();
+    if !int_handlers.vector_to_irq_mapping.get(&vector).is_some() {
+        deallocate_vector(vector);
+    }
 }

@@ -5,17 +5,27 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use common::{MemoryRegion, StrRef};
-use kernel_intf::driver::{DeviceObject, EMPTY_REGION, IrpMajor, IrpMinor, MAX_RESOURCE_ENTRIES, ReqInfo, ResEntry, ResList, ResType, ResTypeDesc, Status};
+use kernel_intf::driver::{
+    DeviceObject, 
+    EMPTY_REGION, 
+    IrpMajor, 
+    IrpMinor, 
+    MAX_RESOURCE_ENTRIES, 
+    ReqInfo, 
+    ResEntry, 
+    ResList, 
+    ResType, 
+    Status
+};
 
 // Max devices a bus can report from a single Enumerate IRP. The caller
 // pre-allocates a buffer this big; the driver writes pointers and sets
 // bytes_completed.
 const MAX_ENUMERATE_DEVICES: usize = 16;
 use kernel_intf::mem::PoolAllocatorGlobal;
-use kernel_intf::info;
+use kernel_intf::{io_allocate_vector_for_irq, io_free_vector, info};
 
 use crate::fs::{FileBuffer, open};
-use crate::hal::{allocate_vector, free_vector};
 use crate::io::DeviceObjectK;
 use crate::sync::{KSem, Once, Spinlock, semaphore_guard};
 
@@ -502,6 +512,7 @@ fn get_resources(parent: &DeviceHandleK, dev: &DeviceHandleK) {
 
     let res = res.unwrap();
     if res.status != Status::Success {
+        info!("Resource information irp not supported by driver");
         return;
     }
 
@@ -517,7 +528,7 @@ pub fn allocate_device_resources(dev: &DeviceHandleK) {
         for entry in res_slice {
             match entry.res_type {
                 ResType::Interrupt => {
-                    let vector = allocate_vector();
+                    let vector = io_allocate_vector_for_irq(unsafe { entry.desc.interrupt.irq} );
                     entry.desc.interrupt.vector = vector;
                 },
                 _ => {}
@@ -533,7 +544,7 @@ pub fn deallocate_device_resources(dev: &DeviceObjectK) {
         for entry in res_slice {
             match entry.res_type {
                 ResType::Interrupt => {
-                    free_vector(unsafe { entry.desc.interrupt.vector });
+                    io_free_vector(unsafe { entry.desc.interrupt.vector });
                 },
                 _ => {}
             }
