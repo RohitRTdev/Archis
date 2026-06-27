@@ -1,11 +1,13 @@
 use core::ptr::NonNull;
-use alloc::sync::Arc;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::sync::{Arc, Weak};
 use kernel_intf::KError;
 use super::Spinlock;
 use crate::hal;
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::list::{List, DynList};
-use crate::sched::{self, KThread, SignalCause, is_preemption_enabled};
+use crate::sched::{self, Handle, KThread, SignalCause, is_preemption_enabled};
 
 pub type KSemInnerType = Arc<Spinlock<KSemInner>, PoolAllocatorGlobal>;
 
@@ -16,7 +18,16 @@ enum SemState {
 
 pub struct KSemInner {
     state: SemState,
-    blocked_list: DynList<KThread>
+    blocked_list: DynList<KThread>,
+    name: Option<String>
+}
+
+impl Drop for KSemInner {
+    fn drop(&mut self) {
+        if let Some(name) = self.name.take() {
+            NAMED_SYNC_OBJECTS.lock().remove(&name);
+        }
+    }
 }
 
 enum Wake {
@@ -273,7 +284,8 @@ impl KSem {
         Self {
             inner: Arc::new_in(Spinlock::new(KSemInner {
                 state: SemState::Semaphore { max_count, counter: init_count },
-                blocked_list: List::new()
+                blocked_list: List::new(),
+                name: None
             }), PoolAllocatorGlobal)
         }
     }
@@ -361,7 +373,8 @@ impl KEvent {
         Self {
             inner: Arc::new_in(Spinlock::new(KSemInner {
                 state: SemState::Event { signalled: false, is_auto_reset },
-                blocked_list: List::new()
+                blocked_list: List::new(),
+                name: None
             }), PoolAllocatorGlobal)
         }
     }
@@ -415,6 +428,37 @@ impl Drop for ConfigGuard<'_> {
 }
 
 pub fn semaphore_guard(sem: &KSem) -> ConfigGuard<'_> {
-    sem.wait(false);
+    let _ = sem.wait(false);
     ConfigGuard { sem }
+}
+
+type KSemWeakType = Weak<Spinlock<KSemInner>, PoolAllocatorGlobal>;
+
+static NAMED_SYNC_OBJECTS: Spinlock<BTreeMap<String, KSemWeakType>> = Spinlock::new(BTreeMap::new());
+
+pub fn register_named_sync(name: &str, inner: KSemInnerType) -> Result<(), KError> {
+    let mut map = NAMED_SYNC_OBJECTS.lock();
+    if map.contains_key(name) {
+        return Err(KError::InvalidArgument);
+    }
+    {
+        let mut guard = inner.lock();
+        assert!(guard.name.is_none());
+        guard.name = Some(name.to_string());
+    }
+    map.insert(name.to_string(), Arc::downgrade(&inner));
+    Ok(())
+}
+
+fn open_sync(name: &str, _flags: u64) -> Result<Handle, KError> {
+    let map = NAMED_SYNC_OBJECTS.lock();
+    match map.get(name).and_then(|w| w.upgrade()) {
+        Some(inner) => Ok(Handle::SyncHandle(inner)),
+        None => Err(KError::InvalidArgument)
+    }
+}
+
+pub fn init() {
+    crate::object::register_object_type("sync", open_sync)
+        .expect("sync object type already registered");
 }

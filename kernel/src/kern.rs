@@ -14,6 +14,7 @@ mod sched;
 mod fs;
 mod loader;
 mod io;
+mod object;
 mod utils;
 
 #[cfg(feature = "acpi")]
@@ -879,6 +880,7 @@ fn kern_main() -> ! {
 
     mem::reclaim_pages();
 
+    sync::init();
     sched::init();
     loader::init();
     io::init();

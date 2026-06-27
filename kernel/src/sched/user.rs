@@ -10,14 +10,14 @@ use crate::hal::{MAX_ARCH_ARGS, copy_user_memory, get_time_ms, transfer_control_
 use crate::devices::read_realtime;
 use crate::loader::load_user_image;
 use crate::mem::{self, PageDescriptor};
-use crate::io::{io_request_sync, open_device_handle};
+use crate::io::io_request_sync;
 use crate::sched::{self, Handle::{ProcessHandle, SyncHandle, ThreadHandle, DeviceHandle}};
 use crate::sync::{KEvent, KSem, do_signal, do_wait};
 use super::*;
 use kernel_intf::*;
 use kernel_intf::driver::{IrpMajor, IrpMinor, ReqInfo, TtyControlInfo, EMPTY_REGION, Status};
 
-const MAX_SYSCALLS: usize = 27;
+const MAX_SYSCALLS: usize = 26;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 const OPEN_INHERITABLE_FLAG: u64 = 1 << 0;
 const SYNC_TYPE_SEMAPHORE: u64 = 0;
@@ -30,8 +30,7 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_read_handler,
     sys_write_handler,
     sys_close_handler,
-    sys_open_file_handler,
-    sys_open_device_handler,
+    sys_open_handler,
     sys_delay_handler,
     sys_create_thread_handler,
     sys_create_process_handler,
@@ -347,35 +346,38 @@ fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     E_SUCCESS
 }
 
-// arg0 = device name C-string ptr, arg1 = flags (bit 0 = IS_INHERITABLE)
-fn sys_open_device_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    if args[0] == 0 {
+// arg0 = type C-string ptr, arg1 = name C-string ptr, arg2 = flags (bit 0 = IS_INHERITABLE)
+fn sys_open_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    if args[0] == 0 || args[1] == 0 {
         return E_INVALID;
     }
-    let len = match read_c_strlen(args[0] as usize) {
-        Some(l) => l,
+    let type_str = match read_user_string(args[0] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
         None => return E_INVALID_MEMORY_RANGE
     };
-    if len == 0 {
-        return E_INVALID;
-    }
-    let mut name_buf = vec![0u8; len];
-    if mem::copy_from_user(name_buf.as_mut_ptr(), args[0] as usize, len).is_err() {
-        return E_INVALID_MEMORY_RANGE;
-    }
-    let name = match String::from_utf8(name_buf) {
-        Ok(s) => s,
-        Err(_) => return E_INVALID
+    let name_str = match read_user_string(args[1] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
     };
-    let is_inheritable = args[1] & OPEN_INHERITABLE_FLAG != 0;
-    match open_device_handle(&name) {
-        Ok(handle) => add_new_handle(DeviceHandle(handle), is_inheritable) as i64,
+    let is_inheritable = args[2] & OPEN_INHERITABLE_FLAG != 0;
+    match crate::object::open_object(&type_str, &name_str, args[2]) {
+        Ok(handle) => add_new_handle(handle, is_inheritable) as i64,
         Err(e) => e.into()
     }
 }
 
-fn sys_open_file_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    E_INVALID
+fn read_user_string(ptr: usize) -> Option<String> {
+    let len = read_c_strlen(ptr)?;
+    if len == 0 {
+        return Some(String::new());
+    }
+    let mut buf = vec![0u8; len];
+    if mem::copy_from_user(buf.as_mut_ptr(), ptr, len).is_err() {
+        return None;
+    }
+    String::from_utf8(buf).ok()
 }
 
 // arg0 = device handle, arg1 = minor code, arg2 = command (Depends on the minor code)
@@ -714,6 +716,7 @@ fn sys_sigreturn_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 }
 
 // arg0 = sync type, arg1 = init count, arg2 = max count, arg3 = auto reset, arg4 = is inheritable
+// arg5 = name C-string ptr (0 or ptr to empty string = anonymous)
 fn sys_create_sync_object_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     if args[0] == SYNC_TYPE_SEMAPHORE && args[2] == 0 {
         // max count cannot be zero
@@ -730,11 +733,23 @@ fn sys_create_sync_object_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 
     let obj = if args[0] == SYNC_TYPE_SEMAPHORE {
-        KSem::new(args[1] as isize, args[2] as isize).inner()   
+        KSem::new(args[1] as isize, args[2] as isize).inner()
     }
     else {
         KEvent::new(args[3] == 1).inner()
     };
+
+    if args[5] != 0 {
+        let name = match read_user_string(args[5] as usize) {
+            Some(s) => s,
+            None => return E_INVALID_MEMORY_RANGE
+        };
+        if !name.is_empty() {
+            if let Err(e) = crate::sync::register_named_sync(&name, obj.clone()) {
+                return e.into();
+            }
+        }
+    }
 
     add_new_handle(SyncHandle(obj), args[4] == 1) as i64
 }

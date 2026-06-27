@@ -10,8 +10,7 @@ enum syscall_t {
     SYSCALL_READ,
     SYSCALL_WRITE,
     SYSCALL_CLOSE,
-    SYSCALL_OPEN_FILE,
-    SYSCALL_OPEN_DEVICE,
+    SYSCALL_OPEN,
     SYSCALL_DELAY_MS,
     SYSCALL_CREATE_THREAD,
     SYSCALL_CREATE_PROCESS,
@@ -79,7 +78,7 @@ typedef struct {
 
 syscall_status_t sys_exit(ssize_t exit_code);
 syscall_status_t sys_close(handle_t handle);
-handle_t         sys_open_device(const char *name, uint64_t flags);
+handle_t         sys_open(const char *type, const char *name, uint64_t flags);
 syscall_status_t sys_read(handle_t handle, void *buf, size_t len, size_t *bytes_read);
 syscall_status_t sys_write(handle_t handle, const void *buf, size_t len, size_t *bytes_written);
 syscall_status_t sys_delay_ms(size_t ms);
@@ -94,11 +93,13 @@ syscall_status_t sys_allocate_memory(size_t size, void **out);
 syscall_status_t sys_deallocate_memory(void *addr, size_t size);
 syscall_status_t sys_set_signal_handler(uint8_t signal, uint64_t handler_addr, void *user_ctx);
 syscall_status_t sys_sigreturn(void);
-syscall_status_t sys_create_sync_object(
+handle_t sys_create_sync_object(
     sync_type_t type,
     uint64_t init_count,
     uint64_t max_count,
-    uint8_t auto_reset
+    uint8_t auto_reset,
+    boolean_t is_inheritable,
+    const char *name
 );
 syscall_status_t sys_wait(handle_t handle, ssize_t timeout);
 syscall_status_t sys_signal(handle_t handle);

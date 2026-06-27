@@ -7,8 +7,8 @@ syscall_status_t sys_exit(ssize_t exit_code) {
     return do_syscall(SYSCALL_EXIT_PROCESS, (uint64_t)exit_code, 0, 0, 0, 0, 0);
 }
 
-handle_t sys_open_device(const char *name, uint64_t flags) {
-    return do_syscall(SYSCALL_OPEN_DEVICE, (uint64_t)name, flags, 0, 0, 0, 0);
+handle_t sys_open(const char *type, const char *name, uint64_t flags) {
+    return do_syscall(SYSCALL_OPEN, (uint64_t)type, (uint64_t)name, flags, 0, 0, 0);
 }
 
 syscall_status_t sys_read(handle_t handle, void *buf, size_t len, size_t *bytes_read) {
@@ -71,13 +71,15 @@ syscall_status_t sys_sigreturn(void) {
     return do_syscall(SYSCALL_SIGRETURN, 0, 0, 0, 0, 0, 0);
 }
 
-syscall_status_t sys_create_sync_object(
-    sync_type_t type, 
-    uint64_t init_count, 
+handle_t sys_create_sync_object(
+    sync_type_t type,
+    uint64_t init_count,
     uint64_t max_count,
-    uint8_t auto_reset
+    uint8_t auto_reset,
+    boolean_t is_inheritable,
+    const char *name
 ) {
-    return do_syscall(SYSCALL_CREATE_SYNC_OBJECT, (uint64_t)type, init_count, max_count, auto_reset, 0, 0);
+    return do_syscall(SYSCALL_CREATE_SYNC_OBJECT, (uint64_t)type, init_count, max_count, auto_reset, (uint64_t)is_inheritable, (uint64_t)name);
 }
 
 syscall_status_t sys_wait(handle_t handle, ssize_t timeout) {

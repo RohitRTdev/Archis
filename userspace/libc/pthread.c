@@ -15,7 +15,7 @@ static int mutex_ensure_init(pthread_mutex_t *m) {
     if (__atomic_load_n(&m->init, __ATOMIC_ACQUIRE))
         return 0;
 
-    syscall_status_t fd = sys_create_sync_object(SYNC_SEMAPHORE, 1, 1, 0);
+    syscall_status_t fd = sys_create_sync_object(SYNC_SEMAPHORE, 1, 1, 0, 0, NULL);
     if (fd < 0)
         return ENOMEM;
 
@@ -34,7 +34,7 @@ static int mutex_ensure_init(pthread_mutex_t *m) {
 
 int pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr) {
     (void)attr;
-    syscall_status_t fd = sys_create_sync_object(SYNC_SEMAPHORE, 1, 1, 0);
+    syscall_status_t fd = sys_create_sync_object(SYNC_SEMAPHORE, 1, 1, 0, 0, NULL);
     if (fd < 0)
         return ENOMEM;
     mutex->fd   = (uint64_t)fd;
@@ -76,11 +76,11 @@ static int cond_ensure_init(pthread_cond_t *c) {
     if (__atomic_load_n(&c->init, __ATOMIC_ACQUIRE))
         return 0;
 
-    syscall_status_t sem = sys_create_sync_object(SYNC_SEMAPHORE, 0, 0x7FFFFFFF, 0);
+    syscall_status_t sem = sys_create_sync_object(SYNC_SEMAPHORE, 0, 0x7FFFFFFF, 0, 0, NULL);
     if (sem < 0)
         return ENOMEM;
 
-    syscall_status_t wlock = sys_create_sync_object(SYNC_SEMAPHORE, 1, 1, 0);
+    syscall_status_t wlock = sys_create_sync_object(SYNC_SEMAPHORE, 1, 1, 0, 0, NULL);
     if (wlock < 0) {
         sys_close((uint64_t)sem);
         return ENOMEM;
@@ -107,10 +107,10 @@ static int cond_ensure_init(pthread_cond_t *c) {
 
 int pthread_cond_init(pthread_cond_t *cond, const pthread_condattr_t *attr) {
     (void)attr;
-    syscall_status_t sem = sys_create_sync_object(SYNC_SEMAPHORE, 0, 0x7FFFFFFF, 0);
+    syscall_status_t sem = sys_create_sync_object(SYNC_SEMAPHORE, 0, 0x7FFFFFFF, 0, 0, NULL);
     if (sem < 0)
         return ENOMEM;
-    syscall_status_t wlock = sys_create_sync_object(SYNC_SEMAPHORE, 1, 1, 0);
+    syscall_status_t wlock = sys_create_sync_object(SYNC_SEMAPHORE, 1, 1, 0, 0, NULL);
     if (wlock < 0) {
         sys_close((uint64_t)sem);
         return ENOMEM;
@@ -215,7 +215,7 @@ int pthread_cond_broadcast(pthread_cond_t *cond) {
 
 int sem_init(sem_t *sem, int pshared, unsigned int value) {
     (void)pshared;
-    syscall_status_t fd = sys_create_sync_object(SYNC_SEMAPHORE, (uint64_t)value, 0x7FFFFFFF, 0);
+    syscall_status_t fd = sys_create_sync_object(SYNC_SEMAPHORE, (uint64_t)value, 0x7FFFFFFF, 0, 0, NULL);
     if (fd < 0)
         return -1;
     sem->fd   = (uint64_t)fd;

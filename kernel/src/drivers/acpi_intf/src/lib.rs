@@ -87,6 +87,14 @@ pub struct AcpiGenericAddress {
     pub address: u64
 }
 
+#[repr(C)]
+pub struct AcpiBufferRaw {
+    pub length: usize,
+    pub pointer: *mut c_void
+}
+
+pub const ACPI_ALLOCATE_BUFFER: usize = usize::MAX;
+
 #[cfg_attr(not(feature = "link-kernel"), link(name = "aris"))]
 unsafe extern "C" {
     pub fn acpica_init();
@@ -95,8 +103,16 @@ unsafe extern "C" {
     fn acpi_enter_sleep_state_ffi(sleep_state: u8) -> ACPI_STATUS;
 
     fn acpi_enumerate_devices_ffi(cb: AcpiWalkCallback, ctx: *mut c_void) -> ACPI_STATUS;
-    fn acpi_get_hid_ffi(handle: AcpiHandle, buf: *mut u8, len: usize) -> usize;
-    fn acpi_get_resources_ffi(handle: AcpiHandle, out: *mut AcpiSimpleResource, max: usize) -> usize;
+    fn acpi_get_devices_ffi(
+            hid: *const c_char,
+            user_function: Option<AcpiWalkCallback>,
+            context: *mut c_void,
+            return_value: *mut *mut c_void
+        ) -> ACPI_STATUS;
+
+    fn acpi_get_object_info_ffi(handle: AcpiHandle, ret: *mut *mut u8) -> ACPI_STATUS;
+    fn acpi_os_free_ffi(ptr: *mut c_void);
+    fn acpi_get_current_resources_ffi(handle: AcpiHandle, ret_buf: *mut AcpiBufferRaw) -> ACPI_STATUS;
 }
 
 pub fn acpi_enter_sleep_state_prep(sleep_state: u8) -> ACPI_STATUS {
@@ -111,13 +127,27 @@ pub fn acpi_enumerate_devices(cb: AcpiWalkCallback, ctx: *mut c_void) -> ACPI_ST
     unsafe { acpi_enumerate_devices_ffi(cb, ctx) }
 }
 
-pub fn acpi_get_hid(handle: AcpiHandle, buf: &mut [u8]) -> usize {
-    unsafe { acpi_get_hid_ffi(handle, buf.as_mut_ptr(), buf.len()) }
+pub fn acpi_get_devices(
+    hid: *const c_char,
+    user_function: Option<AcpiWalkCallback>,
+    context: *mut c_void,
+    return_value: *mut *mut c_void
+) -> ACPI_STATUS {
+    unsafe {acpi_get_devices_ffi(hid, user_function, context, return_value) }
 }
 
-pub fn acpi_get_resources(handle: AcpiHandle, out: *mut AcpiSimpleResource, max: usize) -> usize {
-    unsafe { acpi_get_resources_ffi(handle, out, max) }
+pub fn acpi_get_object_info(handle: AcpiHandle, ret: *mut *mut u8) -> ACPI_STATUS {
+    unsafe { acpi_get_object_info_ffi(handle, ret) }
 }
+
+pub fn acpi_os_free(ptr: *mut c_void) {
+    unsafe { acpi_os_free_ffi(ptr) }
+}
+
+pub fn acpi_get_current_resources(handle: AcpiHandle, ret_buf: *mut AcpiBufferRaw) -> ACPI_STATUS {
+    unsafe { acpi_get_current_resources_ffi(handle, ret_buf) }
+}
+
 
 pub const AE_OK: ACPI_STATUS         = 0x0000_0000;
 pub const AE_ERROR: ACPI_STATUS      = 0x0000_0001;
@@ -125,6 +155,7 @@ pub const AE_NOT_FOUND: ACPI_STATUS  = 0x0000_0005;
 pub const AE_BAD_PARAMETER: ACPI_STATUS = 0x0000_1001;
 pub const AE_TIME: ACPI_STATUS       = 0x0000_0011;
 pub const AE_SUPPORT: ACPI_STATUS    = 0x0000_001D;
+
 
 // AcpiOsInstallInterruptHandler return codes (ACPICA reads these from the
 // wrapper). 1 = interrupt was ours, 0 = pass through to next handler.

@@ -925,9 +925,15 @@ pub fn deallocate_irp(irp: *mut Irp, ctx: *mut AsyncCtx) {
     enable_preemption();
 }
 
+fn open_device_handler(name: &str, _flags: u64) -> Result<crate::sched::Handle, kernel_intf::KError> {
+    open_device_handle(name).map(crate::sched::Handle::DeviceHandle)
+}
+
 pub fn init() {
     DRIVER_LOAD_LOCK.call_once(|| KSem::new(1, 1));
     ROOT_DEVICE.call_once(create_root_device);
+    crate::object::register_object_type("device", open_device_handler)
+        .expect("device object type already registered");
 
     // Parse boot.conf and bring up every Root stack. Enumeration inside the
     // root bus drivers recursively detects and loads child stacks.

@@ -12,7 +12,7 @@ void sigint_handler(void* ctx) {
 int main(int argc, char* argv[]) {
     printf("Starting shell process!\n");
 
-    handle_t tty_dev = sys_open_device("tty", 0);
+    handle_t tty_dev = sys_open("device", "tty", 0);
     if (tty_dev < 0) {
         printf("sh: Unable to open tty device!");
         return -1;

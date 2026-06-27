@@ -1295,7 +1295,7 @@ fn init_signal_handler(task: &mut Task, signal: usize, new_schedule: bool) -> bo
         let sig_frame = task.signal_frame_init[signal]
             .as_mut().expect("signal_init set but signal frame info not available!");
         let context = if is_user {
-            create_context_from(sig_frame.handler, mapped_context_base as *mut u8, context_base,  fetch_context(), sig_frame.user_ctx.addr())
+            create_context_from(sig_frame.handler, mapped_context_base as *mut u8, context_base, task_context, sig_frame.user_ctx.addr())
         }
         else {
             create_user_context(sig_frame.handler, mapped_context_base as *mut u8, context_base, sig_frame.user_ctx.addr())
