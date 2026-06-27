@@ -1,17 +1,26 @@
 mod osl;
 mod table;
 
-pub use table::*;
+use core::ffi::c_void;
 use kernel_intf::info;
-use acpi_intf::*;
+pub use table::*;
+pub use acpi_intf::*;
 
-pub fn init() {
-    // Bring the OSL up first — ACPICA's AcpiOs* calls during the subsystem
-    // bring-up (cache creation, mutex creation, table scanning) need the
-    // work queue and bookkeeping ready.
-    osl::init();
+unsafe extern "C" {
+    fn AcpiInitializeSubsystem() -> ACPI_STATUS;
+    fn AcpiInitializeTables(initial_storage: *mut c_void, initial_table_count: u32, allow_resize: u8) -> ACPI_STATUS;
+    fn AcpiLoadTables() -> ACPI_STATUS;
+    fn AcpiEnableSubsystem(flags: u32) -> ACPI_STATUS;
+    fn AcpiInitializeObjects(flags: u32) -> ACPI_STATUS;
+    fn AcpiEnterSleepStatePrep(sleep_state: u8) -> ACPI_STATUS;
+    fn AcpiEnterSleepState(sleep_state: u8) -> ACPI_STATUS;
+}
 
+#[unsafe(no_mangle)]
+extern "C" fn acpica_init() {
     unsafe {
+        osl::init();
+
         info!("Initializing ACPI subsystem");
         let status = AcpiInitializeSubsystem();
         assert_eq!(status, AE_OK);
@@ -35,3 +44,14 @@ pub fn init() {
         info!("ACPICA fully initialised");
     }
 }
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_enter_sleep_state_prep_ffi(sleep_state: u8) -> ACPI_STATUS {
+    unsafe { AcpiEnterSleepStatePrep(sleep_state) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_enter_sleep_state_ffi(sleep_state: u8) -> ACPI_STATUS {
+    unsafe { AcpiEnterSleepState(sleep_state) }
+}
+

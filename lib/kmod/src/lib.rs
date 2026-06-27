@@ -187,11 +187,7 @@ pub fn dispatch_handler(
                 pdo: *const kernel_intf::driver::DeviceObject
             ) -> kernel_intf::driver::Status {
                 let driver = unsafe { &*driver };
-                let pdo = if pdo.is_null() {
-                    None
-                } else {
-                    Some(unsafe { &*pdo })
-                };
+                let pdo = unsafe { &*pdo };
 
                 #ident(driver, pdo)
             }

@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "acpi"
+version = "0.1.0"
+dependencies = [
+ "acpi_intf",
+ "common",
+ "kernel_intf",
+ "kmod",
+]
+
+[[package]]
 name = "acpi_intf"
 version = "0.1.0"
 

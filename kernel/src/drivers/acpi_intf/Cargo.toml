@@ -7,3 +7,6 @@ edition = "2024"
 path = "src/lib.rs"
 crate-type = ["lib"]
 
+[features]
+default = []
+link-kernel = []

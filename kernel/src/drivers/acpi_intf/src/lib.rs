@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![allow(non_camel_case_types)]
 
 use core::ffi::{c_void, c_char};
@@ -57,26 +57,21 @@ pub struct AcpiGenericAddress {
     pub address: u64
 }
 
+#[cfg_attr(not(feature = "link-kernel"), link(name = "aris"))]
 unsafe extern "C" {
-    // Init
-    pub fn AcpiInitializeSubsystem() -> ACPI_STATUS;
-    pub fn AcpiInitializeTables(initial_storage: *mut c_void, initial_table_count: u32, allow_resize: u8) -> ACPI_STATUS;
-    pub fn AcpiLoadTables() -> ACPI_STATUS;
-    pub fn AcpiEnableSubsystem(flags: u32) -> ACPI_STATUS;
-    pub fn AcpiInitializeObjects(flags: u32) -> ACPI_STATUS;
-
+    pub fn acpica_init();
+ 
     // Sleep
-    fn AcpiEnterSleepStatePrep(sleep_state: u8) -> ACPI_STATUS;  
-    fn AcpiEnterSleepState(sleep_state: u8) -> ACPI_STATUS;
+    fn acpi_enter_sleep_state_prep_ffi(sleep_state: u8) -> ACPI_STATUS;  
+    fn acpi_enter_sleep_state_ffi(sleep_state: u8) -> ACPI_STATUS;
 }
 
-
 pub fn acpi_enter_sleep_state_prep(sleep_state: u8) -> ACPI_STATUS {
-    unsafe { AcpiEnterSleepStatePrep(sleep_state) }
+    unsafe { acpi_enter_sleep_state_prep_ffi(sleep_state) }
 }  
 
 pub fn acpi_enter_sleep_state(sleep_state: u8) -> ACPI_STATUS {
-    unsafe { AcpiEnterSleepState(sleep_state) }
+    unsafe { acpi_enter_sleep_state_ffi(sleep_state) }
 }
 
 pub const AE_OK: ACPI_STATUS         = 0x0000_0000;

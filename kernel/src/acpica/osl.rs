@@ -75,7 +75,8 @@ static MMIO_MAPS: Spinlock<BTreeMap<usize, MmioMapping>> = Spinlock::new(BTreeMa
 pub type AcpiHandlerSCI = extern "C" fn(*mut c_void) -> u32;
 
 // Bring up OSL-side resources.
-pub fn init() {
+pub(super) fn init() {
+    info!("Starting OSL init");
     WORK_QUEUE.call_once(|| WorkQueue {
         queue: Spinlock::new(List::new()),
         signal: KEvent::new(true), // auto-reset

@@ -73,7 +73,7 @@ struct InitFS {
 
 static INIT_FS: Once<InitFS> = Once::new();  
 static REMAP_LIST: Spinlock<FixedList<RemapEntry, {Region2 as usize}>> = Spinlock::new(List::new());
-//#[cfg(feature = "kunit-test")]
+#[cfg(feature = "kunit-test")]
 static THREAD_DONE_SEM: Once<crate::sync::KSem> = Once::new();
 
 // Simple worker used in run_proc_thread_tests test 3.
@@ -883,8 +883,6 @@ fn kern_main() -> ! {
     loader::init();
     io::init();
 
-#[cfg(feature = "acpi")]
-    acpica::init();
     kernel_intf::run_tests!();
     info!("Launching init...");
     let init_proc = sched::create_process(

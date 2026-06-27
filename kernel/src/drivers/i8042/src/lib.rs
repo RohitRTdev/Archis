@@ -185,7 +185,7 @@ fn driver_init(driver: &mut DriverObject) -> Status {
 }
 
 #[kmod::dispatch_handler]
-fn dispatch_add(driver: &DriverObject, pdo: Option<&DeviceObject>) -> Status {
+fn dispatch_add(driver: &DriverObject, pdo: &DeviceObject) -> Status {
     let idx = DEVICE_COUNT.fetch_add(1, Ordering::Relaxed);
     let name: &'static str = alloc::boxed::Box::leak(
         alloc::format!("ps/2_port{}", idx).into_boxed_str()
@@ -194,7 +194,7 @@ fn dispatch_add(driver: &DriverObject, pdo: Option<&DeviceObject>) -> Status {
     let ctx = alloc::boxed::Box::new_in(I8042Ctx::zeroed(), PoolAllocatorGlobal);
     let ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(ctx).0 as *mut c_void;
 
-    let dev = create_device(driver, Some(name), ctx_ptr, pdo, false);
+    let dev = create_device(driver, Some(name), ctx_ptr, Some(pdo), false);
     if dev.is_null() {
         info!("i8042: create_device failed for {}", name);
         unsafe { drop(alloc::boxed::Box::from_raw_in(ctx_ptr as *mut I8042Ctx, PoolAllocatorGlobal)); }

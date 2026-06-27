@@ -127,17 +127,17 @@ fn dispatch_close(_device: &DeviceObject, req: &mut Irp) -> Status {
 }
 
 #[kmod::dispatch_handler]
-fn dispatch_add(driver: &DriverObject, pdo: Option<&DeviceObject>) -> Status {
+fn dispatch_add(driver: &DriverObject, pdo: &DeviceObject) -> Status {
     let idx  = KBD_COUNT.fetch_add(1, Ordering::Relaxed);
     let name: &'static str = alloc::boxed::Box::leak(alloc::format!("kbd{}", idx).into_boxed_str());
 
     let kbd_ctx = alloc::boxed::Box::new_in(
-        KbdCtx { ps2_dev: pdo.map(|p| p as *const _).unwrap_or(null_mut()) },
+        KbdCtx { ps2_dev: pdo as *const _ },
         PoolAllocatorGlobal
     );
     let ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(kbd_ctx).0 as *mut c_void;
 
-    let dev = create_device(driver, Some(name), ctx_ptr, pdo, false);
+    let dev = create_device(driver, Some(name), ctx_ptr, Some(pdo), false);
     if dev.is_null() {
         info!("input: create_device failed for {}", name);
         unsafe {

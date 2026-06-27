@@ -87,7 +87,7 @@ fn driver_init(driver: &mut DriverObject) -> Status {
 }
 
 #[kmod::dispatch_handler]
-fn dispatch_add(driver: &DriverObject, pdo: Option<&DeviceObject>) -> Status {
+fn dispatch_add(driver: &DriverObject, pdo: &DeviceObject) -> Status {
     if TTY_CREATED.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
         info!("tty: only one device allowed");
         return Status::Failed;
@@ -98,7 +98,7 @@ fn dispatch_add(driver: &DriverObject, pdo: Option<&DeviceObject>) -> Status {
 
     unsafe { create_spinlock(&mut (*(ctx_ptr as *mut TtyCtx)).lock); }
 
-    let dev = create_device(driver, Some("tty"), ctx_ptr, pdo, false);
+    let dev = create_device(driver, Some("tty"), ctx_ptr, Some(pdo), false);
     if dev.is_null() {
         info!("tty: create_device failed");
         unsafe {

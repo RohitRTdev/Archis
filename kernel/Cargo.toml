@@ -24,8 +24,8 @@ kunit-test = ["kernel_intf/kunit-test"]
 
 [dependencies]
 kernel_intf = {workspace = true, features = ["link-kernel"]}
+acpi_intf = {workspace = true, features = ["link-kernel"]}
 common.workspace = true
-acpi_intf.workspace = true
 kmod.workspace = true
 rustc-demangle = "*"
 

@@ -293,6 +293,7 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
 
     let driver_list_path = target_dir.join("input_driver_list.txt");
     let driver_list = fs::read_to_string(&driver_list_path).map_err(|e| e.to_string())?;
+    println!( "cargo:rerun-if-changed={}", drivers_dir.display());
     
     for driver_entry in driver_list.lines() {
         let driver_dir = drivers_dir.join(driver_entry);
@@ -312,7 +313,6 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
         let stub_path = driver_dir
             .join("src")
             .join("import_stub.rs");
-        
         let mut generated = String::new();
 
         generated.push_str(
