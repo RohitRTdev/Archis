@@ -5,7 +5,6 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use common::{PAGE_SIZE, MemoryRegion, align_up};
-use kernel_intf::KError::ProcessTerminated;
 use crate::cpu::Stack;
 use crate::hal::{MAX_ARCH_ARGS, copy_user_memory, get_time_ms, transfer_control_to_user};
 use crate::devices::read_realtime;

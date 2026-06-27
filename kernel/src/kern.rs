@@ -19,9 +19,6 @@ mod utils;
 #[cfg(feature = "acpi")]
 mod acpica;
 
-#[cfg(feature = "acpi")]
-use acpi_intf::{ACPI_SLEEP_S5, acpi_enter_sleep_state, acpi_enter_sleep_state_prep};
-
 #[cfg(feature = "kunit-test")] 
 use {
     core::sync::atomic::{AtomicUsize, AtomicBool, Ordering},

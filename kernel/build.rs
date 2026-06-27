@@ -280,16 +280,25 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
     let drivers_dir = PathBuf::from(drivers_dir);
 
     let mut dep_graph: HashMap<String, (Vec<String>, Vec<String>, Vec<String>)> = HashMap::new();
+    let manifest_dir = PathBuf::from(
+        env::var("CARGO_MANIFEST_DIR")
+            .map_err(|e| e.to_string())?,
+    );
+    let target_dir = manifest_dir
+        .parent()
+        .ok_or(
+            "Failed to determine workspace root",
+        )?
+        .join("target");
 
-    for entry in fs::read_dir(&drivers_dir)
-        .map_err(|e| e.to_string())?
-    {
-        let entry =
-            entry.map_err(|e| e.to_string())?;
-
-        let driver_dir = entry.path();
+    let driver_list_path = target_dir.join("input_driver_list.txt");
+    let driver_list = fs::read_to_string(&driver_list_path).map_err(|e| e.to_string())?;
+    
+    for driver_entry in driver_list.lines() {
+        let driver_dir = drivers_dir.join(driver_entry);
 
         if !driver_dir.is_dir() {
+            println!("cargo:warning=Skipping {} as no such directory found", driver_dir.display());
             continue;
         }
         
@@ -499,17 +508,7 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
         )?;
     }
 
-    let manifest_dir = PathBuf::from(
-        env::var("CARGO_MANIFEST_DIR")
-            .map_err(|e| e.to_string())?,
-    );
 
-    let target_dir = manifest_dir
-        .parent()
-        .ok_or(
-            "Failed to determine workspace root",
-        )?
-        .join("target");
 
     fs::create_dir_all(&target_dir)
         .map_err(|e| e.to_string())?;

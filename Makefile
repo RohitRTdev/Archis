@@ -80,6 +80,8 @@ build_kernel_template: config/initfs.conf
 	@cp config/initfs.conf $(OUTPUT_DIR)
 
 build_kernel: $(OUTPUT_DIR)
+	@mkdir -p target
+	@printf "%s\n" $(DRIVER_LIST) > target/input_driver_list.txt
 	@if [ -f "$(KERN_PLACEHOLDER)" ]; then cargo clean; fi
 	@rm -f $(KERN_PLACEHOLDER)	
 	@make build_kernel_template
