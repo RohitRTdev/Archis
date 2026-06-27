@@ -10,6 +10,36 @@ pub type ACPI_SIZE = usize;
 pub type ACPI_STRING = *const c_char;
 pub type ACPI_OSD_EXEC_CALLBACK = extern "C" fn(*mut c_void);
 
+pub type AcpiHandle = *mut c_void;
+pub type AcpiObjectType = u32;
+
+#[repr(C)]
+pub struct AcpiPnpDeviceId {
+    pub length: u32,
+    pub string: *const i8
+}
+
+#[repr(C)]
+pub struct AcpiPnpDeviceIdList {
+    count: u32,
+    list_size: u32 
+}
+
+pub type AcpiWalkCallback = unsafe extern "C" fn(
+    handle: AcpiHandle,
+    nesting_level: u32,
+    context: *mut c_void,
+    return_value: *mut *mut c_void
+) -> ACPI_STATUS;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AcpiSimpleResource {
+    pub res_type: u32,
+    pub address: u64,
+    pub length: u64
+}
+
 #[repr(C)]
 pub struct ACPI_PREDEFINED_NAMES {
     name: *const c_char,
@@ -60,18 +90,33 @@ pub struct AcpiGenericAddress {
 #[cfg_attr(not(feature = "link-kernel"), link(name = "aris"))]
 unsafe extern "C" {
     pub fn acpica_init();
- 
-    // Sleep
-    fn acpi_enter_sleep_state_prep_ffi(sleep_state: u8) -> ACPI_STATUS;  
+
+    fn acpi_enter_sleep_state_prep_ffi(sleep_state: u8) -> ACPI_STATUS;
     fn acpi_enter_sleep_state_ffi(sleep_state: u8) -> ACPI_STATUS;
+
+    fn acpi_enumerate_devices_ffi(cb: AcpiWalkCallback, ctx: *mut c_void) -> ACPI_STATUS;
+    fn acpi_get_hid_ffi(handle: AcpiHandle, buf: *mut u8, len: usize) -> usize;
+    fn acpi_get_resources_ffi(handle: AcpiHandle, out: *mut AcpiSimpleResource, max: usize) -> usize;
 }
 
 pub fn acpi_enter_sleep_state_prep(sleep_state: u8) -> ACPI_STATUS {
     unsafe { acpi_enter_sleep_state_prep_ffi(sleep_state) }
-}  
+}
 
 pub fn acpi_enter_sleep_state(sleep_state: u8) -> ACPI_STATUS {
     unsafe { acpi_enter_sleep_state_ffi(sleep_state) }
+}
+
+pub fn acpi_enumerate_devices(cb: AcpiWalkCallback, ctx: *mut c_void) -> ACPI_STATUS {
+    unsafe { acpi_enumerate_devices_ffi(cb, ctx) }
+}
+
+pub fn acpi_get_hid(handle: AcpiHandle, buf: &mut [u8]) -> usize {
+    unsafe { acpi_get_hid_ffi(handle, buf.as_mut_ptr(), buf.len()) }
+}
+
+pub fn acpi_get_resources(handle: AcpiHandle, out: *mut AcpiSimpleResource, max: usize) -> usize {
+    unsafe { acpi_get_resources_ffi(handle, out, max) }
 }
 
 pub const AE_OK: ACPI_STATUS         = 0x0000_0000;

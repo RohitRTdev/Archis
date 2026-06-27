@@ -13,7 +13,7 @@ use core::ptr::{self, read_volatile, write_volatile, NonNull};
 use core::sync::atomic::Ordering;
 
 use common::{align_down, align_up, PAGE_SIZE};
-use kernel_intf::{info, debug};
+use kernel_intf::{debug, info, io_allocate_vector_for_irq};
 use kernel_intf::list::{DynList, List, ListNodeGuard};
 use kernel_intf::mem::{Allocator, PoolAllocator, PoolAllocatorGlobal};
 use kernel_intf::{io_install_interrupt_handler, io_remove_interrupt_handler};
@@ -23,7 +23,7 @@ use acpi_intf::*;
 
 use crate::acpica_log;
 use crate::devices::HPET;
-use crate::hal::{self, Spinlock as HalSpinlock, allocate_vector};
+use crate::hal::{self, Spinlock as HalSpinlock};
 use crate::mem::{
     allocate_memory, deallocate_memory, get_physical_address, map_memory, unmap_memory,
     PageDescriptor,
@@ -724,7 +724,7 @@ extern "C" fn AcpiOsInstallInterruptHandler(
     // context so the wrapper can look us up; the real ACPICA context is held
     // by us in SciHandler.context.
     let int_stat = hal::disable_interrupts();
-    let vector = allocate_vector();
+    let vector = io_allocate_vector_for_irq(interrupt_number as usize);
     let kernel_handle = io_install_interrupt_handler(
         vector,
         interrupt_number as isize,

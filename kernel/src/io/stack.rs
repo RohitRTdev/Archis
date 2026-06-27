@@ -3,6 +3,8 @@ use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use alloc::vec;
+use alloc::boxed::Box;
 
 use common::{MemoryRegion, StrRef};
 use kernel_intf::driver::{
@@ -486,12 +488,17 @@ fn continue_stack(stack: &Arc<DeviceStack>, from_level: usize) {
     crate::io_log!("stack '{}' fully loaded", stack.match_id());
 }
 
+fn free_resource_list(res_base: *mut ResEntry) {
+    assert!(!res_base.is_null());
+    unsafe { drop(Box::from_raw(res_base)); }
+}
+
 fn get_resources(parent: &DeviceHandleK, dev: &DeviceHandleK) {
-    let mut res_entries: [ResEntry; MAX_RESOURCE_ENTRIES] = [ResEntry::default(); MAX_RESOURCE_ENTRIES];
-    
+    let box_res: Box<[ResEntry]> = vec![ResEntry::default(); MAX_RESOURCE_ENTRIES].into_boxed_slice();
+    let res_base = Box::into_raw(box_res) as *mut ResEntry;
     let req_info = ReqInfo {
         res_list: ResList {
-            base: res_entries.as_mut_ptr(),
+            base: res_base,
             count: MAX_RESOURCE_ENTRIES
         }
     };
@@ -507,11 +514,13 @@ fn get_resources(parent: &DeviceHandleK, dev: &DeviceHandleK) {
     );
 
     if res.is_err() {
+        free_resource_list(res_base);
         return;
     }
 
     let res = res.unwrap();
     if res.status != Status::Success {
+        free_resource_list(res_base);
         info!("Resource information irp not supported by driver");
         return;
     }
@@ -549,6 +558,8 @@ pub fn deallocate_device_resources(dev: &DeviceObjectK) {
                 _ => {}
             }
         }
+
+        free_resource_list(res_list.base);
     }
 }
 

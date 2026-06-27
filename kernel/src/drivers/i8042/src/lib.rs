@@ -6,18 +6,18 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_intf::{
-    InterruptHandle, Lock, acquire_spinlock, create_spinlock, debug, info, io_allocate_vector_for_irq, io_complete_irp, io_create_driver_worker, io_free_vector, io_install_interrupt_handler, io_remove_interrupt_handler, io_set_cancel_routine, io_start_processing, release_spinlock
+    InterruptHandle, Lock, acquire_spinlock, create_spinlock, debug, info, io_complete_irp, io_create_driver_worker, io_install_interrupt_handler, io_remove_interrupt_handler, io_set_cancel_routine, io_start_processing, release_spinlock
 };
 use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
-    DeviceObject, DriverObject, Irp, IrpMinor, Keystroke, RegisterHandlerInfo, Status,
+    DeviceObject, DriverObject, Irp, IrpMinor, Keystroke, RegisterHandlerInfo, ResEntry, ResType, Status,
     create_device,
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
 
-const PORT_DATA:      u16  = 0x60;
-const PORT_STATUS:    u16  = 0x64;
-const PORT_CMD:       u16  = 0x64;
+// Default PS/2 I/O ports — overridden by resource list in do_start if provided
+const DEFAULT_PORT_DATA: u16 = 0x60;
+const DEFAULT_PORT_CMD:  u16 = 0x64;
 const KS_BUF_SIZE:   usize = 64;   // Keystroke ring capacity
 const MAX_PENDING:   usize = 16;
 const SC_PENDING_SIZE: usize = 32;
@@ -101,21 +101,21 @@ unsafe fn outb(port: u16, val: u8) {
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn write_cmd(port: u16, val: u8) {
+unsafe fn write_cmd(port_cmd: u16, port: u16, val: u8) {
     unsafe {
         for _ in 0..0x10000_usize {
-            if inb(PORT_STATUS) & 0x02 == 0 { break; }
+            if inb(port_cmd) & 0x02 == 0 { break; }
         }
         outb(port, val);
     }
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn flush_obuf() {
+unsafe fn flush_obuf(port_data: u16, port_cmd: u16) {
     unsafe {
         for _ in 0..16_usize {
-            if inb(PORT_STATUS) & 0x01 == 0 { break; }
-            let _ = inb(PORT_DATA);
+            if inb(port_cmd) & 0x01 == 0 { break; }
+            let _ = inb(port_data);
         }
     }
 }
@@ -135,7 +135,8 @@ struct I8042Ctx {
     pending_len:      usize,
     keystroke_handler: Option<RegisterHandlerInfo>,
     interrupt_handle: InterruptHandle,
-    vector:           usize
+    port_data:        u16,
+    port_cmd:         u16
 }
 
 unsafe impl Send for I8042Ctx {}
@@ -151,7 +152,8 @@ impl I8042Ctx {
             pending_len:      0,
             keystroke_handler: None,
             interrupt_handle: InterruptHandle::new(),
-            vector:           0 
+            port_data:        DEFAULT_PORT_DATA,
+            port_cmd:         DEFAULT_PORT_CMD
         }
     }
 
@@ -224,24 +226,47 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
     ctx.ks_ring    = RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 });
     ctx.sc_pending = RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 });
     ctx.pending_len = 0;
-    ctx.vector = io_allocate_vector_for_irq(1); 
+
+    // Read I/O port addresses and interrupt vector from the resource list.
+    let res_list = unsafe { request.req_info.res_list };
+    let res_slice: &[ResEntry] = unsafe { core::slice::from_raw_parts(res_list.base, res_list.count) };
+    let mut irq = 0usize;
+    let mut vector = 0usize;
+    for entry in res_slice {
+        match entry.res_type {
+            ResType::Interrupt => {
+                irq    = unsafe { entry.desc.interrupt.irq };
+                vector = unsafe { entry.desc.interrupt.vector };
+            }
+            ResType::Port => {
+                let base = unsafe { entry.desc.port.base as u16 };
+                // 0x60 = data register, 0x64 = command/status register
+                if base == DEFAULT_PORT_DATA {
+                    ctx.port_data = base;
+                } else {
+                    ctx.port_cmd = base;
+                }
+            }
+            _ => {}
+        }
+    }
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        flush_obuf();
-        write_cmd(PORT_CMD, 0xAE);
-        write_cmd(PORT_DATA, 0xF4);
+        flush_obuf(ctx.port_data, ctx.port_cmd);
+        write_cmd(ctx.port_cmd, ctx.port_cmd, 0xAE);
+        write_cmd(ctx.port_cmd, ctx.port_data, 0xF4);
 
         for _ in 0..0x10000_usize {
-            if inb(PORT_STATUS) & 0x01 != 0 {
-                let ack = inb(PORT_DATA);
+            if inb(ctx.port_cmd) & 0x01 != 0 {
+                let ack = inb(ctx.port_data);
                 debug!("i8042: scan-enable ack = {:#04x}", ack);
                 break;
             }
         }
     }
 
-    ctx.interrupt_handle = io_install_interrupt_handler(ctx.vector, 1, device.ctx, keyboard_isr, true, true);
+    ctx.interrupt_handle = io_install_interrupt_handler(vector, irq as isize, device.ctx, keyboard_isr, true, true);
 
     request.complete_irp(Status::Success);
     Status::Success
@@ -253,7 +278,6 @@ fn do_stop(device: &DeviceObject, request: &mut Irp) -> Status {
     let ctx = unsafe { &mut *(device.ctx as *mut I8042Ctx) };
 
     io_remove_interrupt_handler(ctx.interrupt_handle);
-    io_free_vector(ctx.vector);
 
     let mut to_fail = [core::ptr::null_mut::<Irp>(); MAX_PENDING];
     let to_fail_len;
@@ -378,7 +402,8 @@ extern "C" fn i8042_cancel(dev: *const DeviceObject, irp: *mut Irp) {
 extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        let raw_sc = unsafe { inb(PORT_DATA) };
+        let ctx = unsafe { &mut *(ctx_ptr as *mut I8042Ctx) };
+        let raw_sc = unsafe { inb(ctx.port_data) };
         let is_release = raw_sc & 0x80 != 0;
         let scancode = raw_sc & 0x7F;
 
@@ -386,8 +411,6 @@ extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
         let ascii = if idx < SCANCODE_MAP.len() { SCANCODE_MAP[idx] } else { 0 };
 
         let ks = Keystroke { scancode, ascii, flags: if is_release {1} else {0} };
-
-        let ctx = unsafe { &mut *(ctx_ptr as *mut I8042Ctx) };
 
         acquire_spinlock(&mut ctx.lock);
         ctx.sc_pending.push(ks);
