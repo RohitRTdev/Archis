@@ -8,7 +8,7 @@ Current plan is to support x86_64 architecture for intel/amd chipsets which tran
 The build has been tested on Windows, WSL and Ubuntu, and for now, it works<br>
 Tools required
 * Rust (rustc-nightly == 1.98.0)
-* Docker
+* Docker (only required for windows)
 * Make
 * Clang
 * llvm-ar
