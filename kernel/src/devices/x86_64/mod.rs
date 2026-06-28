@@ -7,11 +7,13 @@ mod hpet;
 pub use hpet::*;
 
 pub mod ioapic;
+pub mod ec;
 
 pub fn init() {
 #[cfg(feature = "acpi")]
     {
         hpet::init();
         ioapic::early_init();
+        ec::init();
     }
 }

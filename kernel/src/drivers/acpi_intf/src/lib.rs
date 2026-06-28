@@ -32,6 +32,22 @@ pub type AcpiWalkCallback = unsafe extern "C" fn(
     return_value: *mut *mut c_void
 ) -> ACPI_STATUS;
 
+pub type AcpiAddrSpaceHandler = unsafe extern "C" fn(
+    function: u32,
+    address: ACPI_PHYSICAL_ADDRESS,
+    bit_width: u32,
+    value: *mut u64,
+    handler_ctx: *mut c_void,
+    region_ctx: *mut c_void
+) -> ACPI_STATUS;
+
+pub type AcpiAddrSpaceSetup = unsafe extern "C" fn(
+    region_handle: *mut c_void,
+    function: u32,
+    handler_ctx: *mut c_void,
+    region_ctx: *mut *mut c_void
+) -> ACPI_STATUS;
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct AcpiSimpleResource {
@@ -155,7 +171,7 @@ pub const AE_NOT_FOUND: ACPI_STATUS  = 0x0000_0005;
 pub const AE_BAD_PARAMETER: ACPI_STATUS = 0x0000_1001;
 pub const AE_TIME: ACPI_STATUS       = 0x0000_0011;
 pub const AE_SUPPORT: ACPI_STATUS    = 0x0000_001D;
-
+pub const AE_ALREADY_EXISTS: ACPI_STATUS = 0x0000_0007;
 
 // AcpiOsInstallInterruptHandler return codes (ACPICA reads these from the
 // wrapper). 1 = interrupt was ours, 0 = pass through to next handler.
@@ -174,7 +190,8 @@ pub const ACPI_OEM_ID_SIZE: usize = 6;
 pub const ACPI_OEM_TABLE_ID_SIZE: usize = 8;
 
 pub const ACPI_SLEEP_S5: u8 = 5;
-
+pub const ACPI_ADR_SPACE_EC: u8 = 3;
+ 
 // ACPI TABLES
 pub trait AcpiTable {
     const TABLE_NAME: &'static str;
@@ -200,9 +217,23 @@ pub struct AcpiTableMadt {
 }
 
 impl AcpiTable for AcpiTableHpet {
-    const TABLE_NAME: &'static str = "HPET"; 
+    const TABLE_NAME: &'static str = "HPET";
 }
 
 impl AcpiTable for AcpiTableMadt {
-    const TABLE_NAME: &'static str = "APIC"; 
+    const TABLE_NAME: &'static str = "APIC";
+}
+
+#[derive(Debug)]
+#[repr(C, packed)]
+pub struct AcpiTableEcdt {
+    pub header: AcpiTableHeader,
+    pub control: AcpiGenericAddress, // EC command/status port
+    pub data: AcpiGenericAddress,    // EC data port
+    pub uid: u32,
+    pub gpe: u8
+}
+
+impl AcpiTable for AcpiTableEcdt {
+    const TABLE_NAME: &'static str = "ECDT";
 }

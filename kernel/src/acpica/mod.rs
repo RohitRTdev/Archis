@@ -3,6 +3,7 @@ mod table;
 
 use core::ffi::{c_void, c_char};
 use kernel_intf::info;
+use crate::devices::ec;
 pub use table::*;
 pub use acpi_intf::*;
 
@@ -25,6 +26,14 @@ unsafe extern "C" {
     fn AcpiGetObjectInfo(object: *mut c_void, return_buffer: *mut *mut u8) -> ACPI_STATUS;
     fn AcpiGetCurrentResources(device_handle: *mut c_void, ret_buffer: *mut AcpiBufferRaw) -> ACPI_STATUS;
     fn AcpiOsFree(memory: *mut c_void);
+
+    fn AcpiInstallAddressSpaceHandler(
+        device: AcpiHandle,
+        space_id: u8,
+        handler: Option<AcpiAddrSpaceHandler>,
+        setup: Option<AcpiAddrSpaceSetup>,
+        context: *mut c_void,
+    ) -> ACPI_STATUS;
 }
 
 
@@ -48,6 +57,24 @@ extern "C" fn acpica_init() {
         info!("Enabling ACPI Subsystem");
         let status = AcpiEnableSubsystem(0);
         assert_eq!(status, AE_OK);
+        
+        // Install EC operation region handler before AcpiInitializeObjects so
+        // that _STA/_INI methods which read EC registers can execute without
+        // failing and causing AcpiNsGetDeviceCallback to prune device subtrees.
+        if ec::is_available() {
+            let root = usize::MAX as *mut c_void;
+            let status = AcpiInstallAddressSpaceHandler(
+                root,
+                ACPI_ADR_SPACE_EC,
+                Some(ec::ec_region_handler),
+                None,
+                core::ptr::null_mut(),
+            );
+            // AE_ALREADY_EXISTS is fine if ACPICA already claimed the space
+            assert!(status == AE_OK || status == AE_ALREADY_EXISTS,
+                "EC region handler install failed: {:#X}", status);
+            info!("EC region handler installed");
+        }
 
         info!("Initializing ACPI objects");
         let status = AcpiInitializeObjects(0);

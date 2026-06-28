@@ -23,7 +23,7 @@ use kernel_intf::driver::{
 // Max devices a bus can report from a single Enumerate IRP. The caller
 // pre-allocates a buffer this big; the driver writes pointers and sets
 // bytes_completed.
-const MAX_ENUMERATE_DEVICES: usize = 16;
+const MAX_ENUMERATE_DEVICES: usize = 128;
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::{io_allocate_vector_for_irq, io_free_vector, info};
 

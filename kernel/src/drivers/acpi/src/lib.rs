@@ -270,6 +270,9 @@ fn acpi_get_resources(
                     _ => {}
                 }
             }
+            else {
+                kernel_intf::info!("Crossing max resource descriptor count of {}", max);
+            }
 
             ptr = ptr.add(header.length as usize);
         }
@@ -360,6 +363,7 @@ unsafe extern "C" fn acpi_pdo_callback(
 ) -> u32 {
     let ctx = unsafe { &mut *(context as *mut AcpiEnumCtx) };
     if ctx.count >= ctx.max_count {
+        kernel_intf::info!("Warning: Discarding further device objects since we crossed max_count={}", ctx.max_count);
         return AE_OK;
     }
 
@@ -370,7 +374,10 @@ unsafe extern "C" fn acpi_pdo_callback(
     }
 
     let hid_str = core::str::from_utf8(&hid[..hid_len]).unwrap_or("?");
-    info!("acpi: found device HID={}", hid_str);
+    if hid_str == "PNP0303" {
+        info!("Found ps/2 kbd!");
+    }
+    //info!("acpi: found device HID={}", hid_str);
 
     let pdo_ctx = alloc::boxed::Box::new_in(
         AcpiPdoCtx { handle, hid, hid_len },
