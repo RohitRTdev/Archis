@@ -279,7 +279,7 @@ fn build_acpica(out_dir: &Path, target: &str) {
 pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
     let drivers_dir = PathBuf::from(drivers_dir);
 
-    let mut dep_graph: HashMap<String, (Vec<String>, Vec<String>, Vec<String>)> = HashMap::new();
+    let mut dep_graph: HashMap<String, (Vec<String>, Vec<String>, Vec<Vec<String>>)> = HashMap::new();
     let manifest_dir = PathBuf::from(
         env::var("CARGO_MANIFEST_DIR")
             .map_err(|e| e.to_string())?,
@@ -340,10 +340,7 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
             return Err(format!("driver.conf file for {} has invalid description field!", driver_dir.display())); 
         }
 
-        let device_stack = parse_section(&driver_conf, "DeviceStack");
-        if description.len() == 0 {
-            return Err(format!("driver.conf file for {} has invalid DeviceStack field!", driver_dir.display())); 
-        }
+        let device_stacks = parse_all_sections(&driver_conf, "DeviceStack");
 
         let driver_name = driver_dir
             .file_name()
@@ -353,7 +350,7 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
 
         dep_graph.insert(
             driver_name.clone(),
-            (imports.clone(), description, device_stack),
+            (imports.clone(), description, device_stacks),
         );
 
         if imports.is_empty() {
@@ -437,7 +434,7 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
 
     fn dfs(
         node: &str,
-        graph: &HashMap<String, (Vec<String>, Vec<String>, Vec<String>)>,
+        graph: &HashMap<String, (Vec<String>, Vec<String>, Vec<Vec<String>>)>,
         states: &mut HashMap<String, VisitState>,
         ordering: &mut Vec<String>
     ) -> Result<(), String> {
@@ -528,16 +525,15 @@ pub fn generate_import_stubs(drivers_dir: &str) -> Result<(), String> {
     // Build the description string
     // This doesn't do any validation. Any problems will only be flagged at runtime
     let mut description_contents = String::from("# Automatically generated file\n# Do not modify manually...\n\n");
-    for (_, description, device_stack) in dep_graph.values() {
+    for (_, description, device_stacks) in dep_graph.values() {
         description_contents.push_str("[description]\n");
         description_contents.push_str(description.join("\n").as_str());
         description_contents.push_str("\n\n");
-
-        if !device_stack.is_empty() {
+        for stack in device_stacks {
             description_contents.push_str("[DeviceStack]\n");
-            description_contents.push_str(device_stack.join("\n").as_str());
+            description_contents.push_str(stack.join("\n").as_str());
             description_contents.push_str("\n\n");
-        } 
+        }
     }
 
     fs::write(
@@ -563,8 +559,12 @@ fn parse_section(
         }
 
         if line.starts_with('[') && line.ends_with(']') {
-            inside_section =
-                &line[1..line.len() - 1] == section_name;
+            let name = &line[1..line.len() - 1];
+            // Stop at first match once we've already collected lines
+            if inside_section && !result.is_empty() {
+                break;
+            }
+            inside_section = name == section_name;
             continue;
         }
 
@@ -574,6 +574,44 @@ fn parse_section(
     }
 
     result
+}
+
+fn parse_all_sections(conf: &str, section_name: &str) -> Vec<Vec<String>> {
+    let mut all = Vec::new();
+    let mut current: Option<Vec<String>> = None;
+
+    for line in conf.lines() {
+        let line = line.trim();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with('[') && line.ends_with(']') {
+            let name = &line[1..line.len() - 1];
+            if let Some(section) = current.take() {
+                if !section.is_empty() {
+                    all.push(section);
+                }
+            }
+            if name == section_name {
+                current = Some(Vec::new());
+            }
+            continue;
+        }
+
+        if let Some(ref mut section) = current {
+            section.push(line.to_string());
+        }
+    }
+
+    if let Some(section) = current {
+        if !section.is_empty() {
+            all.push(section);
+        }
+    }
+
+    all
 }
 
 fn main() {

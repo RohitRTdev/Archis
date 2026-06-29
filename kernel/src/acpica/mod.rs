@@ -25,6 +25,10 @@ unsafe extern "C" {
 
     fn AcpiGetObjectInfo(object: *mut c_void, return_buffer: *mut *mut u8) -> ACPI_STATUS;
     fn AcpiGetCurrentResources(device_handle: *mut c_void, ret_buffer: *mut AcpiBufferRaw) -> ACPI_STATUS;
+    fn AcpiGetParent(object: *mut c_void, out_handle: *mut *mut c_void) -> ACPI_STATUS;
+    fn AcpiGetIrqRoutingTable(device: *mut c_void, ret_buffer: *mut AcpiBufferRaw) -> ACPI_STATUS;
+    fn AcpiGetHandle(parent: *mut c_void, pathname: *const c_char, ret_handle: *mut *mut c_void) -> ACPI_STATUS;
+    fn AcpiEvaluateObject(object: *mut c_void, pathname: *const c_char, params: *mut c_void, ret_buf: *mut AcpiBufferRaw) -> ACPI_STATUS;
     fn AcpiOsFree(memory: *mut c_void);
 
     fn AcpiInstallAddressSpaceHandler(
@@ -122,4 +126,38 @@ extern "C" fn acpi_os_free_ffi(ptr: *mut c_void) {
 #[unsafe(no_mangle)]
 extern "C" fn acpi_get_current_resources_ffi(handle: *mut c_void, ret_buf: *mut AcpiBufferRaw) -> ACPI_STATUS {
     unsafe { AcpiGetCurrentResources(handle, ret_buf) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_get_parent_ffi(object: *mut c_void, out_handle: *mut *mut c_void) -> ACPI_STATUS {
+    unsafe { AcpiGetParent(object, out_handle) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_get_irq_routing_table_ffi(device: *mut c_void, ret_buf: *mut AcpiBufferRaw) -> ACPI_STATUS {
+    unsafe { AcpiGetIrqRoutingTable(device, ret_buf) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_get_handle_ffi(parent: *mut c_void, pathname: *const c_char, ret_handle: *mut *mut c_void) -> ACPI_STATUS {
+    unsafe { AcpiGetHandle(parent, pathname, ret_handle) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_evaluate_integer_ffi(object: *mut c_void, pathname: *const c_char, return_value: *mut u64) -> ACPI_STATUS {
+    let mut buf = AcpiBufferRaw { length: ACPI_ALLOCATE_BUFFER, pointer: core::ptr::null_mut() };
+    let status = unsafe { AcpiEvaluateObject(object, pathname, core::ptr::null_mut(), &mut buf) };
+    if status != AE_OK || buf.pointer.is_null() {
+        return status;
+    }
+    let obj_type = unsafe { core::ptr::read_unaligned(buf.pointer as *const u32) };
+    let result = if obj_type == 1 {
+        // ACPI_TYPE_INTEGER: type(u32) + pad(u32) + value(u64) at offset 8
+        unsafe { *return_value = core::ptr::read_unaligned((buf.pointer as *const u8).add(8) as *const u64); }
+        AE_OK
+    } else {
+        AE_ERROR
+    };
+    unsafe { AcpiOsFree(buf.pointer); }
+    result
 }

@@ -102,7 +102,17 @@ pub struct TtyControlInfo {
 #[derive(Clone, Copy)]
 pub struct IntDesc {
     pub irq: usize,
-    pub vector: usize
+    pub vector: usize,
+    pub active_high: bool,
+    pub edge_triggered: bool
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IrqInfo {
+    pub gsi: u32,
+    pub active_high: bool,
+    pub edge_triggered: bool
 }
 
 #[repr(usize)]

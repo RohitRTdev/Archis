@@ -14,6 +14,7 @@ use kernel_intf::driver::{
     create_device,
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
+use kernel_intf::hw::{inb, outb};
 
 // Default PS/2 I/O ports — overridden by resource list in do_start if provided
 const DEFAULT_PORT_DATA: u16 = 0x60;
@@ -81,24 +82,6 @@ static SCANCODE_MAP: [u8; 128] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0,
 ];
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-    let val: u8;
-    unsafe {
-        core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack, preserves_flags));
-    }
-    val
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn outb(port: u16, val: u8) {
-    unsafe {
-        core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
-    }
-}
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn write_cmd(port_cmd: u16, port: u16, val: u8) {
@@ -232,11 +215,15 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
     let res_slice: &[ResEntry] = unsafe { core::slice::from_raw_parts(res_list.base, res_list.count) };
     let mut irq = 0usize;
     let mut vector = 0usize;
+    let mut active_high = true;
+    let mut edge_triggered = true;
     for entry in res_slice {
         match entry.res_type {
             ResType::Interrupt => {
-                irq    = unsafe { entry.desc.interrupt.irq };
-                vector = unsafe { entry.desc.interrupt.vector };
+                irq           = unsafe { entry.desc.interrupt.irq };
+                vector        = unsafe { entry.desc.interrupt.vector };
+                active_high   = unsafe { entry.desc.interrupt.active_high };
+                edge_triggered = unsafe { entry.desc.interrupt.edge_triggered };
             }
             ResType::Port => {
                 let base = unsafe { entry.desc.port.base as u16 };
@@ -266,7 +253,7 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
         }
     }
 
-    ctx.interrupt_handle = io_install_interrupt_handler(vector, irq as isize, device.ctx, keyboard_isr, true, true);
+    ctx.interrupt_handle = io_install_interrupt_handler(vector, irq as isize, device.ctx, keyboard_isr, active_high, edge_triggered);
 
     request.complete_irp(Status::Success);
     Status::Success

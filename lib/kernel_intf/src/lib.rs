@@ -9,6 +9,7 @@ pub mod mem;
 pub mod ds;
 pub use ds::list;
 pub mod driver;
+pub mod hw;
 use core::{ffi::c_void, fmt};
 use common::StrRef;
 use alloc::vec::Vec;

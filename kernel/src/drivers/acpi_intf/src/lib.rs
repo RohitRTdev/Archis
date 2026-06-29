@@ -53,7 +53,9 @@ pub type AcpiAddrSpaceSetup = unsafe extern "C" fn(
 pub struct AcpiSimpleResource {
     pub res_type: u32,
     pub address: u64,
-    pub length: u64
+    pub length: u64,
+    pub active_high: bool,
+    pub edge_triggered: bool
 }
 
 #[repr(C)]
@@ -129,6 +131,10 @@ unsafe extern "C" {
     fn acpi_get_object_info_ffi(handle: AcpiHandle, ret: *mut *mut u8) -> ACPI_STATUS;
     fn acpi_os_free_ffi(ptr: *mut c_void);
     fn acpi_get_current_resources_ffi(handle: AcpiHandle, ret_buf: *mut AcpiBufferRaw) -> ACPI_STATUS;
+    fn acpi_get_parent_ffi(object: AcpiHandle, out_handle: *mut AcpiHandle) -> ACPI_STATUS;
+    fn acpi_get_irq_routing_table_ffi(device: AcpiHandle, ret_buf: *mut AcpiBufferRaw) -> ACPI_STATUS;
+    fn acpi_get_handle_ffi(parent: AcpiHandle, pathname: *const c_char, ret_handle: *mut AcpiHandle) -> ACPI_STATUS;
+    fn acpi_evaluate_integer_ffi(object: AcpiHandle, pathname: *const c_char, return_value: *mut u64) -> ACPI_STATUS;
 }
 
 pub fn acpi_enter_sleep_state_prep(sleep_state: u8) -> ACPI_STATUS {
@@ -164,6 +170,21 @@ pub fn acpi_get_current_resources(handle: AcpiHandle, ret_buf: *mut AcpiBufferRa
     unsafe { acpi_get_current_resources_ffi(handle, ret_buf) }
 }
 
+pub fn acpi_get_parent(object: AcpiHandle, out_handle: *mut AcpiHandle) -> ACPI_STATUS {
+    unsafe { acpi_get_parent_ffi(object, out_handle) }
+}
+
+pub fn acpi_get_irq_routing_table(device: AcpiHandle, ret_buf: *mut AcpiBufferRaw) -> ACPI_STATUS {
+    unsafe { acpi_get_irq_routing_table_ffi(device, ret_buf) }
+}
+
+pub fn acpi_get_handle(parent: AcpiHandle, pathname: *const c_char, ret_handle: *mut AcpiHandle) -> ACPI_STATUS {
+    unsafe { acpi_get_handle_ffi(parent, pathname, ret_handle) }
+}
+
+pub fn acpi_evaluate_integer(object: AcpiHandle, pathname: *const c_char, return_value: *mut u64) -> ACPI_STATUS {
+    unsafe { acpi_evaluate_integer_ffi(object, pathname, return_value) }
+}
 
 pub const AE_OK: ACPI_STATUS         = 0x0000_0000;
 pub const AE_ERROR: ACPI_STATUS      = 0x0000_0001;

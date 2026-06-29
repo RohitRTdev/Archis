@@ -16,7 +16,7 @@ BOOTLOADER := uefi
 KERNEL_OPTIONS := --features acpi,stack_down
 BLR_OPTIONS := --features acpi
 NO_DOCKER := false
-DRIVER_LIST := acpi i8042 input tty
+DRIVER_LIST := acpi pci i8042 input tty
 
 ifeq ($(OS),Windows_NT)
     RUN_DOCKER_SCRIPT := @./scripts/docker.bat
