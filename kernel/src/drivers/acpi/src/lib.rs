@@ -15,7 +15,7 @@ use kernel_intf::{
     info
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
-use kernel_intf::hw::{outl, inl};
+use kernel_intf::hw::pci_cfg_read8;
 use common::MemoryRegion;
 use acpi_intf::{
     AE_OK, AcpiHandle, AcpiObjectType, AcpiPnpDeviceId, AcpiPnpDeviceIdList,
@@ -163,17 +163,6 @@ fn pack_gsi(gsi: u32, active_high: bool, edge_triggered: bool) -> u32 {
     (gsi & 0x0FFF_FFFF) | ((active_high as u32) << 28) | ((edge_triggered as u32) << 29)
 }
 
-fn acpi_pci_cfg_read32(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
-    let addr = 0x8000_0000u32
-        | ((bus as u32) << 16) | ((dev as u32) << 11)
-        | ((func as u32) << 8)  | ((off as u32) & 0xFC);
-    unsafe { outl(0xCF8, addr); inl(0xCFC) }
-}
-
-fn acpi_pci_cfg_read8(bus: u8, dev: u8, func: u8, off: u8) -> u8 {
-    let dword = acpi_pci_cfg_read32(bus, dev, func, off & !3);
-    (dword >> (((off & 3) as u32) * 8)) as u8
-}
 
 // Returns (hid_buf, hid_len, address, valid_flags) from one acpi_get_object_info call.
 fn acpi_get_device_info(handle: AcpiHandle) -> ([u8; 24], usize, u64, u16) {
@@ -626,7 +615,7 @@ unsafe extern "C" fn acpi_pdo_callback(
             let (_, _, bridge_adr, _) = acpi_get_device_info(chain[i]);
             let bridge_dev  = (bridge_adr >> 16) as u8;
             let bridge_func = (bridge_adr & 0xFF) as u8;
-            bus = acpi_pci_cfg_read8(bus, bridge_dev, bridge_func, 0x19);
+            bus = pci_cfg_read8(bus, bridge_dev, bridge_func, 0x19);
         }
 
         let child_idx = PCI_CHILD_COUNTS[rb_idx].fetch_add(1, Ordering::AcqRel);
@@ -733,7 +722,7 @@ fn do_resources(device: &DeviceObject, req: &mut Irp) -> Status {
 // Looks up IRQ routing for a PCI device. `addr = (device << 16) | function`, pin 0-3 = INTA-INTD.
 // Returns true and fills `out` if a routing entry exists; false otherwise.
 #[kmod::export]
-pub fn acpi_get_irq(pdo: *const DeviceObject, bus: u8, addr: u32, pin: u8, out: *mut IrqInfo) -> bool {
+fn acpi_get_irq(pdo: *const DeviceObject, bus: u8, addr: u32, pin: u8, out: *mut IrqInfo) -> bool {
     let ctx = unsafe { &*((*pdo).ctx as *const AcpiPdoCtx) };
     let rb_handle = ctx.handle as usize;
     let rb_count = ROOT_BRIDGE_COUNT.load(Ordering::Acquire);
@@ -764,7 +753,7 @@ pub fn acpi_get_irq(pdo: *const DeviceObject, bus: u8, addr: u32, pin: u8, out: 
 
 // Returns the base bus number and PCI segment for the root bridge identified by `pdo`.
 #[kmod::export]
-pub fn acpi_get_rb_info(pdo: *const DeviceObject, out_bus: *mut u8, out_seg: *mut u16) -> bool {
+fn acpi_get_rb_info(pdo: *const DeviceObject, out_bus: *mut u8, out_seg: *mut u16) -> bool {
     let ctx = unsafe { &*((*pdo).ctx as *const AcpiPdoCtx) };
     let rb_handle = ctx.handle as usize;
     let rb_count = ROOT_BRIDGE_COUNT.load(Ordering::Acquire);
@@ -778,6 +767,12 @@ pub fn acpi_get_rb_info(pdo: *const DeviceObject, out_bus: *mut u8, out_seg: *mu
         }
     }
     false
+}
+
+#[kmod::export]
+fn acpi_pdo_get_handle(pdo_ctx: *const c_void) -> AcpiHandle {
+    if pdo_ctx.is_null() { return core::ptr::null_mut(); }
+    unsafe { &*(pdo_ctx as *const AcpiPdoCtx) }.handle
 }
 
 #[kmod::driver_unload]

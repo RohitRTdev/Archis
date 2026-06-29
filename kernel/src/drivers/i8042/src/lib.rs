@@ -287,7 +287,9 @@ fn do_stop(device: &DeviceObject, request: &mut Irp) -> Status {
 }
 
 fn do_remove(device: &DeviceObject, request: &mut Irp) -> Status {
-    info!("i8042: remove '{}'", device.get_name().unwrap_or("?"));
+    if let Some(name) = device.get_name() {
+        unsafe { drop(alloc::boxed::Box::from_raw(name as *const str as *mut str)); }
+    }
 
     if !device.ctx.is_null() {
         unsafe {

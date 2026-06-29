@@ -48,6 +48,19 @@ pub type AcpiAddrSpaceSetup = unsafe extern "C" fn(
     region_ctx: *mut *mut c_void
 ) -> ACPI_STATUS;
 
+pub type AcpiNotifyHandler = unsafe extern "C" fn(
+    device: AcpiHandle,
+    value: u32,
+    context: *mut c_void
+);
+
+// Returns ACPI_REENABLE_GPE to re-arm the GPE, or 0 to leave it masked.
+pub type AcpiGpeHandler = unsafe extern "C" fn(
+    device: AcpiHandle,
+    gpe_number: u32,
+    context: *mut c_void
+) -> u32;
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct AcpiSimpleResource {
@@ -135,6 +148,51 @@ unsafe extern "C" {
     fn acpi_get_irq_routing_table_ffi(device: AcpiHandle, ret_buf: *mut AcpiBufferRaw) -> ACPI_STATUS;
     fn acpi_get_handle_ffi(parent: AcpiHandle, pathname: *const c_char, ret_handle: *mut AcpiHandle) -> ACPI_STATUS;
     fn acpi_evaluate_integer_ffi(object: AcpiHandle, pathname: *const c_char, return_value: *mut u64) -> ACPI_STATUS;
+
+    fn acpi_install_address_space_handler_ffi(
+        device: AcpiHandle,
+        space_id: u8,
+        handler: Option<AcpiAddrSpaceHandler>,
+        setup: Option<AcpiAddrSpaceSetup>,
+        context: *mut c_void,
+    ) -> ACPI_STATUS;
+
+    fn acpi_install_notify_handler_ffi(
+        device: AcpiHandle,
+        handler_type: u32,
+        handler: Option<AcpiNotifyHandler>,
+        context: *mut c_void,
+    ) -> ACPI_STATUS;
+
+    fn acpi_remove_address_space_handler_ffi(
+        device: AcpiHandle,
+        space_id: u8,
+        handler: Option<AcpiAddrSpaceHandler>,
+    ) -> ACPI_STATUS;
+
+    fn acpi_remove_notify_handler_ffi(
+        device: AcpiHandle,
+        handler_type: u32,
+        handler: Option<AcpiNotifyHandler>,
+    ) -> ACPI_STATUS;
+
+    fn acpi_install_gpe_handler_ffi(
+        device: AcpiHandle,
+        gpe_number: u32,
+        gpe_type: u32,
+        handler: Option<AcpiGpeHandler>,
+        context: *mut c_void,
+    ) -> ACPI_STATUS;
+
+    fn acpi_remove_gpe_handler_ffi(
+        device: AcpiHandle,
+        gpe_number: u32,
+        handler: Option<AcpiGpeHandler>,
+    ) -> ACPI_STATUS;
+
+    fn acpi_enable_gpe_ffi(device: AcpiHandle, gpe_number: u32) -> ACPI_STATUS;
+    fn acpi_disable_gpe_ffi(device: AcpiHandle, gpe_number: u32) -> ACPI_STATUS;
+    fn acpi_evaluate_void_ffi(object: AcpiHandle, pathname: *const c_char) -> ACPI_STATUS;
 }
 
 pub fn acpi_enter_sleep_state_prep(sleep_state: u8) -> ACPI_STATUS {
@@ -186,6 +244,71 @@ pub fn acpi_evaluate_integer(object: AcpiHandle, pathname: *const c_char, return
     unsafe { acpi_evaluate_integer_ffi(object, pathname, return_value) }
 }
 
+pub fn acpi_install_address_space_handler(
+    device: AcpiHandle,
+    space_id: u8,
+    handler: Option<AcpiAddrSpaceHandler>,
+    setup: Option<AcpiAddrSpaceSetup>,
+    context: *mut c_void,
+) -> ACPI_STATUS {
+    unsafe { acpi_install_address_space_handler_ffi(device, space_id, handler, setup, context) }
+}
+
+pub fn acpi_install_notify_handler(
+    device: AcpiHandle,
+    handler_type: u32,
+    handler: Option<AcpiNotifyHandler>,
+    context: *mut c_void,
+) -> ACPI_STATUS {
+    unsafe { acpi_install_notify_handler_ffi(device, handler_type, handler, context) }
+}
+
+pub fn acpi_remove_address_space_handler(
+    device: AcpiHandle,
+    space_id: u8,
+    handler: Option<AcpiAddrSpaceHandler>,
+) -> ACPI_STATUS {
+    unsafe { acpi_remove_address_space_handler_ffi(device, space_id, handler) }
+}
+
+pub fn acpi_remove_notify_handler(
+    device: AcpiHandle,
+    handler_type: u32,
+    handler: Option<AcpiNotifyHandler>,
+) -> ACPI_STATUS {
+    unsafe { acpi_remove_notify_handler_ffi(device, handler_type, handler) }
+}
+
+pub fn acpi_install_gpe_handler(
+    device: AcpiHandle,
+    gpe_number: u32,
+    gpe_type: u32,
+    handler: Option<AcpiGpeHandler>,
+    context: *mut c_void,
+) -> ACPI_STATUS {
+    unsafe { acpi_install_gpe_handler_ffi(device, gpe_number, gpe_type, handler, context) }
+}
+
+pub fn acpi_remove_gpe_handler(
+    device: AcpiHandle,
+    gpe_number: u32,
+    handler: Option<AcpiGpeHandler>,
+) -> ACPI_STATUS {
+    unsafe { acpi_remove_gpe_handler_ffi(device, gpe_number, handler) }
+}
+
+pub fn acpi_enable_gpe(device: AcpiHandle, gpe_number: u32) -> ACPI_STATUS {
+    unsafe { acpi_enable_gpe_ffi(device, gpe_number) }
+}
+
+pub fn acpi_disable_gpe(device: AcpiHandle, gpe_number: u32) -> ACPI_STATUS {
+    unsafe { acpi_disable_gpe_ffi(device, gpe_number) }
+}
+
+pub fn acpi_evaluate_void(object: AcpiHandle, pathname: *const c_char) -> ACPI_STATUS {
+    unsafe { acpi_evaluate_void_ffi(object, pathname) }
+}
+
 pub const AE_OK: ACPI_STATUS         = 0x0000_0000;
 pub const AE_ERROR: ACPI_STATUS      = 0x0000_0001;
 pub const AE_NOT_FOUND: ACPI_STATUS  = 0x0000_0005;
@@ -193,6 +316,10 @@ pub const AE_BAD_PARAMETER: ACPI_STATUS = 0x0000_1001;
 pub const AE_TIME: ACPI_STATUS       = 0x0000_0011;
 pub const AE_SUPPORT: ACPI_STATUS    = 0x0000_001D;
 pub const AE_ALREADY_EXISTS: ACPI_STATUS = 0x0000_0007;
+
+pub const ACPI_ALL_NOTIFY: u32 = 0x3;
+pub const ACPI_GPE_LEVEL_TRIGGERED: u32 = 0x08;
+pub const ACPI_REENABLE_GPE: u32 = 0x80;
 
 // AcpiOsInstallInterruptHandler return codes (ACPICA reads these from the
 // wrapper). 1 = interrupt was ours, 0 = pass through to next handler.
@@ -212,7 +339,7 @@ pub const ACPI_OEM_TABLE_ID_SIZE: usize = 8;
 
 pub const ACPI_SLEEP_S5: u8 = 5;
 pub const ACPI_ADR_SPACE_EC: u8 = 3;
- 
+
 // ACPI TABLES
 pub trait AcpiTable {
     const TABLE_NAME: &'static str;

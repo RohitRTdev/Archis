@@ -15,12 +15,9 @@ use kernel_intf::{
     info
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
-use kernel_intf::hw::{inl, outl};
+use kernel_intf::hw::{pci_cfg_read32, pci_cfg_read8, pci_cfg_read16, pci_cfg_write32};
 use common::MemoryRegion;
 use kmod::dispatch_init;
-
-const PCI_ADDR_PORT: u16 = 0xCF8;
-const PCI_DATA_PORT: u16 = 0xCFC;
 
 struct PciChildEntry {
     bus: u8,
@@ -43,41 +40,6 @@ struct PciCtx {
 unsafe impl Send for PciCtx {}
 unsafe impl Sync for PciCtx {}
 
-fn pci_cfg_read32(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
-    let addr: u32 = 0x8000_0000
-        | ((bus as u32) << 16)
-        | ((dev as u32) << 11)
-        | ((func as u32) << 8)
-        | ((off as u32) & 0xFC);
-    unsafe {
-        outl(PCI_ADDR_PORT, addr);
-        inl(PCI_DATA_PORT)
-    }
-}
-
-fn pci_cfg_read16(bus: u8, dev: u8, func: u8, off: u8) -> u16 {
-    let dword = pci_cfg_read32(bus, dev, func, off & !3);
-    let shift = ((off & 2) as u32) * 8;
-    (dword >> shift) as u16
-}
-
-fn pci_cfg_read8(bus: u8, dev: u8, func: u8, off: u8) -> u8 {
-    let dword = pci_cfg_read32(bus, dev, func, off & !3);
-    let shift = ((off & 3) as u32) * 8;
-    (dword >> shift) as u8
-}
-
-fn pci_cfg_write32(bus: u8, dev: u8, func: u8, off: u8, val: u32) {
-    let addr: u32 = 0x8000_0000
-        | ((bus as u32) << 16)
-        | ((dev as u32) << 11)
-        | ((func as u32) << 8)
-        | ((off as u32) & 0xFC);
-    unsafe {
-        outl(PCI_ADDR_PORT, addr);
-        outl(PCI_DATA_PORT, val);
-    }
-}
 
 fn hex_nibble(n: u8) -> u8 {
     if n < 10 { b'0' + n } else { b'A' + n - 10 }

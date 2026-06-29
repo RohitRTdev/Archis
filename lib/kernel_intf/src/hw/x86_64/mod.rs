@@ -1,3 +1,6 @@
+mod ec;  pub use ec::*;
+mod pci; pub use pci::*;
+
 #[inline(always)]
 pub unsafe fn inb(port: u16) -> u8 {
     let val: u8;

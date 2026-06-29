@@ -38,6 +38,42 @@ unsafe extern "C" {
         setup: Option<AcpiAddrSpaceSetup>,
         context: *mut c_void,
     ) -> ACPI_STATUS;
+
+    fn AcpiInstallNotifyHandler(
+        device: AcpiHandle,
+        handler_type: u32,
+        handler: Option<AcpiNotifyHandler>,
+        context: *mut c_void,
+    ) -> ACPI_STATUS;
+
+    fn AcpiRemoveAddressSpaceHandler(
+        device: AcpiHandle,
+        space_id: u8,
+        handler: Option<AcpiAddrSpaceHandler>,
+    ) -> ACPI_STATUS;
+
+    fn AcpiRemoveNotifyHandler(
+        device: AcpiHandle,
+        handler_type: u32,
+        handler: Option<AcpiNotifyHandler>,
+    ) -> ACPI_STATUS;
+
+    fn AcpiInstallGpeHandler(
+        device: AcpiHandle,
+        gpe_number: u32,
+        gpe_type: u32,
+        handler: Option<AcpiGpeHandler>,
+        context: *mut c_void,
+    ) -> ACPI_STATUS;
+
+    fn AcpiRemoveGpeHandler(
+        device: AcpiHandle,
+        gpe_number: u32,
+        handler: Option<AcpiGpeHandler>,
+    ) -> ACPI_STATUS;
+
+    fn AcpiEnableGpe(device: AcpiHandle, gpe_number: u32) -> ACPI_STATUS;
+    fn AcpiDisableGpe(device: AcpiHandle, gpe_number: u32) -> ACPI_STATUS;
 }
 
 
@@ -160,4 +196,85 @@ extern "C" fn acpi_evaluate_integer_ffi(object: *mut c_void, pathname: *const c_
     };
     unsafe { AcpiOsFree(buf.pointer); }
     result
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_install_address_space_handler_ffi(
+    device: AcpiHandle,
+    space_id: u8,
+    handler: Option<AcpiAddrSpaceHandler>,
+    setup: Option<AcpiAddrSpaceSetup>,
+    context: *mut c_void,
+) -> ACPI_STATUS {
+    unsafe { AcpiInstallAddressSpaceHandler(device, space_id, handler, setup, context) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_install_notify_handler_ffi(
+    device: AcpiHandle,
+    handler_type: u32,
+    handler: Option<AcpiNotifyHandler>,
+    context: *mut c_void,
+) -> ACPI_STATUS {
+    unsafe { AcpiInstallNotifyHandler(device, handler_type, handler, context) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_remove_address_space_handler_ffi(
+    device: AcpiHandle,
+    space_id: u8,
+    handler: Option<AcpiAddrSpaceHandler>,
+) -> ACPI_STATUS {
+    unsafe { AcpiRemoveAddressSpaceHandler(device, space_id, handler) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_remove_notify_handler_ffi(
+    device: AcpiHandle,
+    handler_type: u32,
+    handler: Option<AcpiNotifyHandler>,
+) -> ACPI_STATUS {
+    unsafe { AcpiRemoveNotifyHandler(device, handler_type, handler) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_install_gpe_handler_ffi(
+    device: AcpiHandle,
+    gpe_number: u32,
+    gpe_type: u32,
+    handler: Option<AcpiGpeHandler>,
+    context: *mut c_void,
+) -> ACPI_STATUS {
+    unsafe { AcpiInstallGpeHandler(device, gpe_number, gpe_type, handler, context) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_remove_gpe_handler_ffi(
+    device: AcpiHandle,
+    gpe_number: u32,
+    handler: Option<AcpiGpeHandler>,
+) -> ACPI_STATUS {
+    unsafe { AcpiRemoveGpeHandler(device, gpe_number, handler) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_enable_gpe_ffi(device: AcpiHandle, gpe_number: u32) -> ACPI_STATUS {
+    unsafe { AcpiEnableGpe(device, gpe_number) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_disable_gpe_ffi(device: AcpiHandle, gpe_number: u32) -> ACPI_STATUS {
+    unsafe { AcpiDisableGpe(device, gpe_number) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_evaluate_void_ffi(object: AcpiHandle, pathname: *const c_char) -> ACPI_STATUS {
+    unsafe {
+        AcpiEvaluateObject(
+            object,
+            pathname,
+            core::ptr::null_mut(),
+            core::ptr::null_mut()
+        )
+    }
 }
