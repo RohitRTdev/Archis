@@ -5,6 +5,7 @@ use core::ffi::{c_void, c_char};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
+use common::StrRef;
 use kernel_intf::{
     driver::{
         DeviceObject, DriverObject, Irp, IrpMinor, Status,
@@ -55,7 +56,10 @@ static ROOT_BRIDGE_SEG: [AtomicU32; MAX_ROOT_BRIDGES] =
 struct AcpiPdoCtx {
     handle: AcpiHandle,
     hid: [u8; 24],
-    hid_len: usize
+    hid_len: usize,
+    cids: [[u8; 24]; MAX_CIDS],
+    cid_lens: [usize; MAX_CIDS],
+    cid_count: usize
 }
 
 unsafe impl Send for AcpiPdoCtx {}
@@ -145,7 +149,7 @@ struct AcpiDeviceInfo {
     hardware_id: AcpiPnpDeviceId,
     _unique_id: AcpiPnpDeviceId,
     _subsystem_id: AcpiPnpDeviceId,
-    _compatible_id_list: AcpiPnpDeviceIdList
+    compatible_id_list: AcpiPnpDeviceIdList
 }
 
 // Resource type IDs from acrestyp.h
@@ -158,6 +162,8 @@ const ACPI_RESOURCE_TYPE_EXTENDED_IRQ: u32 = 15;
 
 const ACPI_VALID_HID_FLAG: u16 = 0x4;
 const ACPI_VALID_ADR_FLAG: u16 = 0x2;
+const ACPI_VALID_CID_FLAG: u16 = 0x20;
+const MAX_CIDS: usize = 8;
 
 fn pack_gsi(gsi: u32, active_high: bool, edge_triggered: bool) -> u32 {
     (gsi & 0x0FFF_FFFF) | ((active_high as u32) << 28) | ((edge_triggered as u32) << 29)
@@ -469,6 +475,7 @@ fn dispatch_pnp(device: &DeviceObject, req: &mut Irp) -> Status {
     }
 }
 
+
 fn do_start(_device: &DeviceObject, req: &mut Irp) -> Status {
     if IS_SUBSYSTEM_DEV_STARTED.load(Ordering::Acquire) {
         info!("acpi subsystem already started!");
@@ -507,6 +514,41 @@ fn do_enumerate(device: &DeviceObject, req: &mut Irp) -> Status {
     Status::Success
 }
 
+fn acpi_get_cids(
+    handle: AcpiHandle,
+    cids: &mut [[u8; 24]; MAX_CIDS],
+    cid_lens: &mut [usize; MAX_CIDS]
+) -> usize {
+    let mut info_ptr: *mut u8 = core::ptr::null_mut();
+    if acpi_get_object_info(handle, &mut info_ptr) != AE_OK || info_ptr.is_null() {
+        return 0;
+    }
+    let info = unsafe { &*(info_ptr as *const AcpiDeviceInfo) };
+    let mut count = 0usize;
+    if info.valid & ACPI_VALID_CID_FLAG != 0 {
+        let list_ptr = &info.compatible_id_list as *const AcpiPnpDeviceIdList;
+        let n = unsafe { (*list_ptr).count } as usize;
+        let ids_ptr = unsafe {
+            (list_ptr as *const u8)
+                .add(core::mem::size_of::<AcpiPnpDeviceIdList>())
+                as *const AcpiPnpDeviceId
+        };
+        for i in 0..n.min(MAX_CIDS) {
+            let cid = unsafe { &*ids_ptr.add(i) };
+            if !cid.string.is_null() {
+                let bytes = unsafe { core::ffi::CStr::from_ptr(cid.string) }.to_bytes();
+                let copy_len = bytes.len().min(23);
+                cids[i][..copy_len].copy_from_slice(&bytes[..copy_len]);
+                cids[i][copy_len] = 0;
+                cid_lens[i] = copy_len;
+                count += 1;
+            }
+        }
+    }
+    acpi_os_free(info_ptr as *mut c_void);
+    count
+}
+
 unsafe extern "C" fn acpi_pdo_callback(
     handle: *mut c_void,
     _nesting_level: u32,
@@ -528,7 +570,12 @@ unsafe extern "C" fn acpi_pdo_callback(
     if is_root_bridge {
         // Create PDO for the root bridge (PCI driver loads on top)
         let pdo_ctx = alloc::boxed::Box::new_in(
-            AcpiPdoCtx { handle, hid, hid_len },
+            AcpiPdoCtx {
+                handle, hid, hid_len,
+                cids: [[0; 24]; MAX_CIDS],
+                cid_lens: [0; MAX_CIDS],
+                cid_count: 0
+            },
             PoolAllocatorGlobal
         );
         let pdo_ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(pdo_ctx).0 as *mut c_void;
@@ -637,12 +684,14 @@ unsafe extern "C" fn acpi_pdo_callback(
         return AE_OK;
     }
 
-    if hid_str == "PNP0303" {
-        info!("Found ps/2 kbd!");
-    }
+    info!("Found pnp hid {}", hid_str);
+
+    let mut cids = [[0u8; 24]; MAX_CIDS];
+    let mut cid_lens = [0usize; MAX_CIDS];
+    let cid_count = acpi_get_cids(handle, &mut cids, &mut cid_lens);
 
     let pdo_ctx = alloc::boxed::Box::new_in(
-        AcpiPdoCtx { handle, hid, hid_len },
+        AcpiPdoCtx { handle, hid, hid_len, cids, cid_lens, cid_count },
         PoolAllocatorGlobal
     );
     let pdo_ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(pdo_ctx).0 as *mut c_void;
@@ -665,8 +714,22 @@ unsafe extern "C" fn acpi_pdo_callback(
 
 fn do_query(device: &DeviceObject, req: &mut Irp) -> Status {
     let ctx = unsafe { &*(device.ctx as *const AcpiPdoCtx) };
-    req.buffer.base_address = ctx.hid.as_ptr() as usize;
-    req.buffer.size = ctx.hid_len;
+    let sref_buf = req.buffer.base_address as *mut StrRef;
+    let max = req.buffer.size / core::mem::size_of::<StrRef>();
+    let mut count = 0usize;
+
+    if ctx.hid_len > 0 && count < max {
+        unsafe { *sref_buf.add(count) = StrRef { ptr: ctx.hid.as_ptr(), len: ctx.hid_len }; }
+        count += 1;
+    }
+    for i in 0..ctx.cid_count {
+        if count >= max { break; }
+        if ctx.cid_lens[i] > 0 {
+            unsafe { *sref_buf.add(count) = StrRef { ptr: ctx.cids[i].as_ptr(), len: ctx.cid_lens[i] }; }
+            count += 1;
+        }
+    }
+    req.bytes_completed = count * core::mem::size_of::<StrRef>();
     req.complete_irp(Status::Success);
     Status::Success
 }

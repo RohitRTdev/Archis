@@ -1074,6 +1074,19 @@ extern "C" fn AcpiOsGetLine(
 }
 
 #[unsafe(no_mangle)]
+extern "C" fn acpi_queue_work_ffi(function: ACPI_OSD_EXEC_CALLBACK, context: *mut c_void) -> bool {
+    let wq = match WORK_QUEUE.get() {
+        Some(q) => q,
+        None => return false,
+    };
+    if wq.queue.lock().add_node(WorkItem { function, context }).is_err() {
+        return false;
+    }
+    wq.signal.signal();
+    true
+}
+
+#[unsafe(no_mangle)]
 extern "C" fn AcpiOsEnterSleep(sleep_state: u8, reg_a: u32, reg_b: u32) -> ACPI_STATUS {
     // For now, we just give the green flag here
     acpica_log!("AcpiOsEnterSleep state=S{} PM1A={:#X} PM1B={:#X}", sleep_state, reg_a, reg_b);

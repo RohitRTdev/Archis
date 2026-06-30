@@ -476,6 +476,7 @@ pub fn get_device(id: usize) -> Option<DeviceHandleK> {
     DEVICE_REGISTRY.lock().get(&id).cloned()
 }
 
+
 pub fn root_device() -> DeviceHandleK {
     ROOT_DEVICE.get().expect("root device not initialized").clone()
 }

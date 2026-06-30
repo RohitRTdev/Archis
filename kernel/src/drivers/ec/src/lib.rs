@@ -13,7 +13,7 @@ use kernel_intf::hw::{inb, outb, ec_read, ec_write, ec_wait_ibf, ec_wait_obf};
 use acpi_intf::{
     AE_OK, ACPI_STATUS, ACPI_PHYSICAL_ADDRESS, AcpiHandle,
     ACPI_ADR_SPACE_EC, ACPI_ALL_NOTIFY, ACPI_GPE_LEVEL_TRIGGERED, ACPI_REENABLE_GPE,
-    acpi_evaluate_integer, acpi_evaluate_void,
+    acpi_evaluate_integer, acpi_evaluate_void, acpi_queue_work,
     acpi_install_address_space_handler, acpi_remove_address_space_handler,
     acpi_install_notify_handler, acpi_remove_notify_handler,
     acpi_install_gpe_handler, acpi_remove_gpe_handler,
@@ -216,6 +216,20 @@ unsafe extern "C" fn ec_notify_handler(
     info!("ec: notify {:#X}", value);
 }
 
+struct EcQueryWorkCtx {
+    handle: AcpiHandle,
+    method: [u8; 5]
+}
+
+unsafe impl Send for EcQueryWorkCtx {}
+
+extern "C" fn ec_query_worker(ctx: *mut c_void) {
+    let work = unsafe {
+        alloc::boxed::Box::from_raw_in(ctx as *mut EcQueryWorkCtx, PoolAllocatorGlobal)
+    };
+    acpi_evaluate_void(work.handle, work.method.as_ptr() as *const core::ffi::c_char);
+}
+
 unsafe extern "C" fn ec_gpe_handler(
     _device: AcpiHandle,
     _gpe_number: u32,
@@ -239,11 +253,17 @@ unsafe extern "C" fn ec_gpe_handler(
     let query_code = unsafe { inb(data) };
 
     if query_code != 0 {
-        let name = query_method_name(query_code);
-        acpi_evaluate_void(
-            ctx.acpi_handle,
-            name.as_ptr() as *const core::ffi::c_char
+        let method = query_method_name(query_code);
+        let work = alloc::boxed::Box::new_in(
+            EcQueryWorkCtx { handle: ctx.acpi_handle, method },
+            PoolAllocatorGlobal
         );
+        let work_ptr = alloc::boxed::Box::into_raw_with_allocator(work).0 as *mut c_void;
+        if !acpi_queue_work(ec_query_worker, work_ptr) {
+            unsafe {
+                drop(alloc::boxed::Box::from_raw_in(work_ptr as *mut EcQueryWorkCtx, PoolAllocatorGlobal));
+            }
+        }
     }
 
     ACPI_REENABLE_GPE

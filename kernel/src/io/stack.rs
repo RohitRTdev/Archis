@@ -646,39 +646,54 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
         fdo.attach_child(id);
         pdo.mark_started_pdo();
 
-        let match_id = match query_id(&pdo) {
-            Some(m) => m,
-            None => {
-                info!("PDO {} returned no id; skipping", id);
-                continue;
-            }
-        };
+        let ids = query_id(&pdo);
+        if ids.is_empty() {
+            info!("PDO {} returned no ids; skipping", id);
+            continue;
+        }
 
-        match find_descriptor(&match_id) {
-            Some(descriptor) => {
-                crate::io_log!("PDO {} matched stack '{}'", id, match_id);
-                // Each PDO is the base of its own fresh instance.
-                start_stack_instance(descriptor, pdo.clone(), true);
+        // Try to get atleast one id to match among
+        // the id(s) returned from the driver
+        for match_id in &ids {
+            match find_descriptor(match_id) {
+                Some(descriptor) => {
+                    crate::io_log!("PDO {} matched stack '{}'", id, match_id);
+                    start_stack_instance(descriptor, pdo.clone(), true);
+                    break;
+                }
+                None => { crate::io_log!("PDO {} id '{}' matched no stack", id, match_id); }
             }
-            None => { crate::io_log!("PDO {} id '{}' matched no stack", id, match_id); }
         }
     }
 }
 
-fn query_id(dev: &DeviceHandleK) -> Option<String> {
+fn query_id(dev: &DeviceHandleK) -> Vec<String> {
+    const MAX_QUERY_IDS: usize = 16;
+    let null_sref = StrRef { ptr: core::ptr::null(), len: 0 };
+    let mut buf = [null_sref; MAX_QUERY_IDS];
+    let buffer = MemoryRegion {
+        base_address: buf.as_mut_ptr() as usize,
+        size: core::mem::size_of::<[StrRef; MAX_QUERY_IDS]>()
+    };
+
     let irp = {
         let _g = dev.config_guard();
-        io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Query, EMPTY_REGION, 0, None, false).ok()?
+        match io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Query, buffer, 0, None, false) {
+            Ok(irp) => irp,
+            Err(_) => return Vec::new()
+        }
     };
+
     if irp.status != Status::Success {
-        return None;
+        return Vec::new();
     }
 
-    let sref = StrRef { ptr: irp.buffer.base_address as *const u8, len: irp.buffer.size };
-    if sref.ptr.is_null() || sref.len == 0 {
-        return None;
-    }
-    Some(unsafe { sref.as_str() }.to_string())
+    let count = irp.bytes_completed / core::mem::size_of::<StrRef>();
+    buf[..count]
+        .iter()
+        .filter(|s| !s.ptr.is_null() && s.len > 0)
+        .map(|s| unsafe { s.as_str() }.to_string())
+        .collect()
 }
 
 // Scan any currently failed to load/removed stacks

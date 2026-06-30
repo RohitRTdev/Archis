@@ -21,8 +21,8 @@ pub struct AcpiPnpDeviceId {
 
 #[repr(C)]
 pub struct AcpiPnpDeviceIdList {
-    count: u32,
-    list_size: u32 
+    pub count: u32,
+    list_size: u32
 }
 
 pub type AcpiWalkCallback = unsafe extern "C" fn(
@@ -193,6 +193,7 @@ unsafe extern "C" {
     fn acpi_enable_gpe_ffi(device: AcpiHandle, gpe_number: u32) -> ACPI_STATUS;
     fn acpi_disable_gpe_ffi(device: AcpiHandle, gpe_number: u32) -> ACPI_STATUS;
     fn acpi_evaluate_void_ffi(object: AcpiHandle, pathname: *const c_char) -> ACPI_STATUS;
+    fn acpi_queue_work_ffi(function: ACPI_OSD_EXEC_CALLBACK, context: *mut c_void) -> bool;
 }
 
 pub fn acpi_enter_sleep_state_prep(sleep_state: u8) -> ACPI_STATUS {
@@ -307,6 +308,10 @@ pub fn acpi_disable_gpe(device: AcpiHandle, gpe_number: u32) -> ACPI_STATUS {
 
 pub fn acpi_evaluate_void(object: AcpiHandle, pathname: *const c_char) -> ACPI_STATUS {
     unsafe { acpi_evaluate_void_ffi(object, pathname) }
+}
+
+pub fn acpi_queue_work(function: ACPI_OSD_EXEC_CALLBACK, context: *mut c_void) -> bool {
+    unsafe { acpi_queue_work_ffi(function, context) }
 }
 
 pub const AE_OK: ACPI_STATUS         = 0x0000_0000;

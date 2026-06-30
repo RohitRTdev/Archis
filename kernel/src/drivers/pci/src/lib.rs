@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 #![feature(allocator_api)]
 
+use common::StrRef;
 use core::ffi::c_void;
 use core::mem::size_of;
 use alloc::vec::Vec;
@@ -220,8 +221,12 @@ fn scan_bus(
 
 fn do_query(device: &DeviceObject, req: &mut Irp) -> Status {
     let ctx = unsafe { &*(device.ctx as *const PciCtx) };
-    req.buffer.base_address = ctx.hw_id.as_ptr() as usize;
-    req.buffer.size = ctx.hw_id_len;
+    let max = req.buffer.size / size_of::<StrRef>();
+    if ctx.hw_id_len > 0 && max >= 1 {
+        let sref_buf = req.buffer.base_address as *mut StrRef;
+        unsafe { *sref_buf = StrRef { ptr: ctx.hw_id.as_ptr(), len: ctx.hw_id_len }; }
+        req.bytes_completed = size_of::<StrRef>();
+    }
     req.complete_irp(Status::Success);
     Status::Success
 }
