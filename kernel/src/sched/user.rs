@@ -11,17 +11,22 @@ use crate::devices::read_realtime;
 use crate::loader::load_user_image;
 use crate::mem::{self, PageDescriptor};
 use crate::io::io_request_sync;
-use crate::sched::{self, Handle::{ProcessHandle, SyncHandle, ThreadHandle, DeviceHandle}};
+use crate::sched::{self, Handle::{FileHandle, ProcessHandle, SyncHandle, ThreadHandle, DeviceHandle}};
+use crate::fs::{FileBuffer, FileStat};
 use crate::sync::{KEvent, KSem, do_signal, do_wait};
 use super::*;
 use kernel_intf::*;
 use kernel_intf::driver::{IrpMajor, IrpMinor, ReqInfo, TtyControlInfo, EMPTY_REGION, Status};
 
-const MAX_SYSCALLS: usize = 26;
+const MAX_SYSCALLS: usize = 36;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 const OPEN_INHERITABLE_FLAG: u64 = 1 << 0;
 const SYNC_TYPE_SEMAPHORE: u64 = 0;
 const SYNC_TYPE_EVENT: u64 = 1;
+const CREATE_FILE_EXIST_FLAG: u64 = 1 << 1;
+const SEEK_SET: u64 = 0;
+const SEEK_CUR: u64 = 1;
+const SEEK_END: u64 = 2;
 
 
 static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
@@ -50,7 +55,17 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_create_pgrp_handler,
     sys_get_tid_handler,
     sys_get_thread_info_handler,
-    sys_device_control_handler
+    sys_device_control_handler,
+    sys_seek_handler,
+    sys_fstat_handler,
+    sys_readdir_handler,
+    sys_delete_file_handler,
+    sys_rename_file_handler,
+    sys_mkdir_handler,
+    sys_rmdir_handler,
+    sys_create_file_handler,
+    sys_create_symlink_handler,
+    sys_readlink_handler
 ];
 
 fn read_c_strlen(start: usize) -> Option<usize> {
@@ -273,31 +288,43 @@ fn sys_close_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 
 // arg0 = handle, arg1 = user buf ptr, arg2 = len, arg3 = ptr to bytes read
 fn sys_read_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    let handle = match get_handle(args[0] as usize) {
-        Some(DeviceHandle(h)) => h,
-        _ => return E_INVALID
-    };
     let len = args[2] as usize;
     if len == 0 {
         return E_SUCCESS;
     }
-    let mut kbuf = vec![0u8; len];
-    let region = MemoryRegion { base_address: kbuf.as_mut_ptr() as usize, size: len };
-    let result = match io_request_sync(&**handle, IrpMajor::Read, IrpMinor::None, region, 0, None, true) {
-        Ok(r) => r,
-        Err(_) => return E_INVALID
-    };
-    if result.status != Status::Success {
-        return E_INVALID;
+    match get_handle(args[0] as usize) {
+        Some(FileHandle(f)) => {
+            let buf = FileBuffer::from(args[1] as usize, len, true);
+            let completed = match f.read(&buf) {
+                Ok(n) => n,
+                Err(e) => return e.into()
+            };
+            if mem::copy_to_user(args[3] as usize, &completed as *const usize as *const u8, size_of::<usize>()).is_err() {
+                return E_INVALID_MEMORY_RANGE;
+            }
+            E_SUCCESS
+        }
+        Some(DeviceHandle(h)) => {
+            let mut kbuf = vec![0u8; len];
+            let region = MemoryRegion { base_address: kbuf.as_mut_ptr() as usize, size: len };
+            let result = match io_request_sync(&**h, IrpMajor::Read, IrpMinor::None, region, 0, None, true) {
+                Ok(r) => r,
+                Err(_) => return E_INVALID
+            };
+            if result.status != Status::Success {
+                return E_INVALID;
+            }
+            let completed = result.bytes_completed;
+            if mem::copy_to_user(args[1] as usize, kbuf.as_ptr(), completed).is_err() {
+                return E_INVALID_MEMORY_RANGE;
+            }
+            if mem::copy_to_user(args[3] as usize, &completed as *const usize as *const u8, size_of::<usize>()).is_err() {
+                return E_INVALID_MEMORY_RANGE;
+            }
+            E_SUCCESS
+        }
+        _ => E_INVALID
     }
-    let completed = result.bytes_completed;
-    if mem::copy_to_user(args[1] as usize, kbuf.as_ptr(), completed).is_err() {
-        return E_INVALID_MEMORY_RANGE;
-    }
-    if mem::copy_to_user(args[3] as usize, &completed as *const usize as *const u8, size_of::<usize>()).is_err() {
-        return E_INVALID_MEMORY_RANGE;
-    }
-    E_SUCCESS
 }
 
 #[cfg(feature = "kunit-test")]
@@ -319,31 +346,43 @@ fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 // arg0 = handle, arg1 = user buf ptr, arg2 = len, arg3 = ptr to bytes written
 #[cfg(not(feature = "kunit-test"))]
 fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    let handle = match get_handle(args[0] as usize) {
-        Some(DeviceHandle(h)) => h,
-        _ => return E_INVALID
-    };
     let len = args[2] as usize;
     if len == 0 {
         return E_SUCCESS;
     }
-    let mut kbuf = vec![0u8; len];
-    if mem::copy_from_user(kbuf.as_mut_ptr(), args[1] as usize, len).is_err() {
-        return E_INVALID_MEMORY_RANGE;
+    match get_handle(args[0] as usize) {
+        Some(FileHandle(f)) => {
+            let buf = FileBuffer::from(args[1] as usize, len, true);
+            let completed = match f.write(&buf, len, 0) {
+                Ok(n) => n,
+                Err(e) => return e.into()
+            };
+            if mem::copy_to_user(args[3] as usize, &completed as *const usize as *const u8, size_of::<usize>()).is_err() {
+                return E_INVALID_MEMORY_RANGE;
+            }
+            E_SUCCESS
+        }
+        Some(DeviceHandle(h)) => {
+            let mut kbuf = vec![0u8; len];
+            if mem::copy_from_user(kbuf.as_mut_ptr(), args[1] as usize, len).is_err() {
+                return E_INVALID_MEMORY_RANGE;
+            }
+            let region = MemoryRegion { base_address: kbuf.as_ptr() as usize, size: len };
+            let result = match io_request_sync(&**h, IrpMajor::Write, IrpMinor::None, region, 0, None, false) {
+                Ok(r) => r,
+                Err(_) => return E_INVALID
+            };
+            if result.status != Status::Success {
+                return E_INVALID;
+            }
+            let completed = result.bytes_completed;
+            if mem::copy_to_user(args[3] as usize, &completed as *const usize as *const u8, size_of::<usize>()).is_err() {
+                return E_INVALID_MEMORY_RANGE;
+            }
+            E_SUCCESS
+        }
+        _ => E_INVALID
     }
-    let region = MemoryRegion { base_address: kbuf.as_ptr() as usize, size: len };
-    let result = match io_request_sync(&**handle, IrpMajor::Write, IrpMinor::None, region, 0, None, false) {
-        Ok(r) => r,
-        Err(_) => return E_INVALID
-    };
-    if result.status != Status::Success {
-        return E_INVALID;
-    }
-    let completed = result.bytes_completed;
-    if mem::copy_to_user(args[3] as usize, &completed as *const usize as *const u8, size_of::<usize>()).is_err() {
-        return E_INVALID_MEMORY_RANGE;
-    }
-    E_SUCCESS
 }
 
 // arg0 = type C-string ptr, arg1 = name C-string ptr, arg2 = flags (bit 0 = IS_INHERITABLE)
@@ -886,6 +925,209 @@ fn sys_get_time_ms_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     };
     if mem::copy_to_user(args[1] as usize, &ms as *const u64 as *const u8, size_of::<u64>()).is_err() {
         return E_INVALID;
+    }
+    E_SUCCESS
+}
+
+// arg0 = file handle, arg1 = offset (i64), arg2 = whence
+// Returns new file offset on success, or negative error
+fn sys_seek_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let f = match get_handle(args[0] as usize) {
+        Some(FileHandle(f)) => f,
+        _ => return E_INVALID
+    };
+    let delta = args[1] as i64;
+    let new_offset = match args[2] {
+        SEEK_SET => {
+            if delta < 0 { return E_INVALID; }
+            delta as usize
+        }
+        SEEK_CUR => {
+            let cur = f.get_offset() as i64;
+            let next = cur + delta;
+            if next < 0 { return E_INVALID; }
+            next as usize
+        }
+        SEEK_END => {
+            let end = f.len() as i64;
+            let next = end + delta;
+            if next < 0 { return E_INVALID; }
+            next as usize
+        }
+        _ => return E_INVALID
+    };
+    match f.seek(new_offset) {
+        Ok(()) => new_offset as i64,
+        Err(e) => e.into()
+    }
+}
+
+// arg0 = file handle, arg1 = ptr to file_stat_t
+fn sys_fstat_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let f = match get_handle(args[0] as usize) {
+        Some(FileHandle(f)) => f,
+        _ => return E_INVALID
+    };
+    let attrs = f.fstat();
+    let stat = FileStat { size: attrs.size, mode: attrs.mode };
+    if mem::copy_to_user(args[1] as usize, &stat as *const FileStat as *const u8, size_of::<FileStat>()).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    E_SUCCESS
+}
+
+// arg0 = dir handle, arg1 = offset, arg2 = buf ptr, arg3 = buf len, arg4 = ptr to bytes written
+fn sys_readdir_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let f = match get_handle(args[0] as usize) {
+        Some(FileHandle(f)) => f,
+        _ => return E_INVALID
+    };
+    let offset = args[1] as usize;
+    let buf_len = args[3] as usize;
+    let entry = match f.readdir_at(offset) {
+        Ok(e) => e,
+        Err(e) => return e.into()
+    };
+    let name = entry.name.as_bytes();
+    if name.len() + 1 > buf_len {
+        return E_BUF_TOO_SMALL;
+    }
+    if mem::copy_to_user(args[2] as usize, name.as_ptr(), name.len()).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    // write NUL terminator
+    let nul: u8 = 0;
+    if mem::copy_to_user(args[2] as usize + name.len(), &nul as *const u8, 1).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    let written = name.len() + 1;
+    if mem::copy_to_user(args[4] as usize, &written as *const usize as *const u8, size_of::<usize>()).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    E_SUCCESS
+}
+
+// arg0 = path ptr
+fn sys_delete_file_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let path = match read_user_string(args[0] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    match crate::fs::delete(&path) {
+        Ok(()) => E_SUCCESS,
+        Err(e) => e.into()
+    }
+}
+
+// arg0 = from path ptr, arg1 = to path ptr
+fn sys_rename_file_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let from = match read_user_string(args[0] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    let to = match read_user_string(args[1] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    match crate::fs::rename(&from, &to) {
+        Ok(()) => E_SUCCESS,
+        Err(e) => e.into()
+    }
+}
+
+// arg0 = path ptr
+fn sys_mkdir_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let path = match read_user_string(args[0] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    match crate::fs::mkdir(&path, 0) {
+        Ok(()) => E_SUCCESS,
+        Err(e) => e.into()
+    }
+}
+
+// arg0 = path ptr
+fn sys_rmdir_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let path = match read_user_string(args[0] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    match crate::fs::delete(&path) {
+        Ok(()) => E_SUCCESS,
+        Err(e) => e.into()
+    }
+}
+
+// arg0 = path ptr, arg1 = flags (bit0 = inheritable, bit1 = FILE_EXIST)
+fn sys_create_file_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let path = match read_user_string(args[0] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    let flags = args[1];
+    let file_exist_only = flags & CREATE_FILE_EXIST_FLAG != 0;
+    let is_inheritable = flags & OPEN_INHERITABLE_FLAG != 0;
+    match crate::fs::create_or_open(&path, file_exist_only) {
+        Ok(inst) => add_new_handle(FileHandle(inst), is_inheritable) as i64,
+        Err(e) => e.into()
+    }
+}
+
+// arg0 = path ptr, arg1 = target ptr
+fn sys_create_symlink_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let path = match read_user_string(args[0] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    let target = match read_user_string(args[1] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    match crate::fs::create_symlink(&path, &target) {
+        Ok(()) => E_SUCCESS,
+        Err(e) => e.into()
+    }
+}
+
+// arg0 = path ptr, arg1 = buf ptr, arg2 = buf len, arg3 = ptr to bytes written
+fn sys_readlink_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let path = match read_user_string(args[0] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    let buf_len = args[2] as usize;
+    let (_, target_opt) = match crate::fs::lstat(&path) {
+        Ok(r) => r,
+        Err(e) => return e.into()
+    };
+    let target = match target_opt {
+        Some(t) => t,
+        None => return E_INVALID
+    };
+    let bytes = target.as_bytes();
+    if bytes.len() + 1 > buf_len {
+        return E_BUF_TOO_SMALL;
+    }
+    if mem::copy_to_user(args[1] as usize, bytes.as_ptr(), bytes.len()).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    let nul: u8 = 0;
+    if mem::copy_to_user(args[1] as usize + bytes.len(), &nul as *const u8, 1).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    let written = bytes.len() + 1;
+    if mem::copy_to_user(args[3] as usize, &written as *const usize as *const u8, size_of::<usize>()).is_err() {
+        return E_INVALID_MEMORY_RANGE;
     }
     E_SUCCESS
 }

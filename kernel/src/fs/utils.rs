@@ -1,8 +1,6 @@
 use common::{MemoryRegion, PAGE_SIZE};
 use core::marker::PhantomData;
-use alloc::vec::Vec;
-use crate::hal::copy_user_memory;
-use crate::mem::{PageDescriptor, allocate_memory, deallocate_memory};
+use crate::mem::{self, PageDescriptor, allocate_memory, deallocate_memory};
 use kernel_intf::KError;
 use core::alloc::Layout;
 
@@ -49,20 +47,18 @@ impl FileBuffer {
     }
 
     // dest pointer here must be kernel memory
-    pub fn read(&self, to: usize, len: usize, offset: usize) {
+    pub fn read(&self, to: usize, len: usize, offset: usize) -> Result<(), KError> {
         assert!(len + offset <= self.region.size);
         if len == 0 {
-            return;
+            return Ok(());
         }
-        
+
         if self.is_user {
-            unsafe {
-                copy_user_memory(
-                    to as *mut u8, 
-                    (self.region.base_address as *mut u8).add(offset),
-                    len
-                );
-            }
+            mem::copy_from_user(
+                to as *mut u8,
+                self.region.base_address + offset,
+                len
+            )
         }
         else {
             unsafe {
@@ -72,24 +68,23 @@ impl FileBuffer {
                     len
                 )
             }
+            Ok(())
         }
     }
-    
+
     // src pointer here must be kernel memory
-    pub fn write(&self, from: usize, len: usize, offset: usize) {
+    pub fn write(&self, from: usize, len: usize, offset: usize) -> Result<(), KError> {
         assert!(len + offset <= self.region.size);
         if len == 0 {
-            return;
+            return Ok(());
         }
 
         if self.is_user {
-            unsafe {
-                copy_user_memory(
-                    (self.region.base_address as *mut u8).add(offset),
-                    from as *const u8, 
-                    len
-                );
-            }
+            mem::copy_to_user(
+                self.region.base_address + offset,
+                from as *const u8,
+                len
+            )
         }
         else {
             unsafe {
@@ -99,6 +94,7 @@ impl FileBuffer {
                     len
                 )
             }
+            Ok(())
         }
     }
 

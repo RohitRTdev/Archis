@@ -113,3 +113,43 @@ syscall_status_t sys_get_thread_info(handle_t handle, thread_info_t *out) {
 syscall_status_t sys_device_control(handle_t handle, size_t minor_code, void* command) {
     return do_syscall(SYSCALL_DEVICE_CONTROL, (uint64_t)handle, minor_code, (uint64_t)command, 0, 0, 0);
 }
+
+handle_t sys_create_file(const char *path, uint64_t flags) {
+    return do_syscall(SYSCALL_CREATE_FILE, (uint64_t)path, flags, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_create_symlink(const char *path, const char *target) {
+    return do_syscall(SYSCALL_CREATE_SYMLINK, (uint64_t)path, (uint64_t)target, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_delete_file(const char *path) {
+    return do_syscall(SYSCALL_DELETE_FILE, (uint64_t)path, 0, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_rename_file(const char *from, const char *to) {
+    return do_syscall(SYSCALL_RENAME_FILE, (uint64_t)from, (uint64_t)to, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_mkdir(const char *path) {
+    return do_syscall(SYSCALL_MKDIR, (uint64_t)path, 0, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_rmdir(const char *path) {
+    return do_syscall(SYSCALL_RMDIR, (uint64_t)path, 0, 0, 0, 0, 0);
+}
+
+ssize_t sys_seek(handle_t handle, ssize_t offset, seek_whence_t whence) {
+    return do_syscall(SYSCALL_SEEK, (uint64_t)handle, (uint64_t)offset, (uint64_t)whence, 0, 0, 0);
+}
+
+syscall_status_t sys_fstat(handle_t handle, file_stat_t *out) {
+    return do_syscall(SYSCALL_FSTAT, (uint64_t)handle, (uint64_t)out, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_readdir(handle_t handle, size_t offset, char *buf, size_t buf_len, size_t *bytes_written) {
+    return do_syscall(SYSCALL_READDIR, (uint64_t)handle, offset, (uint64_t)buf, buf_len, (uint64_t)bytes_written, 0);
+}
+
+syscall_status_t sys_readlink(const char *path, char *buf, size_t buf_len, size_t *bytes_written) {
+    return do_syscall(SYSCALL_READLINK, (uint64_t)path, (uint64_t)buf, buf_len, (uint64_t)bytes_written, 0, 0);
+}

@@ -53,6 +53,13 @@ pub struct FileAttrs {
     pub size: u64
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileStat {
+    pub size: u64,
+    pub mode: u16
+}
+
 pub struct VfsNode {
     pub attrs: FileAttrs,
     pub kind: NodeKind
@@ -595,26 +602,24 @@ impl Vfs {
         Ok(rebuild_path(&comps))
     }
 
-    pub fn readdir(node: &VfsNodeRef) -> Result<Vec<DirEntry>, KError> {
+    pub fn readdir(node: &VfsNodeRef, offset: usize) -> Result<DirEntry, KError> {
         let g = node.lock();
         match &g.kind {
             NodeKind::Dir { children, .. } => {
-                let mut entries = Vec::new();
-                for (name, child) in children {
-                    let cg = child.lock();
-                    let (kind, symlink_target, size) = match &cg.kind {
-                        NodeKind::File { data, .. } => (EntryType::File, None, data.len() as u64),
-                        NodeKind::Dir { children, .. } => (EntryType::Dir, None, children.len() as u64),
-                        NodeKind::Symlink { target } => (EntryType::Symlink, Some(target.clone()), target.len() as u64)
-                    };
-                    entries.push(DirEntry {
-                        name: name.clone(),
-                        kind,
-                        attrs: FileAttrs { mode: cg.attrs.mode, size },
-                        symlink_target
-                    });
-                }
-                Ok(entries)
+                let (name, child) = children.iter().nth(offset)
+                    .ok_or(KError::NoMoreEntries)?;
+                let cg = child.lock();
+                let (kind, symlink_target, size) = match &cg.kind {
+                    NodeKind::File { data, .. } => (EntryType::File, None, data.len() as u64),
+                    NodeKind::Dir { children, .. } => (EntryType::Dir, None, children.len() as u64),
+                    NodeKind::Symlink { target } => (EntryType::Symlink, Some(target.clone()), target.len() as u64)
+                };
+                Ok(DirEntry {
+                    name: name.clone(),
+                    kind,
+                    attrs: FileAttrs { mode: cg.attrs.mode, size },
+                    symlink_target
+                })
             }
             _ => Err(KError::NotADirectory)
         }

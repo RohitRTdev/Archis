@@ -30,7 +30,17 @@ enum syscall_t {
     SYSCALL_CREATE_PGRP,
     SYSCALL_GET_TID,
     SYSCALL_GET_THREAD_INFO,
-    SYSCALL_DEVICE_CONTROL
+    SYSCALL_DEVICE_CONTROL,
+    SYSCALL_SEEK,
+    SYSCALL_FSTAT,
+    SYSCALL_READDIR,
+    SYSCALL_DELETE_FILE,
+    SYSCALL_RENAME_FILE,
+    SYSCALL_MKDIR,
+    SYSCALL_RMDIR,
+    SYSCALL_CREATE_FILE,
+    SYSCALL_CREATE_SYMLINK,
+    SYSCALL_READLINK
 };
 
 typedef enum {
@@ -49,11 +59,14 @@ typedef enum {
     E_PROCESS_TERMINATED = -7,
     E_NOPERM = -8,
     E_WAIT_INTERRUPTED = -11,
-    E_TIMEOUT = -12
+    E_TIMEOUT          = -12,
+    E_BUF_TOO_SMALL    = -20,
+    E_NO_DIR_ENTRIES   = -21
 } syscall_status_t;
 
-#define PROCESS_SUSPEND_FLAG  ((uint64_t)1 << 0)
-#define OPEN_INHERITABLE_FLAG ((uint64_t)1 << 0)
+#define PROCESS_SUSPEND_FLAG    ((uint64_t)1 << 0)
+#define OPEN_INHERITABLE_FLAG   ((uint64_t)1 << 0)
+#define CREATE_FILE_EXIST_FLAG  ((uint64_t)1 << 1)
 
 typedef enum {
     CLOCK_MONOTONIC = 0,
@@ -62,6 +75,21 @@ typedef enum {
 
 #define SET_FOREGROUND_PGRP (8)
 #define SET_CTTY (9)
+
+typedef struct {
+    uint64_t size;
+    uint16_t mode;
+} file_stat_t;
+
+#define FILE_MODE_FILE    (1 << 0)
+#define FILE_MODE_DIR     (1 << 1)
+#define FILE_MODE_SYMLINK (1 << 2)
+
+typedef enum {
+    SEEK_SET = 0,
+    SEEK_CUR = 1,
+    SEEK_END = 2
+} seek_whence_t;
 
 
 typedef struct {
@@ -109,3 +137,13 @@ syscall_status_t sys_get_time_ms(clock_type_t clock, size_t *out);
 uint64_t         sys_get_tid(void);
 syscall_status_t sys_get_thread_info(handle_t handle, thread_info_t *out);
 syscall_status_t sys_device_control(handle_t handle, size_t minor_code, void* command);
+handle_t         sys_create_file(const char *path, uint64_t flags);
+syscall_status_t sys_create_symlink(const char *path, const char *target);
+syscall_status_t sys_delete_file(const char *path);
+syscall_status_t sys_rename_file(const char *from, const char *to);
+syscall_status_t sys_mkdir(const char *path);
+syscall_status_t sys_rmdir(const char *path);
+ssize_t          sys_seek(handle_t handle, ssize_t offset, seek_whence_t whence);
+syscall_status_t sys_fstat(handle_t handle, file_stat_t *out);
+syscall_status_t sys_readdir(handle_t handle, size_t offset, char *buf, size_t buf_len, size_t *bytes_written);
+syscall_status_t sys_readlink(const char *path, char *buf, size_t buf_len, size_t *bytes_written);

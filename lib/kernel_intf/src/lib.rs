@@ -67,7 +67,9 @@ pub enum KError {
     FileExists,
     FileBusy,
     TooManySymlinks,
-    NotEmpty
+    NotEmpty,
+    BufferTooSmall,
+    NoMoreEntries
 }
 
 pub const E_SUCCESS: i64 = 0;
@@ -89,7 +91,9 @@ pub const E_NOT_DIR: i64 = -15;
 pub const E_FILE_EXISTS: i64 = -16;
 pub const E_FILE_BUSY: i64 = -17;
 pub const E_TOO_MANY_SYMLINKS: i64 = -18;
-pub const E_NOT_EMPTY: i64 = -19;
+pub const E_NOT_EMPTY: i64      = -19;
+pub const E_BUF_TOO_SMALL: i64  = -20;
+pub const E_NO_DIR_ENTRIES: i64 = -21;
 
 impl<T> From<Result<T, KError>> for KError {
     fn from(e: Result<T, KError>) -> Self {
@@ -118,7 +122,9 @@ impl From<KError> for i64 {
             KError::FileExists => E_FILE_EXISTS,
             KError::FileBusy => E_FILE_BUSY,
             KError::TooManySymlinks => E_TOO_MANY_SYMLINKS,
-            KError::NotEmpty => E_NOT_EMPTY
+            KError::NotEmpty => E_NOT_EMPTY,
+            KError::BufferTooSmall => E_BUF_TOO_SMALL,
+            KError::NoMoreEntries => E_NO_DIR_ENTRIES
         }
     }
 }
@@ -148,6 +154,8 @@ impl fmt::Display for KError {
             KError::FileBusy => "File is busy",
             KError::TooManySymlinks => "Too many levels of symbolic links",
             KError::NotEmpty => "Directory not empty",
+            KError::BufferTooSmall => "Buffer too small",
+            KError::NoMoreEntries => "No more directory entries",
             KError::Success => "Success"
         };
         write!(f, "{}", description)

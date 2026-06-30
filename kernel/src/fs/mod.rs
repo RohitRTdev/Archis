@@ -5,7 +5,7 @@ mod vfs;
 
 pub use file::{FileInst, FileInstance};
 pub use utils::FileBuffer;
-pub use vfs::{DirEntry, EntryType, FileAttrs, make_absolute, normalize_path, MODE_FILE, MODE_DIR, MODE_SYMLINK};
+pub use vfs::{DirEntry, EntryType, FileAttrs, FileStat, make_absolute, normalize_path, MODE_FILE, MODE_DIR, MODE_SYMLINK};
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -100,6 +100,19 @@ pub fn chdir(path: &str) -> Result<(), KError> {
     Ok(())
 }
 
+pub fn create_or_open(path: &str, file_exist_only: bool) -> Result<FileInstance, KError> {
+    if file_exist_only {
+        return open(path);
+    }
+    let _ = delete(path);
+    create_file(path, 0)?;
+    open(path)
+}
+
+fn open_fs_handler(name: &str, _flags: u64) -> Result<crate::sched::Handle, KError> {
+    open(name).map(crate::sched::Handle::FileHandle)
+}
+
 pub fn init() {
     let init_fs = crate::INIT_FS.get().expect("fs::init called before INIT_FS is ready");
     let mut vfs_instance = vfs::Vfs::new();
@@ -108,6 +121,9 @@ pub fn init() {
     mount::mount("/", vfs_instance).expect("fs::init: failed to mount VFS at /");
 
     crate::sched::set_init_cwd("/");
+
+    crate::object::register_object_type("fs", open_fs_handler)
+        .expect("fs: failed to register object type");
 
     info!("VFS mounted at /");
 }

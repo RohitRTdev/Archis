@@ -80,7 +80,7 @@ impl FileInst {
                 let len = remaining.min(buffer.len());
                 if len == 0 { return Ok(0); }
                 let src = data.as_slice()[*offset..].as_ptr() as usize;
-                buffer.write(src, len, 0);
+                buffer.write(src, len, 0)?;
                 drop(g);
                 *offset += len;
                 Ok(len)
@@ -102,7 +102,7 @@ impl FileInst {
                         data.make_owned();
                         if let FileData::Owned(v) = data {
                             if v.len() < end { v.resize(end, 0); }
-                            buffer.read(v[cur..end].as_mut_ptr() as usize, len, buf_offset);
+                            buffer.read(v[cur..end].as_mut_ptr() as usize, len, buf_offset)?;
                         }
                         data.len() as u64
                     }
@@ -116,10 +116,10 @@ impl FileInst {
         }
     }
 
-    pub fn readdir(&self) -> Result<Vec<DirEntry>, KError> {
+    pub fn readdir_at(&self, offset: usize) -> Result<DirEntry, KError> {
         match self.kind {
             HandleKind::File => Err(KError::NotADirectory),
-            HandleKind::Dir => Vfs::readdir(&self.node)
+            HandleKind::Dir => Vfs::readdir(&self.node, offset)
         }
     }
 }
