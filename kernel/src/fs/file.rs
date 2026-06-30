@@ -1,97 +1,151 @@
+use core::cell::UnsafeCell;
 use alloc::sync::Arc;
 use alloc::string::String;
-use alloc::borrow::ToOwned;
+use alloc::vec::Vec;
 use kernel_intf::KError;
-use crate::INIT_FS;
-use crate::sync::Spinlock;
 use kernel_intf::mem::PoolAllocatorGlobal;
-use super::{FileBuffer, FilePath};
+use crate::sync::{KSem, semaphore_guard};
+use super::vfs::{DirEntry, FileAttrs, FileData, NodeKind, Vfs, VfsNodeRef};
+use super::utils::FileBuffer;
 
-pub type FileInstance = Arc<Spinlock<FileInst>, PoolAllocatorGlobal>;
+pub type FileInstance = Arc<FileInst, PoolAllocatorGlobal>;
+
+enum HandleKind { File, Dir }
 
 pub struct FileInst {
-    file_name: String,
-    offset: usize,
-    total_size: usize
+    sem: KSem,
+    path: String,
+    node: VfsNodeRef,
+    ancestors: Vec<VfsNodeRef>,
+    kind: HandleKind,
+    offset: UnsafeCell<usize>
 }
 
+unsafe impl Send for FileInst {}
+unsafe impl Sync for FileInst {}
+
 impl FileInst {
-    pub fn read(&mut self, buffer: &FileBuffer) -> usize {
-        let remaining = self.total_size.saturating_sub(self.offset);
-        let len = remaining.min(buffer.len());
-        if len == 0 {
-            return 0;
-        }
-
-        let filename = resolve_symlink(self.file_name.as_str());
-        let init_fs = INIT_FS.get().unwrap();
-        let entry = init_fs.fs.get(filename)
-        .expect("Critical error! File not found in init fs!");
-
-        let start = unsafe {
-            entry.as_ptr().add(self.offset)
-        };
-
-        buffer.write(start.addr(), len, 0);
-        self.offset += len;
-
-        len
+    pub fn is_dir(&self) -> bool {
+        matches!(self.kind, HandleKind::Dir)
     }
 
-    pub fn write(&mut self, _: FileBuffer) {
-        panic!("write() not supported right now!");
-    }
-
-    pub fn len(&self) -> usize {
-        self.total_size
+    pub fn get_path(&self) -> &str {
+        &self.path
     }
 
     pub fn get_offset(&self) -> usize {
-        self.offset
-    }
-    
-    pub fn get_path(&self) -> FilePath<'_> {
-        FilePath::from(self.file_name.as_str())
+        unsafe { *self.offset.get() }
     }
 
-    pub fn get_name(&self) -> &str {
-        self.file_name.as_str()
+    pub fn len(&self) -> usize {
+        let g = self.node.lock();
+        match &g.kind {
+            NodeKind::File { data, .. } => data.len(),
+            _ => 0
+        }
+    }
+
+    pub fn fstat(&self) -> FileAttrs {
+        let g = self.node.lock();
+        let mut attrs = g.attrs;
+        if let NodeKind::File { data, .. } = &g.kind {
+            attrs.size = data.len() as u64;
+        }
+        attrs
+    }
+
+    pub fn seek(&self, new_offset: usize) -> Result<(), KError> {
+        match self.kind {
+            HandleKind::Dir => Err(KError::IsADirectory),
+            HandleKind::File => {
+                let _guard = semaphore_guard(&self.sem);
+                unsafe { *self.offset.get() = new_offset; }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn read(&self, buffer: &FileBuffer) -> Result<usize, KError> {
+        match self.kind {
+            HandleKind::Dir => Err(KError::IsADirectory),
+            HandleKind::File => {
+                let _guard = semaphore_guard(&self.sem);
+                let offset = unsafe { &mut *self.offset.get() };
+                let g = self.node.lock();
+                let data = match &g.kind {
+                    NodeKind::File { data, .. } => data,
+                    _ => return Err(KError::InvalidArgument)
+                };
+                let remaining = data.len().saturating_sub(*offset);
+                let len = remaining.min(buffer.len());
+                if len == 0 { return Ok(0); }
+                let src = data.as_slice()[*offset..].as_ptr() as usize;
+                buffer.write(src, len, 0);
+                drop(g);
+                *offset += len;
+                Ok(len)
+            }
+        }
+    }
+
+    pub fn write(&self, buffer: &FileBuffer, len: usize, buf_offset: usize) -> Result<usize, KError> {
+        match self.kind {
+            HandleKind::Dir => Err(KError::IsADirectory),
+            HandleKind::File => {
+                let _guard = semaphore_guard(&self.sem);
+                let offset = unsafe { &mut *self.offset.get() };
+                let cur = *offset;
+                let end = cur + len;
+                let mut g = self.node.lock();
+                let new_size = match &mut g.kind {
+                    NodeKind::File { data, .. } => {
+                        data.make_owned();
+                        if let FileData::Owned(v) = data {
+                            if v.len() < end { v.resize(end, 0); }
+                            buffer.read(v[cur..end].as_mut_ptr() as usize, len, buf_offset);
+                        }
+                        data.len() as u64
+                    }
+                    _ => return Err(KError::InvalidArgument)
+                };
+                g.attrs.size = new_size;
+                drop(g);
+                *offset += len;
+                Ok(len)
+            }
+        }
+    }
+
+    pub fn readdir(&self) -> Result<Vec<DirEntry>, KError> {
+        match self.kind {
+            HandleKind::File => Err(KError::NotADirectory),
+            HandleKind::Dir => Vfs::readdir(&self.node)
+        }
     }
 }
 
 impl Drop for FileInst {
     fn drop(&mut self) {
-        crate::loader_log!("Dropped file instance: {}", self.file_name);
+        Vfs::close(&self.node, &self.ancestors);
+        crate::loader_log!("Closed handle: {}", self.path);
     }
 }
 
-pub fn open(file_name: &str) -> Result<FileInstance, KError> {
-    let init_fs = INIT_FS.get().unwrap();
-    let filename = resolve_symlink(file_name);
-
-    let entry = init_fs.fs.get(filename)
-    .ok_or(KError::InvalidArgument).or_else(|e| {
-        crate::io_log!("Failed to open file {}", file_name);
-        Err(e)
-    })?;
-    
-    let file_desc = FileInst {
-        file_name: filename.to_owned(),
-        offset: 0,
-        total_size: entry.len()
-    };
-    
-    let file_instance = Arc::new_in(
-        Spinlock::new(
-            file_desc
-        ),
+pub(super) fn make_handle(
+    path: String,
+    node: VfsNodeRef,
+    ancestors: Vec<VfsNodeRef>,
+    is_dir: bool
+) -> FileInstance {
+    Arc::new_in(
+        FileInst {
+            sem: KSem::new(1, 1),
+            path,
+            node,
+            ancestors,
+            kind: if is_dir { HandleKind::Dir } else { HandleKind::File },
+            offset: UnsafeCell::new(0)
+        },
         PoolAllocatorGlobal
-    );
-
-    Ok(file_instance)
-}
-
-pub fn resolve_symlink(name: &str) -> &str {
-    let init_fs = INIT_FS.get().unwrap();
-    init_fs.symlinks.get(name).copied().unwrap_or(name)
+    )
 }

@@ -68,6 +68,7 @@ pub struct Process {
     init_status: bool,
 
     handle_table: Vec<Option<HandleType>>,
+    cwd: String,
 
     // Per-process registry of user modules mapped into this process's address space
     user_modules: Vec<LoadedImageWeak>,
@@ -108,7 +109,8 @@ impl Process {
         session: KSession,
         pgroup: KProcessGroup,
         args: Vec<String>,
-        handle_table: Vec<Option<HandleType>>
+        handle_table: Vec<Option<HandleType>>,
+        cwd: String
     ) -> Result<KProcess, KError> {
         let id = PROCESS_ID.fetch_add(1, Ordering::Relaxed);
         let kernel_addr_space = mem::get_kernel_addr_space();
@@ -140,6 +142,7 @@ impl Process {
             init_status: false,
             memory_list: List::new(),
             handle_table,
+            cwd,
             user_modules: Vec::new(),
             signal_handlers: [None; MAX_SIGNALS],
             pending_signals: 0,
@@ -438,7 +441,8 @@ pub fn init() {
     sess.lock().processes.add_node(0).expect("init: session add failed");
     pgrp.lock().processes.add_node(0).expect("init: pgroup add failed");
 
-    // Create init process and attach init task (task id = 0) to it
+    // Create init process and attach init task (task id = 0) to it.
+    // CWD is set to "/" later by fs::init via set_init_cwd().
     let init_proc = Process::new(
         false,
         false,
@@ -447,7 +451,8 @@ pub fn init() {
         sess,
         pgrp,
         vec!(KERNEL_PATH.into()),
-        Vec::new())
+        Vec::new(),
+        "/".into())
     .expect("Failed to create init process");
 
     PROCESSES.lock().insert(0, Arc::clone(&init_proc));
@@ -543,7 +548,7 @@ pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_us
         return Err(KError::InvalidArgument);
     }
 
-    let (pid, session, pgroup, inherited_table) = {
+    let (pid, session, pgroup, inherited_table, inherited_cwd) = {
         let proc = get_current_process().expect("create_process() called from idle process!");
         let guard = proc.lock();
         let table: Vec<Option<HandleType>> = guard.handle_table.iter().map(|entry| {
@@ -555,7 +560,7 @@ pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_us
                 }
             })
         }).collect();
-        (guard.id, Arc::clone(&guard.session), Arc::clone(&guard.pgroup), table)
+        (guard.id, Arc::clone(&guard.session), Arc::clone(&guard.pgroup), table, guard.cwd.clone())
     };
 
     disable_preemption();
@@ -572,7 +577,8 @@ pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_us
         Arc::clone(&session),
         Arc::clone(&pgroup),
         args,
-        inherited_table) {
+        inherited_table,
+        inherited_cwd) {
         Ok(p) => p,
         Err(e) => {
             enable_preemption();
@@ -937,6 +943,28 @@ extern "C" fn proc_issue_signal_ffi(pid: usize, signal: u8) {
 extern "C" fn proc_issue_pgrp_ffi(val: usize, signal: u8) {
     let arc = ManuallyDrop::new(unsafe { Arc::from_raw_in(val as *const Spinlock<ProcessGroup>, PoolAllocatorGlobal) });
     issue_pgrp(&arc, signal);
+}
+
+pub fn get_cwd() -> String {
+    get_current_process()
+        .map(|p| p.lock().cwd.clone())
+        .expect("get_cwd() called from idle task!")
+}
+
+pub fn set_cwd(path: String) {
+    if let Some(p) = get_current_process() {
+        p.lock().cwd = path;
+    }
+}
+
+// Called once by fs::init() to set process 0's CWD after the VFS is mounted.
+pub fn set_init_cwd(path: &str) {
+    if let Some(p) = get_process_info(0) {
+        p.lock().cwd = path.into();
+    }
+    else {
+        panic!("Process 0 not found during set_init_cwd!!");
+    }
 }
 
 impl Spinlock<Process> {

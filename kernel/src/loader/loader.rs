@@ -12,7 +12,7 @@ use common::{PAGE_SIZE, elf::*};
 use common::{ArrayTable, MemoryRegion, ModuleInfo, StrRef};
 use kernel_intf::{KError, info};
 use crate::KERNEL_PATH;
-use crate::fs::{FileBuffer, open, resolve_symlink};
+use crate::fs::{self, FileBuffer, open};
 use crate::infra::disable_preloader_phase;
 use crate::loader::module::{KernelModule, ModuleDescriptor, ModuleType};
 use crate::loader::user_loader::load_user_image;
@@ -144,7 +144,7 @@ fn load_image_inner(
             let res = do_load_image_inner(filename.as_str(), in_progress);
 
             match res {
-                Err(InvalidArgument) => {
+                Err(KError::NotFound) | Err(InvalidArgument) => {
                     continue;
                 },
                 Err(e) => {
@@ -157,7 +157,7 @@ fn load_image_inner(
         }
     }
 
-    Err(InvalidArgument)
+    Err(KError::NotFound)
 }
 
 fn load_image_uncached(
@@ -166,7 +166,7 @@ fn load_image_uncached(
 ) -> Result<LoadedImage, KError> {
     crate::loader_log!("Loading image {} from disk", path);
     let file = open(path)?;
-    let file_size = file.lock().len();
+    let file_size = file.len();
 
     let buf= FileBuffer::new(file_size, false)
     .or_else(|e| {
@@ -174,7 +174,10 @@ fn load_image_uncached(
         Err(e)
     })?;
 
-    let read_len = file.lock().read(&buf);
+    let read_len = file.read(&buf).map_err(|e| {
+        info!("Read failed for image {}: {}", path, e);
+        e
+    })?;
     if read_len != file_size {
         info!("read_len={} doesn't seem to match file_size={} for path={}", read_len, file_size, path);
         return Err(KError::InvalidArgument);
@@ -215,8 +218,9 @@ fn load_image_uncached(
 }
 
 fn find_loaded_module(path: &str) -> Option<LoadedImage> {
-    let resolved = resolve_symlink(path);
-    crate::loader_log!("Resolved symlink:{} -> {}", path, resolved);
+    let abs_path = fs::make_absolute(&crate::sched::get_cwd(), path);
+    let canonical = fs::resolve_symlink(&abs_path).unwrap_or_else(|_| abs_path.clone());
+    crate::loader_log!("find_loaded_module: looking for {} (canonical: {})", abs_path, canonical);
 
     // Collect strong refs under the registry lock, but compare (and drop the
     // non-matching Arcs) outside of it. Dropping the last strong ref runs
@@ -231,8 +235,7 @@ fn find_loaded_module(path: &str) -> Option<LoadedImage> {
         let matches = {
             let guard = entry.lock();
             let fh = guard.kernel().file_handle.as_ref().unwrap();
-            let file_guard = fh.lock();
-            file_guard.get_name() == resolved
+            fh.get_path() == canonical.as_str()
         };
         if matches {
             return Some(entry);

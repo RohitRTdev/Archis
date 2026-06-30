@@ -155,9 +155,9 @@ static DEVICE_TREE_REFRESH_LOCK: Once<KSem> = Once::new();
 
 fn read_file_to_string(path: &str) -> Option<String> {
     let file = open(path).ok()?;
-    let size = file.lock().len();
+    let size = file.len();
     let buf = FileBuffer::new(size, false).ok()?;
-    if file.lock().read(&buf) != size {
+    if file.read(&buf).ok()? != size {
         return None;
     }
     core::str::from_utf8(buf.as_slice()).ok().map(|s| s.to_string())

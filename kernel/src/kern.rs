@@ -882,6 +882,7 @@ fn kern_main() -> ! {
 
     sync::init();
     sched::init();
+    fs::init();
     loader::init();
     io::init();
 

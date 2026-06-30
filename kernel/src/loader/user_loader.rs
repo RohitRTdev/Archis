@@ -11,7 +11,7 @@ use kernel_intf::KError::InvalidArgument;
 use kernel_intf::{KError, info};
 use kernel_intf::list::{List, DynList};
 use kernel_intf::mem::PoolAllocatorGlobal;
-use crate::fs::{FileBuffer, open, resolve_symlink};
+use crate::fs::{self, FileBuffer, open};
 use crate::hal::copy_user_memory;
 use crate::loader::{LoadedImage, PREDEFINED_DIRECTORIES, read_cstr};
 use crate::mem::{PageDescriptor, allocate_memory, deallocate_memory, map_memory, unmap_memory};
@@ -454,7 +454,8 @@ fn apply_user_relocations(
 
 // Check if this module has been loaded in some process space
 fn find_user_module(path: &str) -> Option<SharedUserModuleRef> {
-    let resolved = resolve_symlink(path);
+    let abs_path = fs::make_absolute(&crate::sched::get_cwd(), path);
+    let canonical = fs::resolve_symlink(&abs_path).unwrap_or_else(|_| abs_path.clone());
 
     let candidates: Vec<SharedUserModuleRef> = {
         let registry = USER_MODULES.lock();
@@ -464,8 +465,7 @@ fn find_user_module(path: &str) -> Option<SharedUserModuleRef> {
     for entry in candidates {
         let matches = {
             let guard = entry.lock();
-            let file_guard = guard.file_handle.lock();
-            file_guard.get_name() == resolved
+            guard.file_handle.get_path() == canonical.as_str()
         };
         if matches {
             return Some(entry);
@@ -496,16 +496,16 @@ fn load_user_inner(path: &str, in_progress: &mut Vec<String>) -> Result<LoadedIm
         let res = do_load_user_inner(filename.as_str(), in_progress);
 
         match res {
-            Err(InvalidArgument) => continue,
+            Err(KError::NotFound) | Err(InvalidArgument) => continue,
             other => return other
         }
     }
 
-    Err(InvalidArgument)
+    Err(KError::NotFound)
 }
 
 fn do_load_user_inner(path: &str, in_progress: &mut Vec<String>) -> Result<LoadedImage, KError> {
-    let resolved = resolve_symlink(path);
+    let abs_path = fs::make_absolute(&crate::sched::get_cwd(), path);
 
     // If this process already mapped this module, hand back the existing
     // mapping. The snapshot is cloned out so that the shared/file locks are
@@ -516,12 +516,12 @@ fn do_load_user_inner(path: &str, in_progress: &mut Vec<String>) -> Result<Loade
         guard.get_user_modules()
     };
 
+    let canonical = fs::resolve_symlink(&abs_path).unwrap_or_else(|_| abs_path.clone());
     for module in snapshot {
         let (name_matches, base) = {
             let module_guard = module.lock();
             let desc_guard = module_guard.user().shared.lock();
-            let file_guard = desc_guard.file_handle.lock();
-            (file_guard.get_name() == resolved, module_guard.user().base)
+            (desc_guard.file_handle.get_path() == canonical.as_str(), module_guard.user().base)
         };
 
         if name_matches {
@@ -555,7 +555,7 @@ fn load_user_into_process(
     crate::loader_log!("Loading user image {} from {}", path, if cold { "disk" } else { "shared cache" });
 
     let file = open(path)?;
-    let file_size = file.lock().len();
+    let file_size = file.len();
 
     let buf = FileBuffer::new(file_size, false)
     .or_else(|e| {
@@ -563,7 +563,10 @@ fn load_user_into_process(
         Err(e)
     })?;
 
-    let read_len = file.lock().read(&buf);
+    let read_len = file.read(&buf).map_err(|e| {
+        info!("Read failed for user image {}: {}", path, e);
+        e
+    })?;
     if read_len != file_size {
         info!("read_len={} doesn't match file_size={} for user image {}", read_len, file_size, path);
         return Err(InvalidArgument);

@@ -1,8 +1,6 @@
 use common::{MemoryRegion, PAGE_SIZE};
 use core::marker::PhantomData;
-use alloc::fmt::Display;
 use alloc::vec::Vec;
-use alloc::fmt::Formatter;
 use crate::hal::copy_user_memory;
 use crate::mem::{PageDescriptor, allocate_memory, deallocate_memory};
 use kernel_intf::KError;
@@ -135,52 +133,3 @@ impl Drop for FileBuffer {
     }
 }
 
-pub struct FilePath<'a> {
-    path: Vec<&'a str>
-}
-
-impl<'a> From<&'a str> for FilePath<'a> {
-    fn from(s: &'a str) -> Self {
-        assert!(s.len() != 0 && (s.len() == 1 || !s.ends_with('/')));
-        let mut path = Vec::new();
-        
-        // Break up the string into different parts of the file path
-        let mut last_idx = 0;
-        for (idx, ch) in s.chars().enumerate() {
-            if ch == '/' {
-                path.push(&s[last_idx..idx]);
-                last_idx = idx + 1;
-            }
-        }
-
-        // Prevent getting Vec = {"", ""} when path is just "/"
-        if s.trim() != "/" {
-            path.push(&s[last_idx..]);
-        } 
-
-        for s in path.iter().skip(1) {
-            assert!(s.trim().len() != 0);
-        }
-
-        Self {
-            path
-        }
-    }
-}
-
-impl<'a> FilePath<'a> {
-    pub fn get_file_stem(&self) -> &str {
-        self.path.last().unwrap()
-    }
-}
-
-impl<'a> Display for FilePath<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), core::fmt::Error> {
-        let _ = write!(f, "FilePath = {{");
-        for s in self.path.iter().take(self.path.len() - 1) {
-            let _ = write!(f, "{}, ", s);
-        }
-        let _ = write!(f, "{}}}", self.path.last().unwrap());
-        Ok(())
-    } 
-}

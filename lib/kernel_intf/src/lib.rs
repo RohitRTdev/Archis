@@ -60,7 +60,14 @@ pub enum KError {
     Unsupported,
     DeviceStopped,
     DeviceRemoved,
-    DeviceStarted
+    DeviceStarted,
+    NotFound,
+    IsADirectory,
+    NotADirectory,
+    FileExists,
+    FileBusy,
+    TooManySymlinks,
+    NotEmpty
 }
 
 pub const E_SUCCESS: i64 = 0;
@@ -76,6 +83,13 @@ pub const E_DEV_REMOVED: i64 = -9;
 pub const E_DEV_STARTED: i64 = -10;
 pub const E_WAIT_INTERRUPTED: i64 = -11;
 pub const E_TIMEOUT: i64 = -12;
+pub const E_NOT_FOUND: i64 = -13;
+pub const E_IS_DIR: i64 = -14;
+pub const E_NOT_DIR: i64 = -15;
+pub const E_FILE_EXISTS: i64 = -16;
+pub const E_FILE_BUSY: i64 = -17;
+pub const E_TOO_MANY_SYMLINKS: i64 = -18;
+pub const E_NOT_EMPTY: i64 = -19;
 
 impl<T> From<Result<T, KError>> for KError {
     fn from(e: Result<T, KError>) -> Self {
@@ -97,7 +111,14 @@ impl From<KError> for i64 {
             KError::WaitInterrupted => E_WAIT_INTERRUPTED,
             KError::WaitTimedOut => E_TIMEOUT,
             KError::WaitFailed | KError::CircularDependency | KError::DriverLoadFailed |
-            KError::ModuleNotDriver | KError::ProcessInitFailed => E_INTERNAL_FAILURE
+            KError::ModuleNotDriver | KError::ProcessInitFailed => E_INTERNAL_FAILURE,
+            KError::NotFound => E_NOT_FOUND,
+            KError::IsADirectory => E_IS_DIR,
+            KError::NotADirectory => E_NOT_DIR,
+            KError::FileExists => E_FILE_EXISTS,
+            KError::FileBusy => E_FILE_BUSY,
+            KError::TooManySymlinks => E_TOO_MANY_SYMLINKS,
+            KError::NotEmpty => E_NOT_EMPTY
         }
     }
 }
@@ -120,6 +141,13 @@ impl fmt::Display for KError {
             KError::DeviceStopped => "Device is stopped",
             KError::DeviceRemoved => "Device has been removed",
             KError::DeviceStarted => "Device is already started",
+            KError::NotFound => "File or directory not found",
+            KError::IsADirectory => "Is a directory",
+            KError::NotADirectory => "Not a directory",
+            KError::FileExists => "File already exists",
+            KError::FileBusy => "File is busy",
+            KError::TooManySymlinks => "Too many levels of symbolic links",
+            KError::NotEmpty => "Directory not empty",
             KError::Success => "Success"
         };
         write!(f, "{}", description)
