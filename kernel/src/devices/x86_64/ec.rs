@@ -6,11 +6,14 @@ use kernel_intf::info;
 use kernel_intf::hw::{ec_read, ec_write};
 
 use crate::BOOT_INFO;
+
+#[cfg(feature = "acpi")]
 use crate::acpica::fetch_acpi_table;
 
 static EC_DATA_PORT: AtomicU16 = AtomicU16::new(0);
 static EC_CMD_PORT:  AtomicU16 = AtomicU16::new(0);
 
+#[cfg(feature = "acpi")]
 pub fn init() {
     let rsdp = match BOOT_INFO.get() {
         Some(bi) => bi.rsdp as *const u8,

@@ -327,24 +327,7 @@ fn sys_read_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-#[cfg(feature = "kunit-test")]
-fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    let mut kbuf = vec![0u8; args[2] as usize];
-    if mem::copy_from_user(kbuf.as_mut_ptr(), args[1] as usize, args[2] as usize).is_err() {
-        return E_INVALID_MEMORY_RANGE;
-    }
-
-    let utf_str = match str::from_utf8(kbuf.as_slice()) {
-        Ok(s) => { s },
-        Err(_) => { return E_INVALID; }
-    };
-
-    kernel_intf::print!("{}", utf_str);
-    E_SUCCESS
-}
-
 // arg0 = handle, arg1 = user buf ptr, arg2 = len, arg3 = ptr to bytes written
-#[cfg(not(feature = "kunit-test"))]
 fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let len = args[2] as usize;
     if len == 0 {

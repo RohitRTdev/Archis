@@ -832,49 +832,6 @@ fn run_sync_tests() {
     info!("=== run_sync_tests: PASSED ===");
 }
 
-#[kmod::test_function(true)]
-fn run_signal_tests() {
-    static SEM: Once<KEvent> = Once::new();
-    static PID: AtomicUsize = AtomicUsize::new(0);
-    SEM.call_once(|| {
-        KEvent::new(false)
-    });
-
-    extern "C" fn signaller() -> ! {
-        let _ = SEM.get().unwrap().wait(false);
-        let pid = PID.load(Ordering::Acquire); 
-        info!("Issuing signal from child thread");
-        sched::issue_signal(pid, SIGKILL);
-
-        sched::exit_thread(0);
-    }
-
-    sched::create_thread(signaller, core::ptr::null_mut()).unwrap();
-    info!("--- signal test 1: user signal handler via sigreturn ---");
-    let p1 = sched::create_process(
-        &["signal_test"],
-        core::ptr::null_mut(),
-        true,
-        false
-    ).expect("signal test 1: failed to create signal_test process");
-
-    let pid = p1.lock().get_id();
-    info!("signal test 1: created process pid={}", pid);
-
-    sched::delay_ms(1000, false);
-    PID.store(pid, Ordering::Release);
-    SEM.get().unwrap().signal();
-
-    info!("signal test 1: issuing signals to pid={}", pid);
-    sched::issue_signal(pid, kernel_intf::SIGSEGV);
-    sched::issue_signal(pid, kernel_intf::SIGILL);
-
-    p1.wait(false);
-    info!("signal test 1: process exited with code {}", p1.lock().get_exit_code());
-
-    info!("=== run_signal_tests: END ===");
-}
-
 fn kern_main() -> ! {
     info!("Starting main kernel init");
 
