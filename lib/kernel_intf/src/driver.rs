@@ -88,8 +88,17 @@ pub type KeystrokeHandler = unsafe extern "C" fn(*const Keystroke, count: usize,
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RegisterHandlerInfo {
-    pub handler: KeystrokeHandler,
+    pub handler: Option<KeystrokeHandler>,
     pub context: *mut c_void,
+}
+
+impl RegisterHandlerInfo {
+    pub const fn new() -> Self {
+        Self {
+            handler: None,
+            context: core::ptr::null_mut()
+        }
+    }
 }
 
 #[repr(C)]

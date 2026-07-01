@@ -6,12 +6,7 @@ use core::ptr::null_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_intf::{
-    info,
-    Lock,
-    create_spinlock, acquire_spinlock, release_spinlock,
-    io_complete_irp, io_set_cancel_routine, io_start_processing,
-    io_start_device, io_stop_device,
-    io_send_request
+    Lock, acquire_spinlock, create_spinlock, info, io_complete_irp, io_remove_device, io_send_request, io_set_cancel_routine, io_start_device, io_start_processing, io_stop_device, release_spinlock
 };
 use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
@@ -79,8 +74,6 @@ struct KbdCtx {
 
 unsafe impl Send for KbdCtx {}
 unsafe impl Sync for KbdCtx {}
-
-unsafe extern "C" fn noop_handler(_: *const Keystroke, _: usize, _: *mut c_void) {}
 
 #[kmod::init(driver)]
 fn driver_init(driver: &mut DriverObject) -> Status {
@@ -169,7 +162,7 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
     // Register our keystroke_received handler with port driver
     let req_info = ReqInfo {
         register_handler: RegisterHandlerInfo {
-            handler: keystroke_received as KeystrokeHandler,
+            handler: Some(keystroke_received as KeystrokeHandler),
             context: input_ctx_ptr
         }
     };
@@ -204,7 +197,7 @@ fn do_stop(device: &DeviceObject, request: &mut Irp) -> Status {
     // could be freed — the stack tears down top-down (input before i8042).
     let req_info = ReqInfo {
         register_handler: RegisterHandlerInfo {
-            handler: noop_handler as KeystrokeHandler,
+            handler: None,
             context: null_mut()
         }
     };
@@ -375,4 +368,14 @@ unsafe extern "C" fn keystroke_received(
 #[kmod::driver_unload]
 fn destroy(driver: &mut DriverObject) {
     info!("Destroying driver {}", driver.get_name());
+
+    let ctx = INPUT_CTX_PTR.load(Ordering::Acquire);
+    if ctx != 0 {
+        unsafe { alloc::boxed::Box::from_raw_in(ctx as *mut InputCtx, PoolAllocatorGlobal); }
+    }
+
+    let dev = INPUT_DEVICE_PTR.load(Ordering::Acquire);
+    if dev != 0 {
+        io_remove_device(dev as *const DeviceObject);
+    }
 }

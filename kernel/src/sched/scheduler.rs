@@ -697,13 +697,23 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
     let mut drop_task  = false;
     let mut skip_notify  = false;
 
-    #[cfg(not(feature = "kunit-test"))]
-    {
-        let cur_proc_id = crate::sched::get_current_process_id().expect("kill_thread() called from idle process!");
-        assert!(cur_proc_id != 0, "Attempted to kill system thread!");
-    } 
 
     let this_task = get_task_info(task_id);
+    
+    #[cfg(not(feature = "kunit-test"))]
+    {
+        let target_proc = this_task
+            .as_ref()
+            .expect("Attempted to kill idle task!")
+            .lock()
+            .get_process();
+        let target_proc_id = target_proc
+            .expect("Target kill thread has no process??")
+            .lock()
+            .get_id();
+
+        assert!(target_proc_id != 0, "Attempted to kill system thread!");
+    } 
 
     if this_task.is_none() {
         return;

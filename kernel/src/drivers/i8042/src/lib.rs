@@ -116,7 +116,7 @@ struct I8042Ctx {
     sc_pending:       RingBuffer<Keystroke, SC_PENDING_SIZE>,
     pending:          [PendingEntry; MAX_PENDING],
     pending_len:      usize,
-    keystroke_handler: Option<RegisterHandlerInfo>,
+    keystroke_handler: RegisterHandlerInfo,
     interrupt_handle: InterruptHandle,
     port_data:        u16,
     port_cmd:         u16
@@ -133,7 +133,7 @@ impl I8042Ctx {
             sc_pending:       RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 }),
             pending:          [PendingEntry { irp: core::ptr::null_mut(), requested: 0 }; MAX_PENDING],
             pending_len:      0,
-            keystroke_handler: None,
+            keystroke_handler: RegisterHandlerInfo::new(),
             interrupt_handle: InterruptHandle::new(),
             port_data:        DEFAULT_PORT_DATA,
             port_cmd:         DEFAULT_PORT_CMD
@@ -312,7 +312,7 @@ fn dispatch_control(device: &DeviceObject, request: &mut Irp) -> Status {
             let handler_info = unsafe { request.req_info.register_handler };
             let ctx = unsafe { &mut *(device.ctx as *mut I8042Ctx) };
             acquire_spinlock(&mut ctx.lock);
-            ctx.keystroke_handler = Some(handler_info);
+            ctx.keystroke_handler = handler_info;
             release_spinlock(&mut ctx.lock);
             request.complete_irp(Status::Success);
             Status::Success
@@ -449,13 +449,13 @@ extern "C" fn keyboard_dw(ctx_ptr: *mut c_void) {
     }
     ctx.pending_len = remaining;
 
-    let maybe_handler = ctx.keystroke_handler;
+    let class_handler = ctx.keystroke_handler;
 
     release_spinlock(&mut ctx.lock);
 
     // Invoke the registered input-layer handler outside the lock.
-    if let Some(info) = maybe_handler {
-        unsafe { (info.handler)(batch.as_ptr(), batch_len, info.context); }
+    if let Some(handler) = class_handler.handler {
+        unsafe { (handler)(batch.as_ptr(), batch_len, class_handler.context); }
     }
 
     // Complete satisfied read IRPs outside the lock.

@@ -739,6 +739,11 @@ pub fn remove_device(dev: &DeviceObjectK) {
         return;
     }
 
+    // We get the name all the way here since we can't guarantee that the name 
+    // string exists within the driver once remove request is sent.
+    // The driver is expected to deallocate all device related resources (including buffer storing its name)
+    let dev_name = dev.device.get_name().map(String::from);
+
     for cid in dev.children_snapshot() {
         if let Some(child) = get_device(cid) {
             remove_device(&child);
@@ -776,7 +781,8 @@ pub fn remove_device(dev: &DeviceObjectK) {
     }
 
     DEVICE_REGISTRY.lock().remove(&dev.id);
-    if let Some(n) = dev.device.get_name() {
+    if let Some(n) = &dev_name {
+        kernel_intf::debug!("Removing device {} from registry", n);
         DEVICE_BY_NAME.lock().remove(n);
     }
     crate::io_log!("remove_device: dropped device {}", dev.id);
