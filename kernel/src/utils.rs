@@ -81,3 +81,17 @@ macro_rules! acpica_log {
 macro_rules! acpica_log {
     ($($arg:tt)*) => {};
 }
+
+#[cfg(all(debug_assertions, feature = "debug-pipe-logs"))]
+#[macro_export]
+macro_rules! pipe_log {
+    ($($arg:tt)*) => {{
+        ::kernel_intf::debug!("[PIPE] {}", ::core::format_args!($($arg)*));
+    }};
+}
+
+#[cfg(not(all(debug_assertions, feature = "debug-pipe-logs")))]
+#[macro_export]
+macro_rules! pipe_log {
+    ($($arg:tt)*) => {};
+}

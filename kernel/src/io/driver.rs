@@ -314,6 +314,11 @@ impl DeviceObjectK {
         self.set_state(DeviceState::Stopped);
         self.update_stack_state(LevelState::Stopped);
         
+        let num_irps = self.pending_irps.lock().get_nodes();
+        if num_irps > 0 {
+            info!("Warning: Device {:?} has {} pending irp(s)", self.device.get_name(), num_irps);
+        }
+        
         if !is_child {
             self.enabled.store(false, Ordering::Release);
         }

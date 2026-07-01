@@ -40,7 +40,8 @@ enum syscall_t {
     SYSCALL_RMDIR,
     SYSCALL_CREATE_FILE,
     SYSCALL_CREATE_SYMLINK,
-    SYSCALL_READLINK
+    SYSCALL_READLINK,
+    SYSCALL_CREATE_PIPE
 };
 
 typedef enum {
@@ -67,6 +68,7 @@ typedef enum {
 #define PROCESS_SUSPEND_FLAG    ((uint64_t)1 << 0)
 #define OPEN_INHERITABLE_FLAG   ((uint64_t)1 << 0)
 #define CREATE_FILE_EXIST_FLAG  ((uint64_t)1 << 1)
+#define OPEN_WRITE_FLAG         ((uint64_t)1 << 2)
 
 typedef enum {
     CLOCK_MONOTONIC = 0,
@@ -147,3 +149,4 @@ ssize_t          sys_seek(handle_t handle, ssize_t offset, seek_whence_t whence)
 syscall_status_t sys_fstat(handle_t handle, file_stat_t *out);
 syscall_status_t sys_readdir(handle_t handle, size_t offset, char *buf, size_t buf_len, size_t *bytes_written);
 syscall_status_t sys_readlink(const char *path, char *buf, size_t buf_len, size_t *bytes_written);
+syscall_status_t sys_create_pipe(handle_t *read_handle, handle_t *write_handle, const char *name, boolean_t is_inheritable);

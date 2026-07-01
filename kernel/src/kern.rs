@@ -16,6 +16,7 @@ mod loader;
 mod io;
 mod object;
 mod utils;
+mod pipe;
 
 #[cfg(feature = "acpi")]
 mod acpica;
@@ -838,6 +839,7 @@ fn kern_main() -> ! {
     mem::reclaim_pages();
 
     sync::init();
+    pipe::init();
     sched::init();
     fs::init();
     loader::init();

@@ -11,6 +11,8 @@ use crate::devices::read_realtime;
 use crate::loader::load_user_image;
 use crate::mem::{self, PageDescriptor};
 use crate::io::io_request_sync;
+use crate::pipe::{PipeType, create_named_pipe};
+use crate::sched::Handle::{PipeReadHandle, PipeWriteHandle};
 use crate::sched::{self, Handle::{FileHandle, ProcessHandle, SyncHandle, ThreadHandle, DeviceHandle}};
 use crate::fs::{FileBuffer, FileStat};
 use crate::sync::{KEvent, KSem, do_signal, do_wait};
@@ -18,12 +20,18 @@ use super::*;
 use kernel_intf::*;
 use kernel_intf::driver::{IrpMajor, IrpMinor, ReqInfo, TtyControlInfo, EMPTY_REGION, Status};
 
-const MAX_SYSCALLS: usize = 36;
+const MAX_SYSCALLS: usize = 37;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
+
 const OPEN_INHERITABLE_FLAG: u64 = 1 << 0;
+pub const OPEN_CREATE_FLAG: u64 = 1 << 1;
+pub const OPEN_WRITE_FLAG: u64 = 1 << 2;
+
 const SYNC_TYPE_SEMAPHORE: u64 = 0;
 const SYNC_TYPE_EVENT: u64 = 1;
+
 const CREATE_FILE_EXIST_FLAG: u64 = 1 << 1;
+
 const SEEK_SET: u64 = 0;
 const SEEK_CUR: u64 = 1;
 const SEEK_END: u64 = 2;
@@ -65,7 +73,8 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_rmdir_handler,
     sys_create_file_handler,
     sys_create_symlink_handler,
-    sys_readlink_handler
+    sys_readlink_handler,
+    sys_create_pipe_handler
 ];
 
 fn read_c_strlen(start: usize) -> Option<usize> {
@@ -292,9 +301,9 @@ fn sys_read_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     if len == 0 {
         return E_SUCCESS;
     }
+    let buf = FileBuffer::from(args[1] as usize, len, true);
     match get_handle(args[0] as usize) {
         Some(FileHandle(f)) => {
-            let buf = FileBuffer::from(args[1] as usize, len, true);
             let completed = match f.read(&buf) {
                 Ok(n) => n,
                 Err(e) => return e.into()
@@ -303,10 +312,23 @@ fn sys_read_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
                 return E_INVALID_MEMORY_RANGE;
             }
             E_SUCCESS
-        }
+        },
+        Some(PipeReadHandle(p)) => {
+            let completed = match p.read(&buf) {
+                Ok(n) => n,
+                Err(e) => return e.into()
+            };
+            
+            if mem::copy_to_user(args[3] as usize, &completed as *const usize as *const u8, size_of::<usize>()).is_err() {
+                return E_INVALID_MEMORY_RANGE;
+            }
+            E_SUCCESS
+        },
         Some(DeviceHandle(h)) => {
             let mut kbuf = vec![0u8; len];
             let region = MemoryRegion { base_address: kbuf.as_mut_ptr() as usize, size: len };
+            
+            // Tell driver to write to the kernel buffer
             let result = match io_request_sync(&**h, IrpMajor::Read, IrpMinor::None, region, 0, None, true) {
                 Ok(r) => r,
                 Err(_) => return E_INVALID
@@ -315,6 +337,8 @@ fn sys_read_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
                 return E_INVALID;
             }
             let completed = result.bytes_completed;
+
+            // Now copy back to user
             if mem::copy_to_user(args[1] as usize, kbuf.as_ptr(), completed).is_err() {
                 return E_INVALID_MEMORY_RANGE;
             }
@@ -322,7 +346,7 @@ fn sys_read_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
                 return E_INVALID_MEMORY_RANGE;
             }
             E_SUCCESS
-        }
+        },
         _ => E_INVALID
     }
 }
@@ -333,9 +357,9 @@ fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     if len == 0 {
         return E_SUCCESS;
     }
+    let buf = FileBuffer::from(args[1] as usize, len, true);
     match get_handle(args[0] as usize) {
         Some(FileHandle(f)) => {
-            let buf = FileBuffer::from(args[1] as usize, len, true);
             let completed = match f.write(&buf, len, 0) {
                 Ok(n) => n,
                 Err(e) => return e.into()
@@ -344,7 +368,17 @@ fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
                 return E_INVALID_MEMORY_RANGE;
             }
             E_SUCCESS
-        }
+        },
+        Some(PipeWriteHandle(p)) => {
+            let completed = match p.write(&buf) {
+                Ok(n) => n,
+                Err(e) => return e.into()
+            };
+            if mem::copy_to_user(args[3] as usize, &completed as *const usize as *const u8, size_of::<usize>()).is_err() {
+                return E_INVALID_MEMORY_RANGE;
+            }
+            E_SUCCESS
+        },
         Some(DeviceHandle(h)) => {
             let mut kbuf = vec![0u8; len];
             if mem::copy_from_user(kbuf.as_mut_ptr(), args[1] as usize, len).is_err() {
@@ -363,7 +397,7 @@ fn sys_write_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
                 return E_INVALID_MEMORY_RANGE;
             }
             E_SUCCESS
-        }
+        },
         _ => E_INVALID
     }
 }
@@ -1047,7 +1081,7 @@ fn sys_rmdir_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-// arg0 = path ptr, arg1 = flags (bit0 = inheritable, bit1 = FILE_EXIST)
+// arg0 = path ptr, arg1 = flags 
 fn sys_create_file_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let path = match read_user_string(args[0] as usize) {
         Some(s) if !s.is_empty() => s,
@@ -1113,4 +1147,45 @@ fn sys_readlink_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
         return E_INVALID_MEMORY_RANGE;
     }
     E_SUCCESS
+}
+
+// arg0 = ptr to read handle, arg1 = ptr to write handle, arg2 = name, arg3 = is inheritable
+fn sys_create_pipe_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    if args[0] == 0 || args[1] == 0 {
+        return E_INVALID;
+    }
+
+    let mut name = None;
+    if args[2] != 0 {
+        let res = read_user_string(args[2] as usize);
+        match res {
+            Some(s) => {
+                if !s.is_empty() {
+                    name = Some(s);
+                }
+            },
+            None => { return E_INVALID_MEMORY_RANGE; }
+        }
+    }
+
+    match create_named_pipe(name) {
+        Err(err) => { err.into() },
+        Ok(pipe) => {
+            let read_handle = PipeReadHandle(PipeType::new(pipe.clone(), true));
+            let write_handle = PipeWriteHandle(PipeType::new(pipe, false));
+
+            let read_h = add_new_handle(read_handle, args[3] == 1);
+            let write_h = add_new_handle(write_handle, args[3] == 1); 
+
+            if mem::copy_to_user(args[0] as usize, &read_h as *const usize as *const u8, size_of::<usize>()).is_err() {
+                return E_INVALID_MEMORY_RANGE;
+            }
+            
+            if mem::copy_to_user(args[1] as usize, &write_h as *const usize as *const u8, size_of::<usize>()).is_err() {
+                return E_INVALID_MEMORY_RANGE;
+            }
+
+            E_SUCCESS
+        }
+    }
 }

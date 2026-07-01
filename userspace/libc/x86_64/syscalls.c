@@ -153,3 +153,7 @@ syscall_status_t sys_readdir(handle_t handle, size_t offset, char *buf, size_t b
 syscall_status_t sys_readlink(const char *path, char *buf, size_t buf_len, size_t *bytes_written) {
     return do_syscall(SYSCALL_READLINK, (uint64_t)path, (uint64_t)buf, buf_len, (uint64_t)bytes_written, 0, 0);
 }
+
+syscall_status_t sys_create_pipe(handle_t *read_handle, handle_t *write_handle, const char *name, boolean_t is_inheritable) {
+    return do_syscall(SYSCALL_CREATE_PIPE, (uint64_t)read_handle, (uint64_t)write_handle, (uint64_t)name, (uint64_t)is_inheritable, 0, 0);
+}

@@ -11,6 +11,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use kernel_intf::{info, KError};
 use kernel_intf::mem::PoolAllocatorGlobal;
+use crate::sched::OPEN_CREATE_FLAG;
 use crate::sync::Spinlock;
 
 fn cwd() -> String {
@@ -109,8 +110,15 @@ pub fn create_or_open(path: &str, file_exist_only: bool) -> Result<FileInstance,
     open(path)
 }
 
-fn open_fs_handler(name: &str, _flags: u64) -> Result<crate::sched::Handle, KError> {
-    open(name).map(crate::sched::Handle::FileHandle)
+fn open_fs_handler(name: &str, flags: u64) -> Result<crate::sched::Handle, KError> {
+    let res = if flags & OPEN_CREATE_FLAG != 0 {
+        create_or_open(name, false)?
+    }
+    else {
+        open(name)?
+    };
+
+    Ok(crate::sched::Handle::FileHandle(res))
 }
 
 pub fn init() {

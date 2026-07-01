@@ -253,7 +253,7 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
 
     // Only the current foreground process group can read/write to tty (if it exists)
     // Otherwise issue SIGTTIN to that entire process group
-    if fgrp != 0 && pid != 0 && !proc_is_foreground_pgrp(pid, fgrp) {
+    if fgrp != 0 && proc_is_pgrp_active(fgrp) && !proc_is_foreground_pgrp(pid, fgrp) {
         let caller_pgrp = proc_get_pgrp(pid);
         if caller_pgrp != 0 {
             info!("Not foreground process group!");
@@ -312,7 +312,7 @@ fn dispatch_write(device: &DeviceObject, request: &mut Irp) -> Status {
         p
     };
 
-    if fgrp != 0 && pid != 0 && !proc_is_foreground_pgrp(pid, fgrp) {
+    if fgrp != 0 && proc_is_pgrp_active(fgrp) && !proc_is_foreground_pgrp(pid, fgrp) {
         let caller_pgrp = proc_get_pgrp(pid);
         if caller_pgrp != 0 {
             info!("Not foreground process group");

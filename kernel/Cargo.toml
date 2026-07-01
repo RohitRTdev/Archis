@@ -20,6 +20,7 @@ debug-loader-logs = []
 debug-mem-logs = []
 debug-allocator-logs = []
 debug-acpica-logs = []
+debug-pipe-logs = []
 kunit-test = ["kernel_intf/kunit-test"]
 
 [dependencies]

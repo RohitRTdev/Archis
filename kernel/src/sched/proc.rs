@@ -10,6 +10,7 @@ use kernel_intf::list::{List, DynList};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use crate::fs::FileInstance;
 use crate::loader::{LoadedImage, LoadedImageWeak, load_image};
+use crate::pipe::PipeType;
 use crate::{KERNEL_PATH, hal};
 use crate::mem::{self, PageDescriptor, VCB, VirtMemConBlk, get_physical_address};
 use crate::sched::{self, *};
@@ -30,7 +31,9 @@ pub enum Handle {
     DeviceHandle(OpenDeviceHandle),
     ThreadHandle(KThread),
     ProcessHandle(KProcess),
-    SyncHandle(KSemInnerType)
+    SyncHandle(KSemInnerType),
+    PipeReadHandle(PipeType),
+    PipeWriteHandle(PipeType)
 }
 
 pub struct HandleType {
