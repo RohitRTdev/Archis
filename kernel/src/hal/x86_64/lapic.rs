@@ -202,8 +202,8 @@ pub fn init_timer() {
     // Setup timer in periodic mode. Masked initially
     lapic_write(TIMER_LVT, (1 << 17) | (1 << 16) | TIMER_VECTOR as u64);
 
-    // Divide by 1
-    lapic_write(DIVIDE_CNT_OFFSET, 0b1011);
+    // Divide by 128 
+    lapic_write(DIVIDE_CNT_OFFSET, 0b1010);
     lapic_write(INITIAL_CNT_OFFSET, 0xffffffff);
 }
 

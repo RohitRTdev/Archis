@@ -1,14 +1,15 @@
 use crate::hal::get_bsp_lapic_id;
 use crate::mem::{PageDescriptor, map_memory, reserve_virtual_memory};
 use crate::infra;
-use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use crate::BOOT_INFO;
 use crate::mem::PHY_MEM_CB;
-use kernel_intf::list::{List, DynList};
 use crate::sync::Spinlock;
 use crate::cpu::{self, MAX_CPUS};
+use kernel_intf::list::{List, DynList};
 use kernel_intf::{debug, info};
+use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use alloc::alloc::Layout;
+use alloc::vec::Vec;
 use common::PAGE_SIZE;
 use super::page_mapper;
 use super::lapic;
@@ -244,8 +245,17 @@ pub fn init() {
     }
     
     let bsp_id = get_bsp_lapic_id();
-    for (idx, core) in LAPIC_LIST.lock().iter().take(total_cores_capped).enumerate() {
-        if core.id == bsp_id {
+    let cores: Vec<usize> = LAPIC_LIST
+        .lock()
+        .iter()
+        .take(total_cores_capped)
+        .map(|l| {
+            l.id
+        })
+        .collect();
+
+    for (idx, &core) in cores.iter().enumerate() {
+        if core == bsp_id {
             continue;
         } 
 
@@ -265,18 +275,18 @@ pub fn init() {
         
         AP_INIT_COMPLETE.store(false, Ordering::SeqCst);
         let sipi_vector = (ap_start_code.addr() >> 12) as u8;
-        debug!("Sending INIT-SIPI-SIPI sequence to core:{} with apic_id:{} at vector: {}", idx, core.id, sipi_vector);
+        debug!("Sending INIT-SIPI-SIPI sequence to core:{} with apic_id:{} at vector: {}", idx, core, sipi_vector);
 
-        lapic::send_init_ipi(core.id as u32);
+        lapic::send_init_ipi(core as u32);
         timer::delay_ns(10_000_000);
-        lapic::send_init_deassert(core.id as u32);
+        lapic::send_init_deassert(core as u32);
         timer::delay_ns(200_000);
 
-        lapic::send_sipi(core.id as u32, sipi_vector);
+        lapic::send_sipi(core as u32, sipi_vector);
         timer::delay_ns(200_000);
         lapic::lapic_wait_icr_idle();
 
-        lapic::send_sipi(core.id as u32, sipi_vector);
+        lapic::send_sipi(core as u32, sipi_vector);
         timer::delay_ns(200_000);
         lapic::lapic_wait_icr_idle();
 
@@ -323,12 +333,10 @@ fn activate_local_core_nmi_trap() {
 extern "C" fn ap_init() -> ! {
     disable_interrupts();
     
-    // Signal BSP that this core is up
     let core = AP_CORES_ID.fetch_add(1, Ordering::SeqCst);
-    AP_INIT_COMPLETE.store(true, Ordering::SeqCst);
     lapic::init();
     super::init_per_cpu_data(core);
-    
+
     info!("Starting AP init for core {}", get_core());
     debug!("gs_base={:#X}, kernel_gs_base={:#X} on core {}", super::get_per_cpu_kernel_base(), super::get_per_cpu_base(),
  get_core());
@@ -343,7 +351,10 @@ extern "C" fn ap_init() -> ! {
     debug!("APIC base: {:#X}", lapic::get_apic_base());
     info!("AP core {} going to sleep", get_core());
     AP_CORES_INIT.fetch_add(1, Ordering::Release);
-    
+
+    // Signal BSP that this core has fully completed init
+    AP_INIT_COMPLETE.store(true, Ordering::SeqCst);
+
 
     // This will internally enable interrupts
     sleep();
