@@ -9,9 +9,11 @@ use crate::sync::Spinlock;
 use crate::mem::{PageDescriptor, allocate_memory, deallocate_memory, map_memory};
 
 pub const INIT_STACK_SIZE: usize  = PAGE_SIZE * 10;
+pub const INIT_BOOT_CPU_STACK_SIZE: usize  = PAGE_SIZE * 11;
 pub const INIT_GUARD_PAGE_SIZE: usize = PAGE_SIZE;
 pub const WORKER_STACK_SIZE: usize = 5 * PAGE_SIZE;
 pub const TOTAL_STACK_SIZE: usize = INIT_STACK_SIZE + INIT_GUARD_PAGE_SIZE;
+pub const TOTAL_BOOT_STACK_SIZE: usize = INIT_BOOT_CPU_STACK_SIZE + INIT_GUARD_PAGE_SIZE;
 
 static TOTAL_CPUS: AtomicUsize = AtomicUsize::new(1);
 
@@ -25,11 +27,6 @@ static KERNEL_STACK_TOP: u8 = 0;
 #[cfg_attr(target_arch = "x86_64", repr(align(4096)))]
 struct KStackGood {
     stack: [u8; PAGE_SIZE]
-}
-
-#[cfg_attr(target_arch = "x86_64", repr(align(4096)))]
-struct KStack {
-    stack: [u8; TOTAL_STACK_SIZE]
 }
 
 static KERN_BACKUP_STACK: KStackGood = KStackGood {
@@ -324,7 +321,7 @@ pub fn get_worker_stack(core_id: usize) -> usize {
 
 // This should be called once memory manager is up
 pub fn set_worker_stack_for_boot_cpu(stack_base: *mut u8) {
-    let stack = Stack {stack_size: INIT_STACK_SIZE, guard_size: INIT_GUARD_PAGE_SIZE, 
+    let stack = Stack {stack_size: INIT_BOOT_CPU_STACK_SIZE, guard_size: INIT_GUARD_PAGE_SIZE, 
         base: NonNull::new(stack_base).unwrap(), allocated: true, user: false};
 
     let mut cpu_list = CPU_LIST.local().lock();

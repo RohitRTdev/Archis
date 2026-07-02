@@ -64,15 +64,49 @@ impl Drop for ModuleDescriptor {
     }
 }
 
+impl ModuleDescriptor {
+    // Loads and gives the address of an exported symbol
+    pub fn load_symbol(&self, symbol: &str) -> Option<usize> {
+        let info = &self.kernel().info;
+        let dyn_tab = match info.dyn_tab { Some(t) => t, None => return None };
+        let dyn_str = match info.dyn_str { Some(s) => s, None => return None };
+
+        let entries = unsafe {
+            core::slice::from_raw_parts(
+                dyn_tab.start as *const Elf64Sym,
+                dyn_tab.size / dyn_tab.entry_size,
+            )
+        };
+
+        for sym in entries {
+            if sym.st_shndx == SHN_UNDEF {
+                continue;
+            }
+            let sym_name = unsafe { read_cstr(dyn_str.base_address, sym.st_name as usize) };
+            if sym_name == symbol {
+                let func_addr = info.base + sym.st_value as usize;
+                return Some(func_addr);
+            }
+        }
+
+        None
+    }
+}
+
+pub fn invoke_init(image: &LoadedImage) {
+    let entry = image.lock().kernel().info.entry;
+
+    let init_fn: extern "C" fn() = unsafe { core::mem::transmute(entry) };
+    init_fn();
+}
+
 
 pub fn init() {
     LOAD_LOCK.call_once(|| KSem::new(1, 1));
     super::user_loader::init();
 
     let mut kernel_img = module::ARIS.get().unwrap().lock().clone();
-    kernel_img.kernel_mut().file_handle = Some(
-        open(KERNEL_PATH).expect("Failed to open kernel image!")
-    );
+    kernel_img.kernel_mut().canonical_file_path = Some(KERNEL_PATH.to_owned());
 
     let loaded_img = Arc::new_in(
         Spinlock::new(
@@ -167,6 +201,8 @@ fn load_image_uncached(
     crate::loader_log!("Loading image {} from disk", path);
     let file = open(path)?;
     let file_size = file.len();
+    let abs_path = fs::make_absolute(&crate::sched::get_cwd(), path);
+    let canonical_file_path = Some(fs::resolve_symlink(&abs_path).expect("File path could not be resolved!"));
 
     let buf= FileBuffer::new(file_size, false)
     .or_else(|e| {
@@ -200,7 +236,7 @@ fn load_image_uncached(
             name: module_name,
             driver_init_address,
             driver_unload_address,
-            file_handle: Some(file),
+            canonical_file_path,
             info: mod_info,
             _deps: Some(deps)
         })
@@ -234,8 +270,8 @@ fn find_loaded_module(path: &str) -> Option<LoadedImage> {
     for entry in candidates {
         let matches = {
             let guard = entry.lock();
-            let fh = guard.kernel().file_handle.as_ref().unwrap();
-            fh.get_path() == canonical.as_str()
+            let fh = guard.kernel().canonical_file_path.as_ref().unwrap();
+            *fh == canonical
         };
         if matches {
             return Some(entry);

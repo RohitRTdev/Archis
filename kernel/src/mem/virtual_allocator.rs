@@ -1094,10 +1094,10 @@ pub fn virtual_allocator_init() {
     });
     
     // Create a new stack for boot cpu
-    let stack_raw= kernel_addr_space.allocate(Layout::from_size_align(cpu::TOTAL_STACK_SIZE, PAGE_SIZE).unwrap()
+    let stack_raw= kernel_addr_space.allocate(Layout::from_size_align(cpu::TOTAL_BOOT_STACK_SIZE, PAGE_SIZE).unwrap()
     , false).expect("Failed to create space in virtual address for boot cpu stack");
 
-    let stack_raw_phys = PHY_MEM_CB.get().unwrap().lock().allocate(Layout::from_size_align(cpu::INIT_STACK_SIZE, PAGE_SIZE).unwrap())
+    let stack_raw_phys = PHY_MEM_CB.get().unwrap().lock().allocate(Layout::from_size_align(cpu::INIT_BOOT_CPU_STACK_SIZE, PAGE_SIZE).unwrap())
     .expect("Failed to create space for physical address space for boot cpu stack");
 
     #[cfg(feature = "stack_down")]
@@ -1120,7 +1120,7 @@ pub fn virtual_allocator_init() {
         &dummy_reserve,
         stack_base.addr(),
         stack_raw_phys.addr(),
-        cpu::INIT_STACK_SIZE,
+        cpu::INIT_BOOT_CPU_STACK_SIZE,
         0
     );
 

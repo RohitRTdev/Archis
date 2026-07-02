@@ -1,10 +1,10 @@
 use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use core::alloc::Layout;
+use alloc::string::String;
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use common::{elf::*, PAGE_SIZE};
 use common::{MemoryRegion, ModuleInfo, FileDescriptor};
-use crate::fs::FileInstance;
 use crate::loader::LoadedImage;
 use crate::{BOOT_INFO, InitFS, KERNEL_PATH, REMAP_LIST, RemapEntry, RemapType::*};
 use crate::sync::{Once, Spinlock};
@@ -16,7 +16,7 @@ pub struct KernelModule {
     pub name: &'static str,
     pub driver_init_address: Option<usize>,
     pub driver_unload_address: Option<usize>,
-    pub file_handle: Option<FileInstance>,
+    pub canonical_file_path: Option<String>,
     pub info: ModuleInfo,
 
     // This is here so that the dependencies are not released when this image is loaded
@@ -34,7 +34,7 @@ pub struct UserModuleSegment {
 pub type SharedUserModuleRef = Arc<Spinlock<SharedUserModule>, PoolAllocatorGlobal>;
 
 pub struct SharedUserModule {
-    pub file_handle: FileInstance,
+    pub canonical_file_path: String,
     pub segments: Vec<UserModuleSegment>,
     pub total_size: usize,
     pub entry_offset: usize,
@@ -112,7 +112,7 @@ pub fn early_init() {
             name: env!("CARGO_PKG_NAME"),
             driver_init_address: None,
             driver_unload_address: None,
-            file_handle: None,
+            canonical_file_path: None,
             info: info.kernel_desc,
             _deps: None
         })

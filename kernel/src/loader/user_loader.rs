@@ -465,7 +465,7 @@ fn find_user_module(path: &str) -> Option<SharedUserModuleRef> {
     for entry in candidates {
         let matches = {
             let guard = entry.lock();
-            guard.file_handle.get_path() == canonical.as_str()
+            guard.canonical_file_path == canonical
         };
         if matches {
             return Some(entry);
@@ -521,7 +521,7 @@ fn do_load_user_inner(path: &str, in_progress: &mut Vec<String>) -> Result<Loade
         let (name_matches, base) = {
             let module_guard = module.lock();
             let desc_guard = module_guard.user().shared.lock();
-            (desc_guard.file_handle.get_path() == canonical.as_str(), module_guard.user().base)
+            (desc_guard.canonical_file_path == canonical, module_guard.user().base)
         };
 
         if name_matches {
@@ -556,6 +556,8 @@ fn load_user_into_process(
 
     let file = open(path)?;
     let file_size = file.len();
+    let abs_path = fs::make_absolute(&crate::sched::get_cwd(), path);
+    let canonical_file_path = fs::resolve_symlink(&abs_path).expect("File path could not be resolved!");
 
     let buf = FileBuffer::new(file_size, false)
     .or_else(|e| {
@@ -638,7 +640,7 @@ fn load_user_into_process(
             let dyn_info = img.dyn_info.as_ref();
             let shared = Arc::new_in(
                 Spinlock::new(SharedUserModule {
-                    file_handle: file,
+                    canonical_file_path,
                     segments: seg_meta,
                     total_size: img.total_size,
                     entry_offset: img.entry,
