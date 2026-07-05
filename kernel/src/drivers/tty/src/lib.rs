@@ -10,7 +10,7 @@ use kernel_intf::{
 };
 use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
-    DeviceObject, DriverObject, Irp, IrpMinor, Status,
+    DeviceObject, DeviceType, DriverObject, Irp, IrpMinor, Status,
     TtyControlInfo, create_device
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
@@ -54,7 +54,7 @@ const ECHO: u8 = 1 << 0;
 impl TtyCtx {
     const fn zeroed() -> Self {
         Self {
-            lock:        Lock { lock: 0, int_status: false },
+            lock:        Lock::new(),
             input_ring:  RingBuffer::new(0u8),
             pending:     [PendingEntry { irp: null_mut(), requested: 0 }; MAX_PENDING],
             pending_len: 0,
@@ -98,7 +98,7 @@ fn dispatch_add(driver: &DriverObject, pdo: &DeviceObject) -> Status {
 
     unsafe { create_spinlock(&mut (*(ctx_ptr as *mut TtyCtx)).lock); }
 
-    let dev = create_device(driver, Some("tty"), ctx_ptr, Some(pdo), false);
+    let dev = create_device(driver, Some("tty"), ctx_ptr, Some(pdo), false, DeviceType::None);
     if dev.is_null() {
         info!("tty: create_device failed");
         unsafe {

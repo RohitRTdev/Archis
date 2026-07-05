@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use common::{MemoryRegion, StrRef};
 use kernel_intf::driver::{
-    DeviceObject, DriverObject, EMPTY_REGION, Irp, IrpMajor, IrpMinor, IrpResult, ReqInfo, ResList, Status
+    DeviceObject, DeviceType, DriverObject, EMPTY_REGION, Irp, IrpMajor, IrpMinor, IrpResult, ReqInfo, ResList, Status
 };
 use kernel_intf::{acquire_spinlock, io_complete_irp, release_spinlock};
 use kernel_intf::list::{DynList, List};
@@ -103,6 +103,7 @@ pub struct DeviceObjectK {
     is_pdo: AtomicBool,
     // Class devices have a driver-managed lifecycle; they are never touched by PnP.
     is_class_device: bool,
+    device_type: DeviceType,
     enabled: AtomicBool,
     parent: Spinlock<Option<usize>>,
     children: Spinlock<Vec<usize>>,
@@ -143,6 +144,10 @@ impl DeviceObjectK {
 
     pub fn is_class_device(&self) -> bool {
         self.is_class_device
+    }
+
+    pub fn device_type(&self) -> DeviceType {
+        self.device_type
     }
 
     pub fn is_pdo(&self) -> bool {
@@ -413,7 +418,11 @@ fn allowed_in_state(state: DeviceState, major: IrpMajor, minor: IrpMinor, is_cla
         (IrpMajor::Pnp, IrpMinor::None)
         | (IrpMajor::Pnp, IrpMinor::RegisterKeyboardHandler)
         | (IrpMajor::Pnp, IrpMinor::SetForegroundPgrp)
-        | (IrpMajor::Pnp, IrpMinor::SetControllingTty) => false,
+        | (IrpMajor::Pnp, IrpMinor::SetControllingTty)
+        | (IrpMajor::Pnp, IrpMinor::DiskGetInfo)
+        | (IrpMajor::Pnp, IrpMinor::DiskCreateGpt)
+        | (IrpMajor::Pnp, IrpMinor::DiskAddPartition)
+        | (IrpMajor::Pnp, IrpMinor::DiskGetPartitionInfo) => false,
     }
 }
 
@@ -535,6 +544,10 @@ pub fn get_device(id: usize) -> Option<DeviceHandleK> {
     DEVICE_REGISTRY.lock().get(&id).cloned()
 }
 
+pub fn devices_by_type(t: DeviceType) -> Vec<DeviceHandleK> {
+    DEVICE_REGISTRY.lock().values().filter(|d| d.device_type() == t).cloned().collect()
+}
+
 
 pub fn root_device() -> DeviceHandleK {
     ROOT_DEVICE.get().expect("root device not initialized").clone()
@@ -550,6 +563,7 @@ fn create_root_device() -> DeviceHandleK {
             state: AtomicUsize::new(DeviceState::Started as usize),
             is_pdo: AtomicBool::new(true),
             is_class_device: false,
+            device_type: DeviceType::None,
             parent: Spinlock::new(None),
             enabled: AtomicBool::new(false),
             children: Spinlock::new(Vec::new()),
@@ -669,7 +683,8 @@ pub extern "C" fn io_create_device(
     name: StrRef,
     ctx: *mut c_void,
     parent: *const DeviceObject,
-    is_class: bool
+    is_class: bool,
+    device_type: DeviceType
 ) -> *mut DeviceObject {
     let driver = match DRIVER_REGISTRY.lock().get(&driver_id) {
         Some(driver) => driver.clone(),
@@ -707,6 +722,7 @@ pub extern "C" fn io_create_device(
             state: AtomicUsize::new(DeviceState::Stopped as usize),
             is_pdo: AtomicBool::new(false),
             is_class_device: is_class,
+            device_type,
             enabled: AtomicBool::new(false),
             parent: Spinlock::new(parent_id),
             children: Spinlock::new(Vec::new()),
@@ -750,6 +766,17 @@ pub fn resolve_device(ptr: *const DeviceObject) -> Option<DeviceHandleK> {
 
 pub fn open_device_handle(name: &str) -> Result<OpenDeviceHandle, KError> {
     let dev = DEVICE_BY_NAME.lock().get(name).cloned().ok_or(KError::InvalidArgument)?;
+    match dev.state() {
+        DeviceState::Stopping | DeviceState::Stopped => {
+            return Err(KError::DeviceStopped);
+        },
+        _ => {}
+    }
+    let _ = io_request_sync(&dev, IrpMajor::Open, IrpMinor::None, EMPTY_REGION, 0, None, false);
+    Ok(Arc::new_in(OpenDeviceHandleInner { dev }, PoolAllocatorGlobal))
+}
+
+pub fn open_device(dev: DeviceHandleK) -> Result<OpenDeviceHandle, KError> {
     match dev.state() {
         DeviceState::Stopping | DeviceState::Stopped => {
             return Err(KError::DeviceStopped);
@@ -923,14 +950,16 @@ pub extern "C" fn io_send_request_ffi(
     req_info_ptr: *const ReqInfo,
     completion: Option<extern "C" fn(*const IrpResult, *mut c_void)>,
     completion_ctx: *mut c_void
-) -> Status {
+) -> IrpResult {
+    let failed = || IrpResult { status: Status::Failed, ..IrpResult::default() };
+
     let dev = match resolve_device(device) {
         Some(dev) => dev,
-        None => return Status::Failed
+        None => return failed()
     };
     let major = match IrpMajor::from_usize(major) {
         Some(major) => major,
-        None => return Status::Failed
+        None => return failed()
     };
     let minor = IrpMinor::from_usize(minor).unwrap_or(IrpMinor::None);
     let buffer = MemoryRegion { base_address: buf_base, size: buf_size };
@@ -940,12 +969,17 @@ pub extern "C" fn io_send_request_ffi(
         Some(unsafe { *req_info_ptr })
     };
 
-    let result = match completion {
-        None    => io_request_sync(&dev, major, minor, buffer, offset, req_info, false).map(|r| r.status),
-        Some(r) => io_request_async(&dev, major, minor, buffer, offset, req_info, r, completion_ctx)
-    };
-
-    result.unwrap_or(Status::Failed)
+    match completion {
+        // Sync: the completed IRP (including any req_info the driver wrote)
+        // is available immediately.
+        None => io_request_sync(&dev, major, minor, buffer, offset, req_info, false).unwrap_or_else(|_| failed()),
+        // Async: the real result arrives later via `completion`. All we can
+        // hand back here is the dispatch status.
+        Some(r) => {
+            let status = io_request_async(&dev, major, minor, buffer, offset, req_info, r, completion_ctx).unwrap_or(Status::Failed);
+            IrpResult { status, ..IrpResult::default() }
+        }
+    }
 }
 
 #[unsafe(no_mangle)]

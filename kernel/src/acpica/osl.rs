@@ -17,7 +17,7 @@ use kernel_intf::{debug, info, io_allocate_vector_for_irq};
 use kernel_intf::list::{DynList, List, ListNodeGuard};
 use kernel_intf::mem::{Allocator, PoolAllocator, PoolAllocatorGlobal};
 use kernel_intf::{io_install_interrupt_handler, io_remove_interrupt_handler};
-use kernel_intf::InterruptHandle;
+use kernel_intf::KInterruptHandle;
 
 use acpi_intf::*;
 
@@ -52,7 +52,7 @@ static WORK_QUEUE: Once<WorkQueue> = Once::new();
 struct SciHandler {
     handler: AcpiHandlerSCI,
     context: *mut c_void,
-    kernel_handle: InterruptHandle,
+    kernel_handle: KInterruptHandle,
 }
 
 unsafe impl Send for SciHandler {}

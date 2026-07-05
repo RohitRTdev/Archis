@@ -10,7 +10,7 @@ use kernel_intf::{
 };
 use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
-    DeviceObject, DriverObject, Irp, IrpMajor, IrpMinor,
+    DeviceObject, DeviceType, DriverObject, Irp, IrpMajor, IrpMinor,
     Keystroke, KeystrokeHandler, RegisterHandlerInfo, ReqInfo, Status,
     create_device, create_device_by_id
 };
@@ -49,7 +49,7 @@ unsafe impl Sync for InputCtx {}
 impl InputCtx {
     const fn zeroed() -> Self {
         Self {
-            lock:       Lock { lock: 0, int_status: false },
+            lock:       Lock::new(),
             raw_ring:   RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 }),
             ascii_ring: RingBuffer::new(0u8),
             pending:    [PendingEntry { irp: null_mut(), requested: 0 }; MAX_PENDING],
@@ -87,7 +87,7 @@ fn driver_init(driver: &mut DriverObject) -> Status {
     let ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(ctx).0 as *mut c_void;
 
     // Create the "input" class device — lifecycle is fully driver-managed.
-    let dev = create_device_by_id(driver.id, Some("input"), ctx_ptr, None, true);
+    let dev = create_device_by_id(driver.id, Some("input"), ctx_ptr, None, true, DeviceType::Input);
     if dev.is_null() {
         info!("input: create_device failed for class device");
         return Status::Failed;
@@ -131,7 +131,7 @@ fn dispatch_add(driver: &DriverObject, pdo: &DeviceObject) -> Status {
     );
     let ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(kbd_ctx).0 as *mut c_void;
 
-    let dev = create_device(driver, Some(name), ctx_ptr, Some(pdo), false);
+    let dev = create_device(driver, Some(name), ctx_ptr, Some(pdo), false, DeviceType::None);
     if dev.is_null() {
         info!("input: create_device failed for {}", name);
         unsafe {

@@ -4,14 +4,17 @@
 extern crate alloc;
 
 mod log;
-pub use log::*;
 pub mod mem;
 pub mod ds;
-pub use ds::list;
 pub mod driver;
 pub mod hw;
+pub mod fs;
 pub mod remove_lock;
+
+pub use ds::list;
+pub use log::*;
 pub use remove_lock::RemoveLock;
+
 use core::{ffi::c_void, fmt};
 use common::StrRef;
 use alloc::vec::Vec;
@@ -29,13 +32,13 @@ pub const SIGTTIN: u8 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct InterruptHandle {
+pub struct KInterruptHandle {
     pub irq:      isize,
     pub vector:   usize,
     pub node_ptr: usize
 }
 
-impl InterruptHandle {
+impl KInterruptHandle {
     pub const fn new() -> Self {
         Self {
             irq: 0,
@@ -71,7 +74,9 @@ pub enum KError {
     TooManySymlinks,
     NotEmpty,
     BufferTooSmall,
-    NoMoreEntries
+    NoMoreEntries,
+    IsSymlink,
+    DeviceMounted
 }
 
 pub const E_SUCCESS: i64 = 0;
@@ -96,6 +101,8 @@ pub const E_TOO_MANY_SYMLINKS: i64 = -18;
 pub const E_NOT_EMPTY: i64      = -19;
 pub const E_BUF_TOO_SMALL: i64  = -20;
 pub const E_NO_DIR_ENTRIES: i64 = -21;
+pub const E_IS_SYMLINK: i64     = -22;
+pub const E_DEVICE_MOUNTED: i64     = -23;
 
 impl<T> From<Result<T, KError>> for KError {
     fn from(e: Result<T, KError>) -> Self {
@@ -126,7 +133,38 @@ impl From<KError> for i64 {
             KError::TooManySymlinks => E_TOO_MANY_SYMLINKS,
             KError::NotEmpty => E_NOT_EMPTY,
             KError::BufferTooSmall => E_BUF_TOO_SMALL,
-            KError::NoMoreEntries => E_NO_DIR_ENTRIES
+            KError::NoMoreEntries => E_NO_DIR_ENTRIES,
+            KError::IsSymlink => E_IS_SYMLINK,
+            KError::DeviceMounted => E_DEVICE_MOUNTED
+        }
+    }
+}
+
+impl From<i64> for KError {
+    fn from(v: i64) -> Self {
+        match v {
+            E_SUCCESS => KError::Success,
+            E_INVALID => KError::InvalidArgument,
+            E_OOM => KError::OutOfMemory,
+            E_NOT_SUPPORTED => KError::Unsupported,
+            E_DEV_STOPPED => KError::DeviceStopped,
+            E_DEV_REMOVED => KError::DeviceRemoved,
+            E_DEV_STARTED => KError::DeviceStarted,
+            E_PROCESS_TERMINATED => KError::ProcessTerminated,
+            E_WAIT_INTERRUPTED => KError::WaitInterrupted,
+            E_TIMEOUT => KError::WaitTimedOut,
+            E_NOT_FOUND => KError::NotFound,
+            E_IS_DIR => KError::IsADirectory,
+            E_NOT_DIR => KError::NotADirectory,
+            E_FILE_EXISTS => KError::FileExists,
+            E_FILE_BUSY => KError::FileBusy,
+            E_TOO_MANY_SYMLINKS => KError::TooManySymlinks,
+            E_NOT_EMPTY => KError::NotEmpty,
+            E_BUF_TOO_SMALL => KError::BufferTooSmall,
+            E_NO_DIR_ENTRIES => KError::NoMoreEntries,
+            E_IS_SYMLINK => KError::IsSymlink,
+            E_DEVICE_MOUNTED => KError::DeviceMounted,
+            _ => KError::InvalidArgument
         }
     }
 }
@@ -158,6 +196,8 @@ impl fmt::Display for KError {
             KError::NotEmpty => "Directory not empty",
             KError::BufferTooSmall => "Buffer too small",
             KError::NoMoreEntries => "No more directory entries",
+            KError::IsSymlink => "Path component is a symlink",
+            KError::DeviceMounted => "Device is already mounted",
             KError::Success => "Success"
         };
         write!(f, "{}", description)
@@ -198,6 +238,16 @@ pub struct Lock {
     pub int_status: bool
 }
 
+impl Lock {
+    pub const fn new() -> Self {
+        Self {
+            lock: 0,
+            int_status: false
+        }
+    }
+}
+
+
 #[cfg_attr(not(feature = "link-kernel"), link(name = "aris"))]
 unsafe extern "C" {
     fn create_spinlock_ffi(lock: &mut Lock);
@@ -222,7 +272,8 @@ unsafe extern "C" {
         name: StrRef,
         ctx: *mut core::ffi::c_void,
         parent: *const driver::DeviceObject,
-        is_class: bool
+        is_class: bool,
+        device_type: driver::DeviceType
     ) -> *mut driver::DeviceObject;
 
     fn io_send_request_ffi(
@@ -235,7 +286,7 @@ unsafe extern "C" {
         req_info_ptr: *const driver::ReqInfo,
         completion: Option<extern "C" fn(*const driver::IrpResult, *mut core::ffi::c_void)>,
         completion_ctx: *mut core::ffi::c_void
-    ) -> driver::Status;
+    ) -> driver::IrpResult;
 
     fn tty_print_ffi(s: *const u8, len: usize);
     fn enable_tty_mode_ffi();
@@ -261,9 +312,9 @@ unsafe extern "C" {
         handler: InterruptRoutine,
         active_high: bool,
         is_edge_triggered: bool
-    ) -> InterruptHandle;
+    ) -> KInterruptHandle;
 
-    fn io_remove_interrupt_handler_ffi(handle: InterruptHandle);
+    fn io_remove_interrupt_handler_ffi(handle: KInterruptHandle);
     fn sched_exit_process_ffi(exit_code: isize) -> !;
     fn sched_get_num_process_args_ffi() -> usize;
     fn sched_get_cur_process_arg_ffi(num: usize) -> StrRef;
@@ -295,8 +346,33 @@ unsafe extern "C" {
     fn proc_issue_pgrp_ffi(val: ProcessGroupType, signal: u8);
 
     fn allocate_vector_ffi() -> usize;
-    fn allocate_vector_for_irq_ffi(irq: usize) -> usize; 
+    fn allocate_vector_for_irq_ffi(irq: usize) -> usize;
     fn free_vector_ffi(vector: usize);
+
+    fn sync_create_semaphore_ffi(initial: isize, max: isize) -> usize;
+    fn sync_wait_semaphore_ffi(handle: usize);
+    fn sync_signal_semaphore_ffi(handle: usize);
+    fn sync_destroy_semaphore_ffi(handle: usize);
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct KSyncHandle(pub usize);
+
+pub fn sync_create_semaphore(initial: isize, max: isize) -> KSyncHandle {
+    KSyncHandle(unsafe { sync_create_semaphore_ffi(initial, max) })
+}
+
+pub fn sync_wait_semaphore(handle: KSyncHandle) {
+    unsafe { sync_wait_semaphore_ffi(handle.0) }
+}
+
+pub fn sync_signal_semaphore(handle: KSyncHandle) {
+    unsafe { sync_signal_semaphore_ffi(handle.0) }
+}
+
+pub fn sync_destroy_semaphore(handle: KSyncHandle) {
+    unsafe { sync_destroy_semaphore_ffi(handle.0) }
 }
 
 pub fn io_create_driver_worker(
@@ -329,11 +405,11 @@ pub fn io_install_interrupt_handler(
     handler: InterruptRoutine,
     active_high: bool,
     is_edge_triggered: bool,
-) -> InterruptHandle {
+) -> KInterruptHandle {
     unsafe { io_install_interrupt_handler_ffi(vector, irq, context, handler, active_high, is_edge_triggered) }
 }
 
-pub fn io_remove_interrupt_handler(handle: InterruptHandle) {
+pub fn io_remove_interrupt_handler(handle: KInterruptHandle) {
     unsafe { io_remove_interrupt_handler_ffi(handle); }
 }
 
@@ -427,7 +503,7 @@ pub fn io_send_request(
     req_info_ptr: *const driver::ReqInfo,
     completion: Option<extern "C" fn(*const driver::IrpResult, *mut core::ffi::c_void)>,
     completion_ctx: *mut core::ffi::c_void
-) -> driver::Status {
+) -> driver::IrpResult {
     unsafe { io_send_request_ffi(device, major, minor, buf_base, buf_size, offset, req_info_ptr, completion, completion_ctx) }
 }
 

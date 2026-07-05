@@ -102,6 +102,20 @@ macro_rules! debug {
     ($($arg:tt)*) => {};
 }
 
+#[cfg(debug_assertions)]
+#[macro_export]
+macro_rules! fs_log {
+    ($($arg:tt)*) => {{
+        $crate::level_print!("FS", $($arg)*);
+    }};
+}
+
+#[cfg(not(debug_assertions))]
+#[macro_export]
+macro_rules! fs_log {
+    ($($arg:tt)*) => {};
+}
+
 impl core::fmt::Write for KernelLogger {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         unsafe {
@@ -138,7 +152,7 @@ pub struct KernelLogger {
 pub static mut LOGGER: KernelLogger = KernelLogger {
     module_name: env!("CARGO_PKG_NAME"),
     log_timestamp: core::sync::atomic::AtomicBool::new(false),
-    lock: crate::Lock { lock: 0, int_status: false },
+    lock: crate::Lock::new(),
     scratch_buffer: [0; LOG_SCRATCH_BUFFER_SIZE],
     buf_size: 0
 };

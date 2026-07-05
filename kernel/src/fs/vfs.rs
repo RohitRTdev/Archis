@@ -7,7 +7,7 @@ use kernel_intf::KError;
 use kernel_intf::mem::PoolAllocatorGlobal;
 use crate::sync::Spinlock;
 
-const MAX_SYMLINK_DEPTH: usize = 8;
+pub const MAX_SYMLINK_DEPTH: usize = 8;
 
 pub const MODE_FILE: u16    = 1 << 0;
 pub const MODE_DIR: u16     = 1 << 1;
@@ -47,10 +47,16 @@ pub enum NodeKind {
     Symlink { target: String }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct FileAttrs {
     pub mode: u16,
     pub size: u64
+}
+
+pub enum ProbeStep {
+    Found { attrs: FileAttrs, symlink_target: Option<String> },
+    // `dir`/`remaining` are both relative to the current backend/mount.
+    Symlink { dir: String, target: String, remaining: String }
 }
 
 #[repr(C)]
@@ -118,7 +124,7 @@ pub fn make_absolute(cwd: &str, path: &str) -> String {
 }
 
 // Returns (parent_path, file_name) for an absolute normalised path.
-fn split_parent(path: &str) -> (&str, &str) {
+pub(crate) fn split_parent(path: &str) -> (&str, &str) {
     if path == "/" { return ("/", ""); }
     match path.rfind('/') {
         Some(0) => (&path[..1], &path[1..]),
@@ -215,25 +221,15 @@ impl Vfs {
         Ok(cur)
     }
 
-    // Walk `path` from the root, returning (node, ancestors_root_first).
-    // `follow_final`: if true, follow a symlink in the last component.
-    // `depth`: symlink recursion depth guard.
-    fn traverse(
-        &self,
-        path: &str,
-        follow_final: bool,
-        depth: usize
-    ) -> Result<(VfsNodeRef, Vec<VfsNodeRef>), KError> {
-        if depth > MAX_SYMLINK_DEPTH {
-            return Err(KError::TooManySymlinks);
-        }
-
+    pub fn probe(&self, path: &str, follow_final: bool) -> Result<ProbeStep, KError> {
         let comps: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         let mut cur = Arc::clone(&self.root);
-        let mut ancestors: Vec<VfsNodeRef> = Vec::new();
 
         if comps.is_empty() {
-            return Ok((Arc::clone(&self.root), Vec::new()));
+            let g = cur.lock();
+            let mut attrs = g.attrs;
+            if let NodeKind::File { data, .. } = &g.kind { attrs.size = data.len() as u64; }
+            return Ok(ProbeStep::Found { attrs, symlink_target: None });
         }
 
         for (idx, &comp) in comps.iter().enumerate() {
@@ -245,89 +241,50 @@ impl Vfs {
                     NodeKind::Dir { children, .. } => {
                         children.get(comp).map(Arc::clone).ok_or(KError::NotFound)?
                     }
-                    NodeKind::File { .. } => return Err(KError::NotADirectory),
-                    NodeKind::Symlink { target } => {
-                        // `cur` itself is a symlink — shouldn't happen in a well-formed
-                        // tree (only leaves can be symlinks for intermediate traversal)
-                        // but handle it defensively.
-                        let target = target.clone();
-                        drop(g);
-                        let remaining = comps[idx..].join("/");
-                        let full = Self::join_symlink_target(
-                            &rebuild_path(&comps[..idx]),
-                            &target,
-                            &remaining
-                        );
-                        return self.traverse(&full, follow_final, depth + 1)
-                            .map(|(n, mut a)| { a.splice(0..0, ancestors); (n, a) });
-                    }
+                    // `cur` only ever becomes a symlink target below via an
+                    // early return, so it can never itself be a symlink here.
+                    _ => return Err(KError::NotADirectory)
                 }
             };
 
-            if is_last {
-                // Decide whether to follow the final component if it's a symlink.
-                let is_symlink = {
-                    let g = child.lock();
-                    matches!(&g.kind, NodeKind::Symlink { .. })
-                };
-
-                if is_symlink && follow_final {
-                    let target = {
-                        let g = child.lock();
-                        if let NodeKind::Symlink { target } = &g.kind { 
-                            target.clone() 
-                        } 
-                        else { 
-                            panic!("Symlink node found as not symlink??"); 
-                        }
-                    };
-                    ancestors.push(Arc::clone(&cur));
-                    let parent_path = rebuild_path(&comps[..idx]);
-                    let full = Self::join_symlink_target(&parent_path, &target, "");
-                    return self.traverse(&full, true, depth + 1)
-                        .map(|(n, mut a)| { a.splice(0..0, ancestors); (n, a) });
-                }
-
-                ancestors.push(Arc::clone(&cur));
-                return Ok((child, ancestors));
-            }
-
-            // Intermediate component: follow symlinks transparently.
             let is_symlink = {
                 let g = child.lock();
                 matches!(&g.kind, NodeKind::Symlink { .. })
             };
 
-            if is_symlink {
+            if is_symlink && (!is_last || follow_final) {
                 let target = {
                     let g = child.lock();
-                    if let NodeKind::Symlink { target } = &g.kind { 
-                        target.clone() 
-                    } else { 
-                        panic!("Symlink node found as not symlink??"); 
-                    }
+                    if let NodeKind::Symlink { target } = &g.kind { target.clone() } else { unreachable!() }
                 };
-                ancestors.push(Arc::clone(&cur));
-                let parent_path = rebuild_path(&comps[..idx]);
-                let remaining = comps[idx + 1..].join("/");
-                let full = Self::join_symlink_target(&parent_path, &target, &remaining);
-                return self.traverse(&full, follow_final, depth + 1)
-                    .map(|(n, mut a)| { a.splice(0..0, ancestors); (n, a) });
+                let dir = rebuild_path(&comps[..idx]);
+                let remaining = if is_last { String::new() } else { comps[idx + 1..].join("/") };
+                crate::fs_log!("memory backend: probe path={} hit symlink dir={} target={} remaining={}", path, dir, target, remaining);
+                return Ok(ProbeStep::Symlink { dir, target, remaining });
             }
 
-            ancestors.push(Arc::clone(&cur));
+            if is_last {
+                let g = child.lock();
+                let mut attrs = g.attrs;
+                let symlink_target = match &g.kind {
+                    NodeKind::File { data, .. } => { attrs.size = data.len() as u64; None }
+                    NodeKind::Dir { .. } => None,
+                    NodeKind::Symlink { target } => Some(target.clone())
+                };
+                return Ok(ProbeStep::Found { attrs, symlink_target });
+            }
+
             cur = child;
         }
 
-        // Reached here only if comps was empty, handled above.
-        Ok((cur, ancestors))
+        unreachable!()
     }
 
     // Compute the path to follow after encountering a symlink.
     // `dir`    : absolute path of the directory containing the symlink.
     // `target` : the symlink's target (absolute or relative).
     // `rest`   : remaining path components after the symlink (may be empty).
-    fn join_symlink_target(dir: &str, target: &str, rest: &str) -> String {
+    pub fn join_symlink_target(dir: &str, target: &str, rest: &str) -> String {
         let base = if target.starts_with('/') {
             target.to_owned()
         } else {
@@ -341,18 +298,29 @@ impl Vfs {
         normalize_path(&full)
     }
 
-    fn get_node(&self, path: &str, follow_final: bool) -> Result<VfsNodeRef, KError> {
-        self.traverse(path, follow_final, 0).map(|(n, _)| n)
-    }
+    // Open an already fully-resolved (no remaining symlinks) path for
+    // file/dir access. Returns (node, ancestors, is_dir) with open_counts
+    // incremented on all — this prevents the dir it is in from being
+    // deleted/renamed while a file within it is open.
+    pub fn open_at(&self, path: &str) -> Result<(VfsNodeRef, Vec<VfsNodeRef>, bool), KError> {
+        let comps: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let mut cur = Arc::clone(&self.root);
+        let mut ancestors: Vec<VfsNodeRef> = Vec::new();
 
-    // Open a path for file/dir access.
-    // Returns (node, ancestors, is_dir) with open_counts incremented on all.
-    // This prevents the dir that it is in to not get deleted/renamed when a file within it is opened
-    pub fn open(&self, path: &str) -> Result<(VfsNodeRef, Vec<VfsNodeRef>, bool), KError> {
-        let (node, ancestors) = self.traverse(path, true, 0)?;
+        for &comp in &comps {
+            let next = {
+                let g = cur.lock();
+                match &g.kind {
+                    NodeKind::Dir { children, .. } => children.get(comp).map(Arc::clone).ok_or(KError::NotFound)?,
+                    _ => return Err(KError::NotADirectory)
+                }
+            };
+            ancestors.push(Arc::clone(&cur));
+            cur = next;
+        }
 
         let is_dir = {
-            let mut g = node.lock();
+            let mut g = cur.lock();
             match &mut g.kind {
                 NodeKind::File { open_count, .. } => {
                     *open_count += 1;
@@ -363,7 +331,7 @@ impl Vfs {
                     true
                 }
                 NodeKind::Symlink { .. } => {
-                    // traverse(follow_final=true) should have resolved this.
+                    // Caller must have already resolved this.
                     return Err(KError::TooManySymlinks);
                 }
             }
@@ -376,7 +344,7 @@ impl Vfs {
             }
         }
 
-        Ok((node, ancestors, is_dir))
+        Ok((cur, ancestors, is_dir))
     }
 
     // Decrement open_count on `node` and all `ancestors`
@@ -401,88 +369,69 @@ impl Vfs {
         }
     }
 
-    pub fn stat(&self, path: &str) -> Result<FileAttrs, KError> {
-        let node = self.get_node(path, true)?;
-        let g = node.lock();
-        let mut attrs = g.attrs;
-        if let NodeKind::File { data, .. } = &g.kind {
-            attrs.size = data.len() as u64;
+    // Whether anything is currently open anywhere within this vfs
+    pub fn root_busy(&self) -> bool {
+        let g = self.root.lock();
+        match &g.kind {
+            NodeKind::Dir { open_count, .. } => *open_count > 0,
+            _ => false
         }
-        Ok(attrs)
     }
 
-    pub fn lstat(&self, path: &str) -> Result<(FileAttrs, Option<String>), KError> {
-        let node = self.get_node(path, false)?;
-        let g = node.lock();
-        let mut attrs = g.attrs;
-        let symlink_target = match &g.kind {
-            NodeKind::File { data, .. } => {
-                attrs.size = data.len() as u64;
-                None
-            }
-            NodeKind::Dir { .. } => None,
-            NodeKind::Symlink { target } => Some(target.clone())
-        };
-        Ok((attrs, symlink_target))
-    }
-
-    pub fn create_file(&self, path: &str, mode: u16) -> Result<(), KError> {
-        let (par, name) = split_parent(path);
-        if name.is_empty() { return Err(KError::InvalidArgument); }
-        let parent = self.get_node(par, true)?;
+    pub fn create_file_in(&self, parent_rel: &str, leaf: &str, mode: u16) -> Result<(), KError> {
+        if leaf.is_empty() { return Err(KError::InvalidArgument); }
+        let parent = self.raw_get(parent_rel)?;
         let mut pg = parent.lock();
         match &mut pg.kind {
             NodeKind::Dir { children, .. } => {
-                if children.contains_key(name) { return Err(KError::FileExists); }
-                children.insert(name.to_owned(), new_file_node(FileData::Owned(Vec::new()), mode));
+                if children.contains_key(leaf) { return Err(KError::FileExists); }
+                children.insert(leaf.to_owned(), new_file_node(FileData::Owned(Vec::new()), mode));
                 Ok(())
             }
             _ => Err(KError::NotADirectory)
         }
     }
 
-    pub fn create_dir(&self, path: &str, mode: u16) -> Result<(), KError> {
-        let (par, name) = split_parent(path);
-        if name.is_empty() { return Err(KError::InvalidArgument); }
-        let parent = self.get_node(par, true)?;
+    pub fn mkdir_in(&self, parent_rel: &str, leaf: &str, mode: u16) -> Result<(), KError> {
+        if leaf.is_empty() { return Err(KError::InvalidArgument); }
+        let parent = self.raw_get(parent_rel)?;
         let mut pg = parent.lock();
         match &mut pg.kind {
             NodeKind::Dir { children, .. } => {
-                if children.contains_key(name) { return Err(KError::FileExists); }
-                children.insert(name.to_owned(), new_dir(mode));
+                if children.contains_key(leaf) { return Err(KError::FileExists); }
+                children.insert(leaf.to_owned(), new_dir(mode));
                 Ok(())
             }
             _ => Err(KError::NotADirectory)
         }
     }
 
-    pub fn create_symlink(&self, path: &str, target: &str) -> Result<(), KError> {
-        let (par, name) = split_parent(path);
-        if name.is_empty() { return Err(KError::InvalidArgument); }
-        let parent = self.get_node(par, true)?;
+    pub fn create_symlink_in(&self, parent_rel: &str, leaf: &str, target: &str) -> Result<(), KError> {
+        if leaf.is_empty() { return Err(KError::InvalidArgument); }
+        let parent = self.raw_get(parent_rel)?;
         let mut pg = parent.lock();
         match &mut pg.kind {
             NodeKind::Dir { children, .. } => {
-                if children.contains_key(name) { return Err(KError::FileExists); }
-                children.insert(name.to_owned(), new_symlink_node(target.to_owned()));
+                if children.contains_key(leaf) { return Err(KError::FileExists); }
+                children.insert(leaf.to_owned(), new_symlink_node(target.to_owned()));
                 Ok(())
             }
             _ => Err(KError::NotADirectory)
         }
     }
 
-    // Delete the node at `path`. Does NOT follow the final symlink component.
-    pub fn delete(&self, path: &str) -> Result<(), KError> {
-        let (par, name) = split_parent(path);
-        if name.is_empty() { return Err(KError::InvalidArgument); }
+    // Delete the leaf `leaf` of the already-resolved parent `parent_rel`.
+    // Does NOT follow a symlink at `leaf` — deletes the symlink itself.
+    pub fn delete_in(&self, parent_rel: &str, leaf: &str) -> Result<(), KError> {
+        if leaf.is_empty() { return Err(KError::InvalidArgument); }
 
-        let parent = self.get_node(par, true)?;
+        let parent = self.raw_get(parent_rel)?;
         let mut pg = parent.lock();
         let children = match &mut pg.kind {
             NodeKind::Dir { children, .. } => children,
             _ => return Err(KError::NotADirectory)
         };
-        let node = children.get(name).map(Arc::clone).ok_or(KError::NotFound)?;
+        let node = children.get(leaf).map(Arc::clone).ok_or(KError::NotFound)?;
 
         {
             let g = node.lock();
@@ -496,20 +445,25 @@ impl Vfs {
             }
         }
 
-        children.remove(name);
+        children.remove(leaf);
         Ok(())
     }
 
-    // Rename the node at `from` to `to`. Does NOT follow the final `from` component.
-    pub fn rename(&self, from: &str, to: &str) -> Result<(), KError> {
-        let (from_par, from_name) = split_parent(from);
-        let (to_par, to_name) = split_parent(to);
+    // Rename `from_leaf` under the already-resolved `from_parent_rel` to
+    // `to_leaf` under `to_parent_rel`. Does not follow a symlink at `from_leaf`.
+    pub fn rename_in(
+        &self,
+        from_parent_rel: &str,
+        from_name: &str,
+        to_parent_rel: &str,
+        to_name: &str
+    ) -> Result<(), KError> {
         if from_name.is_empty() || to_name.is_empty() {
             return Err(KError::InvalidArgument);
         }
 
-        let fp = self.get_node(from_par, true)?;
-        let tp = self.get_node(to_par, true)?;
+        let fp = self.raw_get(from_parent_rel)?;
+        let tp = self.raw_get(to_parent_rel)?;
 
         if Arc::ptr_eq(&fp, &tp) {
             let mut guard = fp.lock();
@@ -519,6 +473,9 @@ impl Vfs {
             };
             let node = children.get(from_name).map(Arc::clone).ok_or(KError::NotFound)?;
             check_not_busy(&node)?;
+            if to_name != from_name && children.contains_key(to_name) {
+                return Err(KError::FileExists);
+            }
             children.remove(from_name);
             children.insert(to_name.to_owned(), node);
         } else {
@@ -544,6 +501,9 @@ impl Vfs {
 
             let node = from_children.get(from_name).map(Arc::clone).ok_or(KError::NotFound)?;
             check_not_busy(&node)?;
+            if to_children.contains_key(to_name) {
+                return Err(KError::FileExists);
+            }
             from_children.remove(from_name);
             to_children.insert(to_name.to_owned(), node);
         }
@@ -551,62 +511,18 @@ impl Vfs {
         Ok(())
     }
 
-    pub fn resolve_canonical(&self, path: &str) -> Result<String, KError> {
-        self.resolve_canonical_inner(path, 0)
-    }
-
-    fn resolve_canonical_inner(&self, path: &str, depth: usize) -> Result<String, KError> {
-        if depth > MAX_SYMLINK_DEPTH { return Err(KError::TooManySymlinks); }
-
-        let comps: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        if comps.is_empty() { return Ok("/".to_string()); }
-
-        let mut cur = Arc::clone(&self.root);
-
-        for (idx, &comp) in comps.iter().enumerate() {
-            let is_last = idx == comps.len() - 1;
-
-            let child = {
-                let g = cur.lock();
-                match &g.kind {
-                    NodeKind::Dir { children, .. } => {
-                        children.get(comp).map(Arc::clone).ok_or(KError::NotFound)?
-                    }
-                    NodeKind::File { .. } => return Err(KError::NotADirectory),
-                    NodeKind::Symlink { target } => {
-                        let target = target.clone();
-                        drop(g);
-                        let parent = rebuild_path(&comps[..idx]);
-                        let rest = comps[idx..].join("/");
-                        let full = Self::join_symlink_target(&parent, &target, &rest);
-                        return self.resolve_canonical_inner(&full, depth + 1);
-                    }
-                }
-            };
-
-            let symlink_target = {
-                let g = child.lock();
-                if let NodeKind::Symlink { target } = &g.kind { Some(target.clone()) } else { None }
-            };
-
-            if let Some(target) = symlink_target {
-                let parent = rebuild_path(&comps[..idx]);
-                let rest = if is_last { "".to_string() } else { comps[idx + 1..].join("/") };
-                let full = Self::join_symlink_target(&parent, &target, &rest);
-                return self.resolve_canonical_inner(&full, depth + 1);
-            }
-
-            if !is_last { cur = child; }
+    pub fn readdir(node: &VfsNodeRef, ancestors: &[VfsNodeRef], offset: usize) -> Result<DirEntry, KError> {
+        if offset == 0 {
+            return Ok(dot_entry(".", node));
         }
-
-        Ok(rebuild_path(&comps))
-    }
-
-    pub fn readdir(node: &VfsNodeRef, offset: usize) -> Result<DirEntry, KError> {
+        if offset == 1 {
+            let parent = ancestors.last().unwrap_or(node);
+            return Ok(dot_entry("..", parent));
+        }
         let g = node.lock();
         match &g.kind {
             NodeKind::Dir { children, .. } => {
-                let (name, child) = children.iter().nth(offset)
+                let (name, child) = children.iter().nth(offset - 2)
                     .ok_or(KError::NoMoreEntries)?;
                 let cg = child.lock();
                 let (kind, symlink_target, size) = match &cg.kind {
@@ -623,6 +539,20 @@ impl Vfs {
             }
             _ => Err(KError::NotADirectory)
         }
+    }
+}
+
+fn dot_entry(name: &str, node: &VfsNodeRef) -> DirEntry {
+    let g = node.lock();
+    let size = match &g.kind {
+        NodeKind::Dir { children, .. } => children.len() as u64,
+        _ => 0
+    };
+    DirEntry {
+        name: name.to_string(),
+        kind: EntryType::Dir,
+        attrs: FileAttrs { mode: g.attrs.mode, size },
+        symlink_target: None
     }
 }
 

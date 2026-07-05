@@ -954,8 +954,8 @@ pub fn cancel_irp(irp_ptr: IrpPtr, dev: &DeviceObjectK) {
     let irp = unsafe { &mut *irp_ptr };
     acquire_spinlock(&mut irp.cancel_lock);
 
-    // Either another path cancelled this explicitly, or the driver did
-    // not (a) get a chance yet to register the cancel routine, or
+    // Either another path cancelled this explicitly, or the driver
+    // (a) did not get a chance yet to register the cancel routine, or
     // (b) decided that cancellation was not required for this request.
     if irp.cancel_routine.is_none() || irp.is_cancelled {
         release_spinlock(&mut irp.cancel_lock);

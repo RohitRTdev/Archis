@@ -6,11 +6,11 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_intf::{
-    InterruptHandle, Lock, RemoveLock, acquire_spinlock, create_spinlock, debug, info, io_complete_irp, io_create_driver_worker, io_install_interrupt_handler, io_remove_interrupt_handler, io_set_cancel_routine, io_start_processing, release_spinlock
+    KInterruptHandle, Lock, RemoveLock, acquire_spinlock, create_spinlock, debug, info, io_complete_irp, io_create_driver_worker, io_install_interrupt_handler, io_remove_interrupt_handler, io_set_cancel_routine, io_start_processing, release_spinlock
 };
 use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
-    DeviceObject, DriverObject, Irp, IrpMinor, Keystroke, RegisterHandlerInfo, ResEntry, ResType, Status,
+    DeviceObject, DeviceType, DriverObject, Irp, IrpMinor, Keystroke, RegisterHandlerInfo, ResEntry, ResType, Status,
     create_device,
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
@@ -117,7 +117,7 @@ struct I8042Ctx {
     pending:          [PendingEntry; MAX_PENDING],
     pending_len:      usize,
     keystroke_handler: RegisterHandlerInfo,
-    interrupt_handle: InterruptHandle,
+    interrupt_handle: KInterruptHandle,
     port_data:        u16,
     port_cmd:         u16,
     remove_lock:      RemoveLock
@@ -129,13 +129,13 @@ unsafe impl Sync for I8042Ctx {}
 impl I8042Ctx {
     const fn zeroed() -> Self {
         Self {
-            lock:             Lock { lock: 0, int_status: false },
+            lock:             Lock::new(),
             ks_ring:          RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 }),
             sc_pending:       RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 }),
             pending:          [PendingEntry { irp: core::ptr::null_mut(), requested: 0 }; MAX_PENDING],
             pending_len:      0,
             keystroke_handler: RegisterHandlerInfo::new(),
-            interrupt_handle: InterruptHandle::new(),
+            interrupt_handle: KInterruptHandle::new(),
             port_data:        DEFAULT_PORT_DATA,
             port_cmd:         DEFAULT_PORT_CMD,
             remove_lock:      RemoveLock::new()
@@ -181,7 +181,7 @@ fn dispatch_add(driver: &DriverObject, pdo: &DeviceObject) -> Status {
     let ctx = alloc::boxed::Box::new_in(I8042Ctx::zeroed(), PoolAllocatorGlobal);
     let ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(ctx).0 as *mut c_void;
 
-    let dev = create_device(driver, Some(name), ctx_ptr, Some(pdo), false);
+    let dev = create_device(driver, Some(name), ctx_ptr, Some(pdo), false, DeviceType::None);
     if dev.is_null() {
         info!("i8042: create_device failed for {}", name);
         unsafe { drop(alloc::boxed::Box::from_raw_in(ctx_ptr as *mut I8042Ctx, PoolAllocatorGlobal)); }

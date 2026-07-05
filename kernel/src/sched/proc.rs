@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use alloc::collections::BTreeMap;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use alloc::borrow::ToOwned;
@@ -71,7 +71,7 @@ pub struct Process {
     init_status: bool,
 
     handle_table: Vec<Option<HandleType>>,
-    cwd: String,
+    cwd: Option<FileInstance>,
 
     // Per-process registry of user modules mapped into this process's address space
     user_modules: Vec<LoadedImageWeak>,
@@ -113,7 +113,7 @@ impl Process {
         pgroup: KProcessGroup,
         args: Vec<String>,
         handle_table: Vec<Option<HandleType>>,
-        cwd: String
+        cwd: Option<FileInstance>
     ) -> Result<KProcess, KError> {
         let id = PROCESS_ID.fetch_add(1, Ordering::Relaxed);
         let kernel_addr_space = mem::get_kernel_addr_space();
@@ -455,7 +455,7 @@ pub fn init() {
         pgrp,
         vec!(KERNEL_PATH.into()),
         Vec::new(),
-        "/".into())
+        None)
     .expect("Failed to create init process");
 
     PROCESSES.lock().insert(0, Arc::clone(&init_proc));
@@ -949,24 +949,32 @@ extern "C" fn proc_issue_pgrp_ffi(val: usize, signal: u8) {
 }
 
 pub fn get_cwd() -> String {
-    get_current_process()
-        .map(|p| p.lock().cwd.clone())
-        .expect("get_cwd() called from idle task!")
+    let proc = get_current_process().expect("get_cwd() called from idle task!");
+    let guard = proc.lock();
+    guard.cwd.as_ref()
+        .expect("get_cwd() called before this process's cwd handle is set")
+        .get_path()
+        .to_string()
 }
 
-pub fn set_cwd(path: String) {
+pub fn set_cwd(handle: FileInstance) {
     if let Some(p) = get_current_process() {
-        p.lock().cwd = path;
+        p.lock().cwd = Some(handle);
     }
 }
 
-// Called once by fs::init() to set process 0's CWD after the VFS is mounted.
-pub fn set_init_cwd(path: &str) {
+pub fn set_init_cwd(handle: FileInstance) {
     if let Some(p) = get_process_info(0) {
-        p.lock().cwd = path.into();
+        p.lock().cwd = Some(handle);
     }
     else {
         panic!("Process 0 not found during set_init_cwd!!");
+    }
+}
+
+pub fn clear_init_cwd() {
+    if let Some(p) = get_process_info(0) {
+        p.lock().cwd = None;
     }
 }
 

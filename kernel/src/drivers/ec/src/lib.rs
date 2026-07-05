@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_intf::{
     info,
-    driver::{DeviceObject, DriverObject, Irp, IrpMinor, Status, ResEntry, ResType, create_device}
+    driver::{DeviceObject, DeviceType, DriverObject, Irp, IrpMinor, Status, ResEntry, ResType, create_device}
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
 use kernel_intf::hw::{inb, outb, ec_read, ec_write, ec_wait_ibf, ec_wait_obf};
@@ -63,7 +63,7 @@ fn dispatch_add(driver: &DriverObject, pdo: &DeviceObject) -> Status {
 
     let ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(ctx).0 as *mut c_void;
 
-    let dev = create_device(driver, Some(name), ctx_ptr, Some(pdo), false);
+    let dev = create_device(driver, Some(name), ctx_ptr, Some(pdo), false, DeviceType::None);
     if dev.is_null() {
         unsafe { drop(alloc::boxed::Box::from_raw_in(ctx_ptr as *mut EcCtx, PoolAllocatorGlobal)); }
         return Status::Failed;

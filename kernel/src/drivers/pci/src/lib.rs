@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use kernel_intf::{
     driver::{
-        DeviceObject, DriverObject, Irp, IrpMinor, Status,
+        DeviceObject, DeviceType, DriverObject, Irp, IrpMinor, Status,
         create_device, create_device_by_id,
         ResEntry, ResType, ResTypeDesc, IntDesc, PortDesc,
         IrqInfo, MAX_RESOURCE_ENTRIES
@@ -90,7 +90,7 @@ fn dispatch_add(driver: &DriverObject, pdo: &DeviceObject) -> Status {
         PoolAllocatorGlobal
     );
     let ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(ctx).0 as *mut c_void;
-    create_device(driver, None, ctx_ptr, Some(pdo), false);
+    create_device(driver, None, ctx_ptr, Some(pdo), false, DeviceType::None);
     Status::Success
 }
 
@@ -194,7 +194,7 @@ fn scan_bus(
                     PoolAllocatorGlobal
                 );
                 let pdo_ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(pdo_ctx).0 as *mut c_void;
-                let new_pdo = create_device_by_id(driver_id, None, pdo_ctx_ptr, Some(fdo), false);
+                let new_pdo = create_device_by_id(driver_id, None, pdo_ctx_ptr, Some(fdo), false, DeviceType::None);
                 if new_pdo.is_null() {
                     unsafe { drop(alloc::boxed::Box::from_raw_in(pdo_ctx_ptr as *mut PciCtx, PoolAllocatorGlobal)); }
                     continue;

@@ -201,7 +201,14 @@ fn load_image_uncached(
     crate::loader_log!("Loading image {} from disk", path);
     let file = open(path)?;
     let file_size = file.len();
-    let abs_path = fs::make_absolute(&crate::sched::get_cwd(), path);
+    // Absolute paths (e.g. module loads that happen before a cwd handle
+    // exists, like fs::load_root_fs()'s device-backend module load) must
+    // not touch get_cwd() at all — only go through it for relative paths.
+    let abs_path = if path.starts_with('/') {
+        fs::normalize_path(path)
+    } else {
+        fs::make_absolute(&crate::sched::get_cwd(), path)
+    };
     let canonical_file_path = Some(fs::resolve_symlink(&abs_path).expect("File path could not be resolved!"));
 
     let buf= FileBuffer::new(file_size, false)
@@ -250,11 +257,17 @@ fn load_image_uncached(
 
     crate::loader_log!("Loaded image '{}' with name={}", path, module_name);
 
+    invoke_init(&arc);
+
     Ok(arc)
 }
 
 fn find_loaded_module(path: &str) -> Option<LoadedImage> {
-    let abs_path = fs::make_absolute(&crate::sched::get_cwd(), path);
+    let abs_path = if path.starts_with('/') {
+        fs::normalize_path(path)
+    } else {
+        fs::make_absolute(&crate::sched::get_cwd(), path)
+    };
     let canonical = fs::resolve_symlink(&abs_path).unwrap_or_else(|_| abs_path.clone());
     crate::loader_log!("find_loaded_module: looking for {} (canonical: {})", abs_path, canonical);
 

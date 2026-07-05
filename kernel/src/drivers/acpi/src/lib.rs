@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering}
 use common::StrRef;
 use kernel_intf::{
     driver::{
-        DeviceObject, DriverObject, Irp, IrpMinor, Status,
+        DeviceObject, DeviceType, DriverObject, Irp, IrpMinor, Status,
         create_device, create_device_by_id,
         ResEntry, ResType, ResTypeDesc, IntDesc, PortDesc,
         IrqInfo, MAX_RESOURCE_ENTRIES
@@ -455,7 +455,7 @@ fn dispatch_add(driver: &DriverObject, pdo: &DeviceObject) -> Status {
     info!("Added device for driver {}", driver.get_name());
     assert!(pdo.id == 0);
 
-    create_device(driver, Some("acpi"), core::ptr::null_mut(), Some(pdo), false);
+    create_device(driver, Some("acpi"), core::ptr::null_mut(), Some(pdo), false, DeviceType::None);
 
     IS_SUBSYSTEM_DEV_ADDED.store(true, Ordering::Release);
     Status::Success
@@ -581,7 +581,7 @@ unsafe extern "C" fn acpi_pdo_callback(
         let pdo_ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(pdo_ctx).0 as *mut c_void;
 
         let parent = unsafe { &*ctx.parent_device };
-        let pdo = create_device_by_id(ctx.driver_id, None, pdo_ctx_ptr, Some(parent), false);
+        let pdo = create_device_by_id(ctx.driver_id, None, pdo_ctx_ptr, Some(parent), false, DeviceType::None);
 
         if pdo.is_null() {
             unsafe {
@@ -697,7 +697,7 @@ unsafe extern "C" fn acpi_pdo_callback(
     let pdo_ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(pdo_ctx).0 as *mut c_void;
 
     let parent = unsafe { &*ctx.parent_device };
-    let pdo = create_device_by_id(ctx.driver_id, None, pdo_ctx_ptr, Some(parent), false);
+    let pdo = create_device_by_id(ctx.driver_id, None, pdo_ctx_ptr, Some(parent), false, DeviceType::None);
 
     if pdo.is_null() {
         unsafe {

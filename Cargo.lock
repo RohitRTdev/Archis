@@ -165,6 +165,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f211af61d8efdd104f96e57adf5e426ba1bc3ed7a4ead616e15e5881fd79c4d"
 
 [[package]]
+name = "disk"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "kernel_intf",
+ "kmod",
+]
+
+[[package]]
 name = "dtor"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -210,6 +219,15 @@ dependencies = [
  "env_filter",
  "jiff",
  "log",
+]
+
+[[package]]
+name = "fat32"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "kernel_intf",
+ "kmod",
 ]
 
 [[package]]

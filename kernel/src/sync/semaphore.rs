@@ -1,4 +1,5 @@
 use core::ptr::NonNull;
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
@@ -461,4 +462,24 @@ fn open_sync(name: &str, _flags: u64) -> Result<Handle, KError> {
 pub fn init() {
     crate::object::register_object_type("sync", open_sync)
         .expect("sync object type already registered");
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn sync_create_semaphore_ffi(initial: isize, max: isize) -> usize {
+    Box::into_raw(Box::new(KSem::new(initial, max))) as usize
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn sync_wait_semaphore_ffi(handle: usize) {
+    let _ = unsafe { &*(handle as *const KSem) }.wait(false);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn sync_signal_semaphore_ffi(handle: usize) {
+    unsafe { &*(handle as *const KSem) }.signal();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn sync_destroy_semaphore_ffi(handle: usize) {
+    unsafe { drop(Box::from_raw(handle as *mut KSem)); }
 }

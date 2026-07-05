@@ -2,7 +2,7 @@ use alloc::collections::BTreeMap;
 use core::ptr::NonNull;
 
 use kernel_intf::list::{DynList, List, ListNode};
-use kernel_intf::{InterruptHandle, InterruptRoutine, debug};
+use kernel_intf::{KInterruptHandle, InterruptRoutine, debug};
 use crate::Spinlock;
 use crate::hal::{allocate_vector, disable_interrupts, enable_interrupts, deallocate_vector, register_interrupt_handler, unregister_interrupt_handler};
 
@@ -55,7 +55,7 @@ pub fn install_interrupt_handler(
     handler: InterruptRoutine,
     active_high: bool,
     is_edge_triggered: bool,
-) -> InterruptHandle {
+) -> KInterruptHandle {
 
     let descriptor = InterruptDescriptor { handler, context };
     debug!("Installing interrupt handler {}, {}", vector, irq);
@@ -84,7 +84,7 @@ pub fn install_interrupt_handler(
         }
     }.expect("OOM: interrupt handler install");
 
-    InterruptHandle {
+    KInterruptHandle {
         irq: irq as isize,
         vector,
         node_ptr: node.as_ptr() as usize
@@ -101,7 +101,7 @@ pub extern "C" fn io_install_interrupt_handler_ffi(
     handler: InterruptRoutine,
     active_high: bool,
     is_edge_triggered: bool
-) -> InterruptHandle {
+) -> KInterruptHandle {
     let int_stat = disable_interrupts();
     let handle = if irq == -1 {
         let mut desc = INTERRUPT_HANDLERS.lock();
@@ -110,7 +110,7 @@ pub extern "C" fn io_install_interrupt_handler_ffi(
         // Must not already be allocated as part of an irq
         assert!(desc.vector_to_irq_mapping.get(&vector).is_none());
         assert!(desc.vector_mapping.insert(vector, int_desc).is_none());
-        InterruptHandle { irq, vector, node_ptr: 0}
+        KInterruptHandle { irq, vector, node_ptr: 0}
     }
     else {
         install_interrupt_handler(vector, irq as usize, context, handler, active_high, is_edge_triggered)
@@ -122,7 +122,7 @@ pub extern "C" fn io_install_interrupt_handler_ffi(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn io_remove_interrupt_handler_ffi(handle: InterruptHandle) {
+pub extern "C" fn io_remove_interrupt_handler_ffi(handle: KInterruptHandle) {
     let int_stat = disable_interrupts();
 
     {

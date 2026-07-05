@@ -1,0 +1,17 @@
+[package]
+name = "fat32"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+common.workspace = true
+kernel_intf.workspace = true
+kmod.workspace = true
+
+[features]
+default = []
+kunit-test = ["kernel_intf/kunit-test"]

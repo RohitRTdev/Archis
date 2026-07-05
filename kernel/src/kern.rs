@@ -44,7 +44,7 @@ use sync::{Once, Spinlock};
 use mem::Regions::*;
 use mem::FixedList;
 #[cfg(feature = "kunit-test")]
-use kernel_intf::driver::{IrpMajor, IrpMinor, IrpResult, Keystroke, Status, create_device_by_id};
+use kernel_intf::driver::{DeviceType, IrpMajor, IrpMinor, IrpResult, Keystroke, Status, create_device_by_id};
 #[cfg(feature = "kunit-test")]
 use kernel_intf::KError;
 use kernel_intf::list::List;
@@ -67,6 +67,12 @@ struct RemapEntry {
 }
 
 const KERNEL_PATH: &'static str = "/sys/aris";
+
+// "9ffd2959-915c-479f-8787-1f9f701e1034"
+pub const ROOT_UUID: [u8; 16] = [
+    0x9f, 0xfd, 0x29, 0x59, 0x91, 0x5c, 0x47, 0x9f,
+    0x87, 0x87, 0x1f, 0x9f, 0x70, 0x1e, 0x10, 0x34
+];
 
 struct InitFS {
     fs: BTreeMap<&'static str, &'static [u8]>,
@@ -267,7 +273,7 @@ fn run_cancel_tests() {
         }
     };
     let driver_id = unsafe { (*probe.device_ptr()).get_driver_id() };
-    let dup = create_device_by_id(driver_id, Some("input"), core::ptr::null_mut(), None, false);
+    let dup = create_device_by_id(driver_id, Some("input"), core::ptr::null_mut(), None, false, DeviceType::Input);
     info!("cancel test (c): duplicate create returned {:#X}", dup.addr());
     assert!(dup.is_null(), "duplicate device name 'input' must be rejected");
     info!("cancel test (c): PASSED");
@@ -833,6 +839,602 @@ fn run_sync_tests() {
     info!("=== run_sync_tests: PASSED ===");
 }
 
+#[cfg(feature = "kunit-test")]
+mod test_fs_conc {
+    use super::*;
+
+    pub static FS_CONC_DONE: Once<KSem> = Once::new();
+    pub static FS_CONC_INDEX: AtomicUsize = AtomicUsize::new(0);
+    pub static FS_CONC_COUNTER: AtomicUsize = AtomicUsize::new(0);
+}
+
+#[cfg(feature = "kunit-test")]
+use test_fs_conc::*;
+
+// Exercises the fs-layer correctness (mount canonicalization, cross-
+// mount symlink resolution, FAT32 FFI bool marshaling, busy-checks and
+// mount-point checks on delete/rename) against the real FAT32 root that
+// fs::load_root_fs() has already mounted by the time run_tests!() fires,
+// plus scratch in-memory mounts created via fs::new_memory_source().
+#[kmod::test_function(true)]
+fn run_fs_correctness_tests() {
+    info!("fs test 1: module-backend busy check on delete/rename");
+    {
+        fs::mkdir("/t1", 0).expect("test 1: mkdir /t1");
+        fs::create_file("/t1/a.txt", 0).expect("test 1: create a.txt");
+        fs::create_file("/t1/b.txt", 0).expect("test 1: create b.txt");
+        let handle = fs::open("/t1/a.txt").expect("test 1: open a.txt");
+
+        let del_res = fs::delete("/t1/a.txt");
+        assert!(matches!(del_res, Err(KError::FileBusy)),
+            "test 1: delete of open file should be FileBusy, got {:?}", del_res);
+
+        let ren_res = fs::rename("/t1/a.txt", "/t1/c.txt");
+        assert!(matches!(ren_res, Err(KError::FileBusy)),
+            "test 1: rename of open file should be FileBusy, got {:?}", ren_res);
+
+        fs::rename("/t1/b.txt", "/t1/d.txt").expect("test 1: rename of non-open file should succeed");
+
+        drop(handle);
+        fs::delete("/t1/a.txt").expect("test 1: delete after close should succeed");
+    }
+    info!("fs test 1: PASSED");
+
+    info!("fs test 2: mount-point protection on delete/rename (both sides)");
+    {
+        fs::mkdir("/mnt2", 0).expect("test 2: mkdir /mnt2");
+        fs::mount("/mnt2", fs::new_memory_source()).expect("test 2: mount /mnt2");
+        fs::mkdir("/other", 0).expect("test 2: mkdir /other");
+        fs::create_file("/other/file.txt", 0).expect("test 2: create /other/file.txt");
+
+        let del_res = fs::delete("/mnt2");
+        assert!(matches!(del_res, Err(KError::FileBusy)),
+            "test 2: delete of mount point should be FileBusy, got {:?}", del_res);
+
+        let ren_from_res = fs::rename("/mnt2", "/other/x");
+        assert!(matches!(ren_from_res, Err(KError::FileBusy)),
+            "test 2: rename FROM a mount point should be FileBusy, got {:?}", ren_from_res);
+
+        let ren_to_res = fs::rename("/other/file.txt", "/mnt2");
+        assert!(matches!(ren_to_res, Err(KError::FileBusy)),
+            "test 2: rename TO a mount point should be FileBusy, got {:?}", ren_to_res);
+    }
+    info!("fs test 2: PASSED");
+
+    info!("fs test 3: cross-mount symlink resolution (both directions)");
+    {
+        fs::mkdir("/xmnt", 0).expect("test 3: mkdir /xmnt");
+        fs::mount("/xmnt", fs::new_memory_source()).expect("test 3: mount /xmnt");
+        fs::mkdir("/xmnt/inner", 0).expect("test 3: mkdir /xmnt/inner");
+        fs::create_file("/xmnt/inner/target.txt", 0).expect("test 3: create target.txt");
+
+        fs::create_symlink("/link_out", "/xmnt/inner/target.txt").expect("test 3: create /link_out");
+
+        let attrs = fs::stat("/link_out").expect("test 3: stat /link_out should cross into the memory mount");
+        assert!(attrs.mode & fs::MODE_FILE != 0,
+            "test 3: /link_out should resolve to a file, mode={:#x}", attrs.mode);
+
+        let canonical = fs::resolve_symlink("/link_out").expect("test 3: resolve_symlink /link_out");
+        assert_eq!(canonical, "/xmnt/inner/target.txt",
+            "test 3: canonical path mismatch, got {}", canonical);
+
+        let h = fs::open("/link_out").expect("test 3: open /link_out");
+        assert!(!h.is_dir(), "test 3: /link_out should open as a file");
+        drop(h);
+
+        fs::create_symlink("/xmnt/link_back", "/other/file.txt").expect("test 3: create /xmnt/link_back");
+        fs::stat("/xmnt/link_back").expect("test 3: stat /xmnt/link_back should cross back into the fat32 root");
+    }
+    info!("fs test 3: PASSED");
+
+    info!("fs test 4: mount canonicalization");
+    {
+        fs::mkdir("/cdir", 0).expect("test 4: mkdir /cdir");
+        fs::create_file("/cdir/fat_only.txt", 0).expect("test 4: create /cdir/fat_only.txt");
+        fs::create_symlink("/cdirlink", "/cdir").expect("test 4: create /cdirlink -> /cdir");
+
+        fs::mount("/cdirlink", fs::new_memory_source()).expect("test 4: mount /cdirlink");
+
+        let stat_res = fs::stat("/cdir/fat_only.txt");
+        assert!(matches!(stat_res, Err(KError::NotFound)),
+            "test 4: /cdir/fat_only.txt should be shadowed by the new mount (mount point must have been \
+             canonicalized to /cdir, not stored as /cdirlink), got {:?}", stat_res);
+
+        fs::create_file("/cdir/mem_only.txt", 0).expect("test 4: create /cdir/mem_only.txt");
+        fs::stat("/cdir/mem_only.txt").expect("test 4: stat /cdir/mem_only.txt");
+
+        fs::create_file("/cdirlink/via_link.txt", 0).expect("test 4: create /cdirlink/via_link.txt");
+        fs::stat("/cdir/via_link.txt").expect("test 4: stat /cdir/via_link.txt (same backend, reached both ways)");
+    }
+    info!("fs test 4: PASSED");
+
+    info!("fs test 5: FFI bool marshaling (mode reported correctly for dirs vs files)");
+    {
+        fs::mkdir("/t1/sub", 0).expect("test 5: mkdir /t1/sub");
+        let attrs = fs::stat("/t1/sub").expect("test 5: stat /t1/sub");
+        assert!(attrs.mode & fs::MODE_DIR != 0, "test 5: /t1/sub should report MODE_DIR, mode={:#x}", attrs.mode);
+        assert!(attrs.mode & fs::MODE_FILE == 0, "test 5: /t1/sub should not report MODE_FILE, mode={:#x}", attrs.mode);
+    }
+    info!("fs test 5: PASSED");
+
+    info!("fs test 6: read/write roundtrip on the fat32-backed root");
+    {
+        fs::create_file("/t1/rw.txt", 0).expect("test 6: create /t1/rw.txt");
+        let handle = fs::open("/t1/rw.txt").expect("test 6: open /t1/rw.txt");
+
+        let write_data = b"Hello, Archis FS! This is a fat32 read/write roundtrip test.";
+        let wbuf = fs::FileBuffer::new(write_data.len(), false).expect("test 6: alloc write buffer");
+        wbuf.write(write_data.as_ptr() as usize, write_data.len(), 0).expect("test 6: fill write buffer");
+        let written = handle.write(&wbuf, write_data.len(), 0).expect("test 6: write /t1/rw.txt");
+        assert_eq!(written, write_data.len(), "test 6: short write to /t1/rw.txt");
+
+        let attrs = fs::stat("/t1/rw.txt").expect("test 6: stat /t1/rw.txt after write");
+        assert_eq!(attrs.size, write_data.len() as u64,
+            "test 6: /t1/rw.txt size mismatch after write, got {}", attrs.size);
+
+        handle.seek(0).expect("test 6: seek to 0");
+        let rbuf = fs::FileBuffer::new(write_data.len(), false).expect("test 6: alloc read buffer");
+        let read_len = handle.read(&rbuf).expect("test 6: read /t1/rw.txt");
+        assert_eq!(read_len, write_data.len(), "test 6: short read from /t1/rw.txt");
+
+        let mut out = vec![0u8; write_data.len()];
+        rbuf.read(out.as_mut_ptr() as usize, read_len, 0).expect("test 6: drain read buffer");
+        assert_eq!(&out[..], &write_data[..], "test 6: readback mismatch on /t1/rw.txt");
+        drop(handle);
+
+        // Re-open and read again to make sure the write actually persisted to
+        // disk (patch_dir_entry updated the on-disk size/cluster), not just
+        // to the still-open handle's cached state.
+        let handle2 = fs::open("/t1/rw.txt").expect("test 6: reopen /t1/rw.txt");
+        let rbuf2 = fs::FileBuffer::new(write_data.len(), false).expect("test 6: alloc reopen read buffer");
+        let read_len2 = handle2.read(&rbuf2).expect("test 6: read /t1/rw.txt after reopen");
+        assert_eq!(read_len2, write_data.len(), "test 6: short read from /t1/rw.txt after reopen");
+        let mut out2 = vec![0u8; write_data.len()];
+        rbuf2.read(out2.as_mut_ptr() as usize, read_len2, 0).expect("test 6: drain reopen read buffer");
+        assert_eq!(&out2[..], &write_data[..], "test 6: readback mismatch on /t1/rw.txt after reopen");
+        drop(handle2);
+    }
+    info!("fs test 6: PASSED");
+
+    info!("fs test 7: read/write roundtrip on a memory-backed mount");
+    {
+        fs::mkdir("/rwmnt", 0).expect("test 7: mkdir /rwmnt");
+        fs::mount("/rwmnt", fs::new_memory_source()).expect("test 7: mount /rwmnt");
+        fs::create_file("/rwmnt/mem.txt", 0).expect("test 7: create /rwmnt/mem.txt");
+        let handle = fs::open("/rwmnt/mem.txt").expect("test 7: open /rwmnt/mem.txt");
+
+        let write_data = b"Hello from the in-memory backend.";
+        let wbuf = fs::FileBuffer::new(write_data.len(), false).expect("test 7: alloc write buffer");
+        wbuf.write(write_data.as_ptr() as usize, write_data.len(), 0).expect("test 7: fill write buffer");
+        let written = handle.write(&wbuf, write_data.len(), 0).expect("test 7: write /rwmnt/mem.txt");
+        assert_eq!(written, write_data.len(), "test 7: short write to /rwmnt/mem.txt");
+
+        handle.seek(0).expect("test 7: seek to 0");
+        let rbuf = fs::FileBuffer::new(write_data.len(), false).expect("test 7: alloc read buffer");
+        let read_len = handle.read(&rbuf).expect("test 7: read /rwmnt/mem.txt");
+        assert_eq!(read_len, write_data.len(), "test 7: short read from /rwmnt/mem.txt");
+        let mut out = vec![0u8; write_data.len()];
+        rbuf.read(out.as_mut_ptr() as usize, read_len, 0).expect("test 7: drain read buffer");
+        assert_eq!(&out[..], &write_data[..], "test 7: readback mismatch on /rwmnt/mem.txt");
+        drop(handle);
+    }
+    info!("fs test 7: PASSED");
+
+    FS_CONC_DONE.call_once(|| KSem::new(0, 32));
+
+    info!("fs test 8: concurrent writers to the same open file");
+    {
+        fs::create_file("/conc_w.txt", 0).expect("test 8: create /conc_w.txt");
+        FS_CONC_INDEX.store(0, Ordering::Relaxed);
+
+        const WORKERS: usize = 6;
+        const CHUNK: usize = 16;
+
+        // Every worker opens the file independently (its own fs_open call,
+        // its own kernel-side FileInstance) but must land on the same
+        // fat32-side SharedFileState, since they all resolve the same
+        // (parent_cluster, slot_start)
+        extern "C" fn conc_writer() -> ! {
+            let idx = FS_CONC_INDEX.fetch_add(1, Ordering::Relaxed);
+            let handle = fs::open("/conc_w.txt").expect("test 8: worker open");
+            handle.seek(idx * 16).expect("test 8: worker seek");
+            let data = [b'A' + idx as u8; 16];
+            let wbuf = fs::FileBuffer::new(16, false).expect("test 8: worker alloc buffer");
+            wbuf.write(data.as_ptr() as usize, 16, 0).expect("test 8: worker fill buffer");
+            handle.write(&wbuf, 16, 0).expect("test 8: worker write");
+            drop(handle);
+            FS_CONC_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+
+        let mut handles = alloc::vec::Vec::new();
+        for _ in 0..WORKERS {
+            handles.push(sched::create_thread(conc_writer, core::ptr::null_mut()).expect("test 8: spawn worker"));
+        }
+        join_workers(FS_CONC_DONE.get().unwrap(), WORKERS);
+        for h in &handles { h.wait(false); }
+
+        let attrs = fs::stat("/conc_w.txt").expect("test 8: stat /conc_w.txt");
+        assert_eq!(attrs.size, (WORKERS * CHUNK) as u64,
+            "test 8: size mismatch (some writes were lost), got {}", attrs.size);
+
+        let verify_handle = fs::open("/conc_w.txt").expect("test 8: reopen for verify");
+        let rbuf = fs::FileBuffer::new(WORKERS * CHUNK, false).expect("test 8: alloc verify buffer");
+        let read_len = verify_handle.read(&rbuf).expect("test 8: read all bytes");
+        assert_eq!(read_len, WORKERS * CHUNK, "test 8: short read on verify");
+        let mut out = vec![0u8; WORKERS * CHUNK];
+        rbuf.read(out.as_mut_ptr() as usize, read_len, 0).expect("test 8: drain verify buffer");
+        for i in 0..WORKERS {
+            let expected = b'A' + i as u8;
+            for b in &out[i * CHUNK..(i + 1) * CHUNK] {
+                assert_eq!(*b, expected, "test 8: worker {}'s region corrupted by another writer", i);
+            }
+        }
+        drop(verify_handle);
+        fs::delete("/conc_w.txt").expect("test 8: cleanup /conc_w.txt");
+    }
+    info!("fs test 8: PASSED");
+
+    info!("fs test 9: concurrent creates in the same directory");
+    {
+        fs::mkdir("/conc_dir", 0).expect("test 9: mkdir /conc_dir");
+        FS_CONC_INDEX.store(0, Ordering::Relaxed);
+
+        const CREATORS: usize = 8;
+
+        extern "C" fn conc_creator() -> ! {
+            let idx = FS_CONC_INDEX.fetch_add(1, Ordering::Relaxed);
+            let path = alloc::format!("/conc_dir/f{}.txt", idx);
+            fs::create_file(&path, 0).expect("test 9: worker create");
+            FS_CONC_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+
+        let mut handles = alloc::vec::Vec::new();
+        for _ in 0..CREATORS {
+            handles.push(sched::create_thread(conc_creator, core::ptr::null_mut()).expect("test 9: spawn worker"));
+        }
+        join_workers(FS_CONC_DONE.get().unwrap(), CREATORS);
+        for h in &handles { h.wait(false); }
+
+        // If the per-directory lock's critical section didn't cover the
+        // whole duplicate-check-then-append sequence, two concurrent
+        // creates could both read the same end-of-entries marker and the
+        // second write-back would silently clobber the first's new entry.
+        for i in 0..CREATORS {
+            let path = alloc::format!("/conc_dir/f{}.txt", i);
+            fs::stat(&path).unwrap_or_else(|e| panic!("test 9: {} missing after concurrent create (lost create), err={:?}", path, e));
+        }
+
+        for i in 0..CREATORS {
+            let path = alloc::format!("/conc_dir/f{}.txt", i);
+            fs::delete(&path).expect("test 9: cleanup");
+        }
+        fs::delete("/conc_dir").expect("test 9: cleanup /conc_dir");
+    }
+    info!("fs test 9: PASSED");
+
+    info!("fs test 10: symlink open/stat/resolve survive concurrent directory churn");
+    {
+        fs::create_file("/conc_target.txt", 0).expect("test 10: create /conc_target.txt");
+        fs::create_symlink("/conc_link", "/conc_target.txt").expect("test 10: create /conc_link");
+        FS_CONC_INDEX.store(0, Ordering::Relaxed);
+
+        const READERS: usize = 3;
+        const CHURNERS: usize = 3;
+        const ITERS: usize = 20;
+
+        // Readers repeatedly stat/resolve/open+close through the symlink;
+        // churners concurrently create+delete unrelated files at the same
+        // root directory the symlink lives in, so both groups contend on
+        // the same directory lock the whole time. Nothing here should ever
+        // panic, return a corrupted target, or momentarily see a mode other
+        // than MODE_FILE 
+        extern "C" fn conc_reader() -> ! {
+            for _ in 0..ITERS {
+                let attrs = fs::stat("/conc_link").expect("test 10: reader stat /conc_link");
+                assert!(attrs.mode & fs::MODE_FILE != 0, "test 10: /conc_link should resolve to a file");
+                let target = fs::resolve_symlink("/conc_link").expect("test 10: reader resolve_symlink");
+                assert_eq!(target, "/conc_target.txt", "test 10: symlink target corrupted under concurrent churn, got {}", target);
+                let handle = fs::open("/conc_link").expect("test 10: reader open through symlink");
+                assert!(!handle.is_dir(), "test 10: /conc_link should open as a file");
+                drop(handle);
+            }
+            FS_CONC_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+
+        extern "C" fn conc_churner() -> ! {
+            let idx = FS_CONC_INDEX.fetch_add(1, Ordering::Relaxed);
+            for i in 0..ITERS {
+                let path = alloc::format!("/churn_{}_{}.txt", idx, i);
+                fs::create_file(&path, 0).expect("test 10: churner create");
+                fs::delete(&path).expect("test 10: churner delete");
+            }
+            FS_CONC_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+
+        let mut handles = alloc::vec::Vec::new();
+        for _ in 0..READERS {
+            handles.push(sched::create_thread(conc_reader, core::ptr::null_mut()).expect("test 10: spawn reader"));
+        }
+        for _ in 0..CHURNERS {
+            handles.push(sched::create_thread(conc_churner, core::ptr::null_mut()).expect("test 10: spawn churner"));
+        }
+        join_workers(FS_CONC_DONE.get().unwrap(), READERS + CHURNERS);
+        for h in &handles { h.wait(false); }
+
+        fs::delete("/conc_link").expect("test 10: cleanup /conc_link");
+        fs::delete("/conc_target.txt").expect("test 10: cleanup /conc_target.txt");
+    }
+    info!("fs test 10: PASSED");
+
+    info!("fs test 11: concurrent delete race on the same file (regression: no double-free/corruption)");
+    {
+        fs::create_file("/conc_del_race.txt", 0).expect("test 11: create /conc_del_race.txt");
+        FS_CONC_COUNTER.store(0, Ordering::Relaxed);
+
+        const RACERS: usize = 6;
+
+        // Every racer independently resolves and tries to delete the exact
+        // same file. Before the resolve-then-act fix, both resolves could
+        // succeed before either took the lock, letting free_chain run twice
+        // on the same (possibly-already-reallocated) chain. Now resolve
+        // holds the parent's lock continuously through the delete, so
+        // exactly one racer's delete can ever see the entry.
+        extern "C" fn conc_deleter() -> ! {
+            if fs::delete("/conc_del_race.txt").is_ok() {
+                FS_CONC_COUNTER.fetch_add(1, Ordering::Relaxed);
+            }
+            FS_CONC_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+
+        let mut handles = alloc::vec::Vec::new();
+        for _ in 0..RACERS {
+            handles.push(sched::create_thread(conc_deleter, core::ptr::null_mut()).expect("test 11: spawn deleter"));
+        }
+        join_workers(FS_CONC_DONE.get().unwrap(), RACERS);
+        for h in &handles { h.wait(false); }
+
+        let successes = FS_CONC_COUNTER.load(Ordering::Relaxed);
+        assert_eq!(successes, 1,
+            "test 11: exactly one concurrent delete of the same file should succeed, got {}", successes);
+
+        // Filesystem must still be healthy afterward -- if a chain had been
+        // double-freed/corrupted, this would misbehave.
+        fs::create_file("/conc_del_race.txt", 0).expect("test 11: fs still healthy after race, recreate should succeed");
+        let handle = fs::open("/conc_del_race.txt").expect("test 11: open after recreate");
+        drop(handle);
+        fs::delete("/conc_del_race.txt").expect("test 11: cleanup");
+    }
+    info!("fs test 11: PASSED");
+
+    info!("fs test 12: rename to an existing destination leaves the source intact (regression: data-loss-on-failure)");
+    {
+        // Same-directory case.
+        fs::create_file("/ren_src.txt", 0).expect("test 12: create /ren_src.txt");
+        let handle = fs::open("/ren_src.txt").expect("test 12: open /ren_src.txt");
+        let data = b"original content survives a failed rename";
+        let wbuf = fs::FileBuffer::new(data.len(), false).expect("test 12: alloc write buffer");
+        wbuf.write(data.as_ptr() as usize, data.len(), 0).expect("test 12: fill write buffer");
+        handle.write(&wbuf, data.len(), 0).expect("test 12: write /ren_src.txt");
+        drop(handle);
+        fs::create_file("/ren_dst.txt", 0).expect("test 12: create /ren_dst.txt");
+
+        let ren_res = fs::rename("/ren_src.txt", "/ren_dst.txt");
+        assert!(matches!(ren_res, Err(KError::FileExists)),
+            "test 12: rename to an existing destination should fail with FileExists, got {:?}", ren_res);
+
+        let attrs = fs::stat("/ren_src.txt").expect("test 12: /ren_src.txt should still exist after failed rename");
+        assert_eq!(attrs.size, data.len() as u64, "test 12: /ren_src.txt size wrong after failed rename");
+
+        let verify_handle = fs::open("/ren_src.txt").expect("test 12: reopen /ren_src.txt");
+        let rbuf = fs::FileBuffer::new(data.len(), false).expect("test 12: alloc read buffer");
+        let read_len = verify_handle.read(&rbuf).expect("test 12: read /ren_src.txt");
+        assert_eq!(read_len, data.len(), "test 12: short read on /ren_src.txt after failed rename");
+        let mut out = vec![0u8; data.len()];
+        rbuf.read(out.as_mut_ptr() as usize, read_len, 0).expect("test 12: drain read buffer");
+        assert_eq!(&out[..], &data[..], "test 12: /ren_src.txt content corrupted after failed rename");
+        drop(verify_handle);
+
+        fs::delete("/ren_src.txt").expect("test 12: cleanup /ren_src.txt");
+        fs::delete("/ren_dst.txt").expect("test 12: cleanup /ren_dst.txt");
+
+        // Cross-directory case -- exercises the destination-first,
+        // source-delete-last path specifically.
+        fs::mkdir("/ren_dstdir", 0).expect("test 12: mkdir /ren_dstdir");
+        fs::create_file("/ren_src2.txt", 0).expect("test 12: create /ren_src2.txt");
+        fs::create_file("/ren_dstdir/taken.txt", 0).expect("test 12: create /ren_dstdir/taken.txt");
+
+        let ren_res2 = fs::rename("/ren_src2.txt", "/ren_dstdir/taken.txt");
+        assert!(matches!(ren_res2, Err(KError::FileExists)),
+            "test 12: cross-dir rename to an existing destination should fail with FileExists, got {:?}", ren_res2);
+        fs::stat("/ren_src2.txt").expect("test 12: /ren_src2.txt should still exist after failed cross-dir rename");
+
+        fs::delete("/ren_src2.txt").expect("test 12: cleanup /ren_src2.txt");
+        fs::delete("/ren_dstdir/taken.txt").expect("test 12: cleanup /ren_dstdir/taken.txt");
+        fs::delete("/ren_dstdir").expect("test 12: cleanup /ren_dstdir");
+    }
+    info!("fs test 12: PASSED");
+
+    info!("fs test 13: symlink is never visible with placeholder metadata (regression: create-then-patch race)");
+    {
+        fs::create_file("/symrace_target.txt", 0).expect("test 13: create /symrace_target.txt");
+
+        const ITERS: usize = 8;
+        const READERS: usize = 2;
+
+        extern "C" fn symrace_creator() -> ! {
+            for _ in 0..ITERS {
+                let _ = fs::create_symlink("/symrace_link", "/symrace_target.txt");
+                let _ = fs::delete("/symrace_link");
+            }
+            FS_CONC_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+
+        // Whenever a reader observes /symrace_link as a symlink at all, its
+        // target must already be the full, correct string -- never the
+        // placeholder 0/0-metadata state the old create-then-patch sequence
+        // could expose to a concurrent resolver.
+        extern "C" fn symrace_reader() -> ! {
+            for _ in 0..ITERS {
+                if let Ok((attrs, target)) = fs::lstat("/symrace_link") {
+                    if attrs.mode & fs::MODE_SYMLINK != 0 {
+                        let target = target.expect("test 13: symlink lstat must report a target");
+                        assert_eq!(target, "/symrace_target.txt",
+                            "test 13: symlink target corrupted/truncated mid-creation, got {:?}", target);
+                    }
+                }
+            }
+            FS_CONC_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+
+        let mut handles = alloc::vec::Vec::new();
+        handles.push(sched::create_thread(symrace_creator, core::ptr::null_mut()).expect("test 13: spawn creator"));
+        for _ in 0..READERS {
+            handles.push(sched::create_thread(symrace_reader, core::ptr::null_mut()).expect("test 13: spawn reader"));
+        }
+        join_workers(FS_CONC_DONE.get().unwrap(), 1 + READERS);
+        for h in &handles { h.wait(false); }
+
+        let _ = fs::delete("/symrace_link");
+        fs::delete("/symrace_target.txt").expect("test 13: cleanup /symrace_target.txt");
+    }
+    info!("fs test 13: PASSED");
+
+    info!("fs test 14: readdir returns . and .. first, for both backends and root (regression: dot-entry inconsistency)");
+    {
+        fn check_dots(handle: &fs::FileInstance) {
+            let e0 = handle.readdir_at(0).expect("test 14: readdir offset 0");
+            assert_eq!(e0.name, ".", "test 14: offset 0 should be '.', got {}", e0.name);
+            let e1 = handle.readdir_at(1).expect("test 14: readdir offset 1");
+            assert_eq!(e1.name, "..", "test 14: offset 1 should be '..', got {}", e1.name);
+        }
+
+        // FAT32-backed root -- the one case with no real on-disk dot
+        // entries at all (do_format never writes them for root).
+        let root_handle = fs::open("/").expect("test 14: open /");
+        check_dots(&root_handle);
+        drop(root_handle);
+
+        // FAT32-backed non-root directory -- real on-disk dot entries.
+        fs::mkdir("/dotcheck_fat", 0).expect("test 14: mkdir /dotcheck_fat");
+        let fat_handle = fs::open("/dotcheck_fat").expect("test 14: open /dotcheck_fat");
+        check_dots(&fat_handle);
+        drop(fat_handle);
+        fs::delete("/dotcheck_fat").expect("test 14: cleanup /dotcheck_fat");
+
+        // Memory-backed mount, both its root and a subdirectory -- neither
+        // stores dot entries at all, both must be synthesized.
+        fs::mkdir("/dotcheck_mem", 0).expect("test 14: mkdir /dotcheck_mem");
+        fs::mount("/dotcheck_mem", fs::new_memory_source()).expect("test 14: mount /dotcheck_mem");
+        let mem_root_handle = fs::open("/dotcheck_mem").expect("test 14: open /dotcheck_mem");
+        check_dots(&mem_root_handle);
+        drop(mem_root_handle);
+
+        fs::mkdir("/dotcheck_mem/sub", 0).expect("test 14: mkdir /dotcheck_mem/sub");
+        let mem_sub_handle = fs::open("/dotcheck_mem/sub").expect("test 14: open /dotcheck_mem/sub");
+        check_dots(&mem_sub_handle);
+        drop(mem_sub_handle);
+
+        fs::unmount("/dotcheck_mem").expect("test 14: unmount /dotcheck_mem");
+        fs::delete("/dotcheck_mem").expect("test 14: cleanup /dotcheck_mem");
+    }
+    info!("fs test 14: PASSED");
+
+    info!("fs test 15: concurrent renames in opposite directions between the same two directories never deadlock (regression: dual-lock ordering)");
+    {
+        fs::mkdir("/rendir_a", 0).expect("test 15: mkdir /rendir_a");
+        fs::mkdir("/rendir_b", 0).expect("test 15: mkdir /rendir_b");
+        fs::create_file("/rendir_a/ping.txt", 0).expect("test 15: create /rendir_a/ping.txt");
+        fs::create_file("/rendir_b/pong.txt", 0).expect("test 15: create /rendir_b/pong.txt");
+
+        const ITERS: usize = 2;
+
+        // Both threads lock the same two directories every iteration, but in
+        // opposite from/to roles. If lock order were ever picked by role
+        // (e.g. always lock "to" first) rather than a fixed per-path-pair
+        // order, this reliably deadlocks. The dual-lock design orders purely
+        // by (path length, case-folded string) -- a pure function of the two
+        // paths -- so both threads always agree on which directory to lock
+        // first regardless of which way either rename is going.
+        extern "C" fn renamer_a_to_b() -> ! {
+            for _ in 0..ITERS {
+                fs::rename("/rendir_a/ping.txt", "/rendir_b/ping.txt").expect("test 15: a->b");
+                fs::rename("/rendir_b/ping.txt", "/rendir_a/ping.txt").expect("test 15: b->a");
+            }
+            FS_CONC_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+        extern "C" fn renamer_b_to_a() -> ! {
+            for _ in 0..ITERS {
+                fs::rename("/rendir_b/pong.txt", "/rendir_a/pong.txt").expect("test 15: b->a");
+                fs::rename("/rendir_a/pong.txt", "/rendir_b/pong.txt").expect("test 15: a->b");
+            }
+            FS_CONC_DONE.get().unwrap().signal();
+            sched::exit_thread(0);
+        }
+
+        let mut handles = alloc::vec::Vec::new();
+        handles.push(sched::create_thread(renamer_a_to_b, core::ptr::null_mut()).expect("test 15: spawn a->b"));
+        handles.push(sched::create_thread(renamer_b_to_a, core::ptr::null_mut()).expect("test 15: spawn b->a"));
+        join_workers(FS_CONC_DONE.get().unwrap(), 2);
+        for h in &handles { h.wait(false); }
+
+        fs::stat("/rendir_a/ping.txt").expect("test 15: ping.txt should have ended back in /rendir_a");
+        fs::stat("/rendir_b/pong.txt").expect("test 15: pong.txt should have ended back in /rendir_b");
+
+        fs::delete("/rendir_a/ping.txt").expect("test 15: cleanup /rendir_a/ping.txt");
+        fs::delete("/rendir_b/pong.txt").expect("test 15: cleanup /rendir_b/pong.txt");
+        fs::delete("/rendir_a").expect("test 15: cleanup /rendir_a");
+        fs::delete("/rendir_b").expect("test 15: cleanup /rendir_b");
+    }
+    info!("fs test 15: PASSED");
+
+    info!("fs cleanup: removing everything created by the tests above");
+    {
+        // Unmount every scratch mount created during the tests before
+        // touching the directories they were mounted over (a mount point
+        // can't be deleted while still mounted). mount() canonicalizes
+        // through symlinks before storing, so /cdirlink was actually
+        // recorded as /cdir.
+        fs::unmount("/rwmnt").expect("cleanup: unmount /rwmnt");
+        fs::unmount("/cdir").expect("cleanup: unmount /cdirlink (stored canonically as /cdir)");
+        fs::unmount("/xmnt").expect("cleanup: unmount /xmnt");
+        fs::unmount("/mnt2").expect("cleanup: unmount /mnt2");
+
+        fs::delete("/rwmnt").expect("cleanup: delete /rwmnt");
+
+        fs::delete("/link_out").expect("cleanup: delete /link_out");
+        fs::delete("/xmnt").expect("cleanup: delete /xmnt");
+
+        fs::delete("/mnt2").expect("cleanup: delete /mnt2");
+        fs::delete("/other/file.txt").expect("cleanup: delete /other/file.txt");
+        fs::delete("/other").expect("cleanup: delete /other");
+
+        fs::delete("/cdirlink").expect("cleanup: delete /cdirlink");
+        fs::delete("/cdir/fat_only.txt").expect("cleanup: delete /cdir/fat_only.txt");
+        fs::delete("/cdir").expect("cleanup: delete /cdir");
+
+        fs::delete("/t1/rw.txt").expect("cleanup: delete /t1/rw.txt");
+        fs::delete("/t1/d.txt").expect("cleanup: delete /t1/d.txt");
+        fs::delete("/t1/sub").expect("cleanup: delete /t1/sub");
+        fs::delete("/t1").expect("cleanup: delete /t1");
+
+        for name in ["/rwmnt", "/link_out", "/xmnt", "/mnt2", "/other", "/cdirlink", "/cdir", "/t1"] {
+            assert!(matches!(fs::stat(name), Err(KError::NotFound)),
+                "cleanup: {} should no longer exist", name);
+        }
+    }
+    info!("fs cleanup: PASSED, root is clean");
+
+    info!("=== run_fs_correctness_tests: PASSED ===");
+}
+
 fn kern_main() -> ! {
     info!("Starting main kernel init");
 
@@ -844,18 +1446,30 @@ fn kern_main() -> ! {
     fs::init();
     loader::init();
     io::init();
+    #[cfg(feature = "kunit-test")]
+    fs::load_root_fs();
 
     kernel_intf::run_tests!();
-    info!("Launching init...");
-    let init_proc = sched::create_process(
-        &["/bin/init"],
-        core::ptr::null_mut(),
-        true,
-        false
-    ).expect("Failed to create init process!");
 
-    init_proc.wait(false);
-    panic!("init process returned!");
+    #[cfg(feature = "kunit-test")]
+    {
+        info!("kunit-test build: skipping init launch");
+        hal::sleep();
+    }
+
+    #[cfg(not(feature = "kunit-test"))]
+    {
+        info!("Launching init...");
+        let init_proc = sched::create_process(
+            &["/bin/init"],
+            core::ptr::null_mut(),
+            true,
+            false
+        ).expect("Failed to create init process!");
+
+        init_proc.wait(false);
+        panic!("init process returned!");
+    }
 }
 
 // === Driver worker (DPC) tests ===

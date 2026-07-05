@@ -43,7 +43,11 @@ pub enum IrpMinor {
     Remove                  = 6,
     RegisterKeyboardHandler = 7,
     SetForegroundPgrp       = 8,
-    SetControllingTty       = 9
+    SetControllingTty       = 9,
+    DiskGetInfo             = 10,
+    DiskCreateGpt           = 11,
+    DiskAddPartition        = 12,
+    DiskGetPartitionInfo    = 13
 }
 
 impl IrpMinor {
@@ -59,6 +63,10 @@ impl IrpMinor {
             7 => Some(Self::RegisterKeyboardHandler),
             8 => Some(Self::SetForegroundPgrp),
             9 => Some(Self::SetControllingTty),
+            10 => Some(Self::DiskGetInfo),
+            11 => Some(Self::DiskCreateGpt),
+            12 => Some(Self::DiskAddPartition),
+            13 => Some(Self::DiskGetPartitionInfo),
             _ => None
         }
     }
@@ -105,6 +113,32 @@ impl RegisterHandlerInfo {
 #[derive(Clone, Copy)]
 pub struct TtyControlInfo {
     pub pid:   usize
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DiskInfo {
+    pub lba_size:  usize,
+    pub lba_count: u64
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PartitionInfo {
+    pub part_type_guid: [u8; 16],
+    pub unique_guid:    [u8; 16],
+    pub start_lba:      u64,
+    pub num_lba:        u64
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CreatePartitionInfo {
+    pub part_type_guid: [u8; 16],
+    pub unique_guid:    [u8; 16],
+    pub start_lba:      u64,
+    pub num_lba:        u64,
+    pub name_utf16:     [u16; 36]
 }
 
 #[repr(C)]
@@ -180,7 +214,10 @@ pub union ReqInfo {
     pub _unused:          [usize; 2],
     pub register_handler: RegisterHandlerInfo,
     pub tty_control:      TtyControlInfo,
-    pub res_list:         ResList
+    pub res_list:         ResList,
+    pub create_partition: CreatePartitionInfo,
+    pub disk_info:        DiskInfo,
+    pub partition_info:   PartitionInfo
 }
 
 #[repr(C)]
@@ -240,7 +277,7 @@ impl Irp {
         device: usize,
         thread_id: usize
     ) -> Self {
-        let mut cancel_lock = Lock { lock: 0, int_status: false };
+        let mut cancel_lock = Lock::new();
         super::create_spinlock(&mut cancel_lock);
         Self {
             major_code,
@@ -354,6 +391,25 @@ impl Default for DispatchTable {
     }
 }
 
+#[repr(usize)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DeviceType {
+    None  = 0,
+    Input = 1,
+    Disk  = 2
+}
+
+impl DeviceType {
+    pub fn from_usize(v: usize) -> Option<Self> {
+        match v {
+            0 => Some(Self::None),
+            1 => Some(Self::Input),
+            2 => Some(Self::Disk),
+            _ => None
+        }
+    }
+}
+
 #[repr(C)]
 pub struct DeviceObject {
     pub id: usize,
@@ -390,11 +446,12 @@ pub fn create_device_by_id(
     name: Option<&'static str>,
     ctx: *mut c_void,
     parent: Option<&DeviceObject>,
-    is_class: bool
+    is_class: bool,
+    device_type: DeviceType
 ) -> *mut DeviceObject {
     let name = name.map_or(StrRef::from_str(""), StrRef::from_str);
     let parent = parent.map(|p| p as *const DeviceObject).unwrap_or(core::ptr::null());
-    unsafe { super::io_create_device(driver_id, name, ctx, parent, is_class) }
+    unsafe { super::io_create_device(driver_id, name, ctx, parent, is_class, device_type) }
 }
 
 pub fn create_device(
@@ -402,9 +459,10 @@ pub fn create_device(
     name: Option<&'static str>,
     ctx: *mut c_void,
     parent: Option<&DeviceObject>,
-    is_class: bool
+    is_class: bool,
+    device_type: DeviceType
 ) -> *mut DeviceObject {
-    create_device_by_id(driver.id, name, ctx, parent, is_class)
+    create_device_by_id(driver.id, name, ctx, parent, is_class, device_type)
 }
 
 
