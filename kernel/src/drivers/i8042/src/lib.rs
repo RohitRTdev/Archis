@@ -6,7 +6,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_intf::{
-    InterruptHandle, Lock, acquire_spinlock, create_spinlock, debug, info, io_complete_irp, io_create_driver_worker, io_install_interrupt_handler, io_remove_interrupt_handler, io_set_cancel_routine, io_start_processing, release_spinlock
+    InterruptHandle, Lock, RemoveLock, acquire_spinlock, create_spinlock, debug, info, io_complete_irp, io_create_driver_worker, io_install_interrupt_handler, io_remove_interrupt_handler, io_set_cancel_routine, io_start_processing, release_spinlock
 };
 use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
@@ -119,7 +119,8 @@ struct I8042Ctx {
     keystroke_handler: RegisterHandlerInfo,
     interrupt_handle: InterruptHandle,
     port_data:        u16,
-    port_cmd:         u16
+    port_cmd:         u16,
+    remove_lock:      RemoveLock
 }
 
 unsafe impl Send for I8042Ctx {}
@@ -136,7 +137,8 @@ impl I8042Ctx {
             keystroke_handler: RegisterHandlerInfo::new(),
             interrupt_handle: InterruptHandle::new(),
             port_data:        DEFAULT_PORT_DATA,
-            port_cmd:         DEFAULT_PORT_CMD
+            port_cmd:         DEFAULT_PORT_CMD,
+            remove_lock:      RemoveLock::new()
         }
     }
 
@@ -292,11 +294,16 @@ fn do_remove(device: &DeviceObject, request: &mut Irp) -> Status {
     }
 
     if !device.ctx.is_null() {
-        unsafe {
-            drop(alloc::boxed::Box::from_raw_in(
-                device.ctx as *mut I8042Ctx,
-                PoolAllocatorGlobal
-            ));
+        let ctx = unsafe { &mut *(device.ctx as *mut I8042Ctx) };
+        // If a keyboard_dw call is still queued against this ctx, it holds
+        // the last reference and will free it when it releases.
+        if ctx.remove_lock.begin_remove() {
+            unsafe {
+                drop(alloc::boxed::Box::from_raw_in(
+                    device.ctx as *mut I8042Ctx,
+                    PoolAllocatorGlobal
+                ));
+            }
         }
     }
 
@@ -392,6 +399,11 @@ extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         let ctx = unsafe { &mut *(ctx_ptr as *mut I8042Ctx) };
+
+        if !ctx.remove_lock.acquire() {
+            return true;
+        }
+
         let raw_sc = unsafe { inb(ctx.port_data) };
         let is_release = raw_sc & 0x80 != 0;
         let scancode = raw_sc & 0x7F;
@@ -405,7 +417,13 @@ extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
         ctx.sc_pending.push(ks);
         release_spinlock(&mut ctx.lock);
 
-        let _ = io_create_driver_worker(keyboard_dw, ctx_ptr);
+        if io_create_driver_worker(keyboard_dw, ctx_ptr).is_err() {
+            // Nothing will ever call keyboard_dw's release() for this
+            // reference now -- release it ourselves.
+            if ctx.remove_lock.release() {
+                unsafe { drop(alloc::boxed::Box::from_raw_in(ctx_ptr as *mut I8042Ctx, PoolAllocatorGlobal)); }
+            }
+        }
     }
 
     true
@@ -464,6 +482,12 @@ extern "C" fn keyboard_dw(ctx_ptr: *mut c_void) {
         if io_start_processing(irp) {
             io_complete_irp(irp, Status::Success);
         }
+    }
+
+    // Release the reference taken in keyboard_isr; if do_remove already ran
+    // and this was the last outstanding reference, we free ctx.
+    if ctx.remove_lock.release() {
+        unsafe { drop(alloc::boxed::Box::from_raw_in(ctx_ptr as *mut I8042Ctx, PoolAllocatorGlobal)); }
     }
 }
 

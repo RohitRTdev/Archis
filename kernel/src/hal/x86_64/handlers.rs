@@ -278,8 +278,8 @@ extern "C" fn allocate_vector_ffi() -> usize {
 pub fn deallocate_vector(vector: usize) {
     assert!(vector >= USER_VECTOR_START && vector < MAX_INTERRUPT_VECTORS);
     let mut vec_stat = VECTOR_STATUS_TABLE.lock();
-    assert!(vec_stat[vector]);
-    vec_stat[vector] = false;
+    assert!(!vec_stat[vector]);
+    vec_stat[vector] = true;
 }
 
 // Interrupts must be disabled during this call

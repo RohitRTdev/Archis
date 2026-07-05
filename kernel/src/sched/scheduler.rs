@@ -14,10 +14,10 @@ use crate::hal::{self, *};
 use crate::mem::*;
 use crate::sched::{ProcessCleanupWork, SignalHandler, enqueue_cleanup, exit_process, kill_process};
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
-use crate::io::{self, DeviceState, IrpPtr, deallocate_irp, get_device};
+use crate::io::{DeviceHandleK, DeviceObjectK, DeviceState, IrpPtr, deallocate_irp};
 use kernel_intf::mem::{PoolAllocator, PoolAllocatorGlobal};
 use kernel_intf::list::{DynList, List, ListNode, ListNodeGuard};
-use kernel_intf::driver::{DeviceObject, Irp, IrpMajor, IrpMinor, IrpResult, Status};
+use kernel_intf::driver::{Irp, IrpMajor, IrpMinor, IrpResult, Status};
 use kernel_intf::{acquire_spinlock, release_spinlock};
 use kernel_intf::{KError, debug, info};
 
@@ -98,6 +98,14 @@ pub enum TaskStatus {
     Suspended
 }
 
+// An IRP a task has outstanding, paired with an independently-owned clone of
+// the device handle so the task's bookkeeping never needs to reconstruct an
+// Arc from the same raw pointer stored in Irp.device.
+struct IssuedIrp {
+    irp: IrpPtr,
+    device: DeviceHandleK
+}
+
 pub struct Task {
     id: usize,
     is_kernel_mode: bool,
@@ -116,7 +124,7 @@ pub struct Task {
     user_fn: Option<DispatchRoutine>,
     last_signal_cause: SignalCause,
     wait_semaphores: DynList<KSemInnerType>,
-    issued_irps: DynList<IrpPtr>,
+    issued_irps: DynList<IssuedIrp>,
     in_signal_init: u8,
     term_notify: KEvent,
     process: Option<KProcess>,
@@ -255,15 +263,15 @@ impl Task {
         self.exit_code.load(Ordering::Relaxed)
     }
 
-    fn register_irp(&mut self, irp: IrpPtr) {
-        self.issued_irps.add_node(irp).expect("Failed to register IRP with task");
+    fn register_irp(&mut self, entry: IssuedIrp) {
+        self.issued_irps.add_node(entry).expect("Failed to register IRP with task");
     }
 
     fn find_and_remove_irp(&mut self, irp: *mut Irp) {
-        self.issued_irps.find_and_remove(|&p| p == irp);
+        self.issued_irps.find_and_remove(|e| e.irp == irp);
     }
 
-    fn take_irp_list(&mut self) -> DynList<IrpPtr> {
+    fn take_irp_list(&mut self) -> DynList<IssuedIrp> {
         take(&mut self.issued_irps)
     }
 
@@ -846,13 +854,13 @@ extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
         dispatch_thread.lock().find_and_remove_irp(irp);
     }
 
-    // Remove the IRP from the device's pending list too
-    let dev_ptr = unsafe { (*irp).device };
-    if !dev_ptr.is_null() {
-        if let Some(dev) = io::resolve_device(dev_ptr) {
-            crate::io_log!("Removing pending irp from device object");
-            dev.get_pending_irps().lock().find_and_remove(|&p| p == irp);
-        }
+    // Reclaim the Arc<DeviceObjectK> reference this IRP was pinning the
+    // device with, removing it from the device's pending list first.
+    let dev = unsafe { Arc::from_raw_in((*irp).device as *const DeviceObjectK, PoolAllocatorGlobal) };
+    crate::io_log!("Removing pending irp from device object");
+    dev.get_pending_irps().lock().find_and_remove(|&p| p == irp);
+    if dev.get_pending_irps().lock().get_nodes() == 0 {
+        dev.pending_irps_drained_event().signal();
     }
 
     // Run the completion routines.
@@ -886,7 +894,7 @@ pub fn allocate_irp(
     minor: IrpMinor,
     buffer: MemoryRegion,
     offset: usize,
-    device: *const DeviceObject,
+    device: DeviceHandleK,
     complete_event: Option<KEvent>,
     completion_result_ptr: *mut IrpResult,
     user_completion_routine: Option<extern "C" fn(*const IrpResult, *mut c_void)>,
@@ -918,28 +926,31 @@ pub fn allocate_irp(
         PoolAllocatorGlobal
     )).0;
 
+    // Pin the device for the IRP's lifetime with an independent Arc
+    // reference, encoded as an opaque handle; reclaimed in io_complete.
+    let pin = Arc::clone(&device);
+    let ptr = Arc::as_ptr(&pin);
+    core::mem::forget(pin);
+    let device_field = ptr as usize;
+
     let mut irp_box = Box::new_in(
-        Irp::new(major, buffer, offset, io_complete, actx as *mut c_void, device, cur_thread.lock().get_id()),
+        Irp::new(major, buffer, offset, io_complete, actx as *mut c_void, device_field, cur_thread.lock().get_id()),
         PoolAllocatorGlobal
     );
     irp_box.minor_code = minor;
     let irp_raw = Box::into_raw_with_allocator(irp_box).0;
     unsafe { (*actx).irp = irp_raw; }
 
-    if !device.is_null() {
-        if let Some(dev) = io::resolve_device(device) {
-            dev.get_pending_irps().lock().add_node(irp_raw)
-                .expect("Failed to register IRP with device pending list");
-        }
-    }
+    device.get_pending_irps().lock().add_node(irp_raw)
+        .expect("Failed to register IRP with device pending list");
 
-    cur_thread.lock().register_irp(irp_raw);
+    cur_thread.lock().register_irp(IssuedIrp { irp: irp_raw, device });
     enable_preemption();
 
     irp_raw
 }
  
-pub fn cancel_irp(irp_ptr: IrpPtr) {
+pub fn cancel_irp(irp_ptr: IrpPtr, dev: &DeviceObjectK) {
     let irp = unsafe { &mut *irp_ptr };
     acquire_spinlock(&mut irp.cancel_lock);
 
@@ -951,29 +962,21 @@ pub fn cancel_irp(irp_ptr: IrpPtr) {
         return;
     }
 
-    (irp.cancel_routine.unwrap())(irp.device, irp_ptr);
+    (irp.cancel_routine.unwrap())(dev.device_ptr(), irp_ptr);
     release_spinlock(&mut irp.cancel_lock);
 }
 
 fn kill_sweep_irps(task: &KThread) {
     let irp_list = task.lock().take_irp_list();
-    for irp in irp_list.iter() {
-        let dev_obj = unsafe {(***irp).device};
-        match get_device(unsafe {(*dev_obj).id}) {
-            None => {
-                // This device has been removed, don't send any cancel irp atp
+    for entry in irp_list.iter() {
+        let dev = &entry.device;
+        match dev.state() {
+            DeviceState::Removed | DeviceState::Removing => {
                 continue;
             },
-            Some(d) => {
-                match d.state() {
-                    DeviceState::Removed | DeviceState::Removing => {
-                        continue;
-                    },
-                    _ => {}
-                }
-            }
+            _ => {}
         }
-        cancel_irp(**irp);
+        cancel_irp(entry.irp, dev);
     }
 }
 

@@ -644,7 +644,10 @@ pub fn enumerate_and_detect(fdo: DeviceHandleK) {
         };
         assert!(!pdo.is_class_device(), "driver bug: enumerate returned a class device as a PDO");
         fdo.attach_child(id);
-        pdo.mark_started_pdo();
+        if !pdo.mark_started_pdo() {
+            info!("PDO {} was created with a name; rejecting (PDOs must be unnamed)", id);
+            continue;
+        }
 
         let ids = query_id(&pdo);
         if ids.is_empty() {

@@ -44,7 +44,7 @@ use sync::{Once, Spinlock};
 use mem::Regions::*;
 use mem::FixedList;
 #[cfg(feature = "kunit-test")]
-use kernel_intf::driver::{IrpMajor, IrpMinor, IrpResult, Keystroke, create_device_by_id};
+use kernel_intf::driver::{IrpMajor, IrpMinor, IrpResult, Keystroke, Status, create_device_by_id};
 #[cfg(feature = "kunit-test")]
 use kernel_intf::KError;
 use kernel_intf::list::List;
@@ -1065,6 +1065,172 @@ extern "C" fn i8042_reader_c() -> ! {
     }, false);
     info!("i8042 reader-c: got char: {:?}", buf);
     sched::exit_thread(0)
+}
+
+#[cfg(feature = "kunit-test")]
+static REMOVE_RACE_SYNC_NON_SUCCESS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "kunit-test")]
+static REMOVE_RACE_ASYNC_REJECTED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "kunit-test")]
+static REMOVE_RACE_ASYNC_NON_SUCCESS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "kunit-test")]
+static REMOVE_RACE_ASYNC_COMPLETED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "kunit-test")]
+static REMOVE_RACE_STOP: AtomicBool = AtomicBool::new(false);
+
+// Blocking reader: one outstanding sync read at a time, re-issued in a loop
+// until it sees a non-Success result (device stopped/removed underneath it).
+#[cfg(feature = "kunit-test")]
+extern "C" fn remove_race_sync_reader() -> ! {
+    let handle = match io::open_device_handle("ps/2_port0") {
+        Ok(h) => h,
+        Err(_) => {
+            info!("remove_race_sync_reader: device could not be opened");
+            sched::exit_thread(0);
+        }
+    };
+
+    let mut buf = [Keystroke::default(); 1];
+    loop {
+        let res = handle.read(io::ReadRequest {
+            buffer: MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: size_of::<Keystroke>() },
+            offset: 0
+        }, false);
+
+        if !matches!(res, Ok(Status::Success)) {
+            REMOVE_RACE_SYNC_NON_SUCCESS.fetch_add(1, Ordering::Relaxed);
+            sched::exit_thread(0);
+        }
+    }
+}
+
+#[cfg(feature = "kunit-test")]
+extern "C" fn remove_race_async_completion(result: *const IrpResult, ctx: *mut core::ffi::c_void) {
+    let status = unsafe { (*result).status };
+    REMOVE_RACE_ASYNC_COMPLETED.fetch_add(1, Ordering::Relaxed);
+    if status != Status::Success {
+        REMOVE_RACE_ASYNC_NON_SUCCESS.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe { &*(ctx as *const KSem) }.signal();
+}
+
+#[cfg(feature = "kunit-test")]
+extern "C" fn remove_race_async_issuer() -> ! {
+    let handle = match io::open_device_handle("ps/2_port0") {
+        Ok(h) => h,
+        Err(_) => {
+            info!("remove_race_async_issuer: device could not be opened");
+            sched::exit_thread(0);
+        }
+    };
+
+    let mut buf = [Keystroke::default(); 1];
+    let sem = KSem::new(0, 1);
+
+    while !REMOVE_RACE_STOP.load(Ordering::Acquire) {
+        let res = io::io_request_async(
+            &handle,
+            IrpMajor::Read,
+            IrpMinor::None,
+            MemoryRegion { base_address: buf.as_mut_ptr() as usize, size: size_of::<Keystroke>() },
+            0,
+            None,
+            remove_race_async_completion,
+            &sem as *const KSem as *mut core::ffi::c_void
+        );
+
+        match res {
+            Err(_) => {
+                REMOVE_RACE_ASYNC_REJECTED.fetch_add(1, Ordering::Relaxed);
+                // No IRP was allocated, so there's nothing to wait on -- but
+                // don't busy-spin re-submitting as fast as possible once the
+                // device starts rejecting everything.
+                sched::delay_ms(5, false);
+            }
+            Ok(_) => {
+                sem.wait_with_timeout(3000, false)
+                    .expect("remove_race_async_issuer: async completion timed out (possible hang/regression)");
+            }
+        }
+    }
+    sched::exit_thread(0);
+}
+
+#[kmod::test_function(true)]
+fn run_remove_race_tests() {
+    let dev_id = match io::open_device_handle("ps/2_port0") {
+        Ok(h) => h.id(),
+        Err(_) => {
+            info!("run_remove_race_tests: SKIP -- ps/2_port0 device missing");
+            return;
+        }
+    };
+
+    REMOVE_RACE_SYNC_NON_SUCCESS.store(0, Ordering::Relaxed);
+    REMOVE_RACE_ASYNC_REJECTED.store(0, Ordering::Relaxed);
+    REMOVE_RACE_ASYNC_NON_SUCCESS.store(0, Ordering::Relaxed);
+    REMOVE_RACE_ASYNC_COMPLETED.store(0, Ordering::Relaxed);
+    REMOVE_RACE_STOP.store(false, Ordering::Release);
+
+    const SYNC_READERS: usize = 8;
+    const ASYNC_ISSUERS: usize = 6;
+
+    let mut sync_threads = alloc::vec::Vec::with_capacity(SYNC_READERS);
+    for _ in 0..SYNC_READERS {
+        sync_threads.push(
+            sched::create_thread(remove_race_sync_reader, core::ptr::null_mut())
+                .expect("Failed to spawn remove_race_sync_reader")
+        );
+    }
+    let mut async_threads = alloc::vec::Vec::with_capacity(ASYNC_ISSUERS);
+    for _ in 0..ASYNC_ISSUERS {
+        async_threads.push(
+            sched::create_thread(remove_race_async_issuer, core::ptr::null_mut())
+                .expect("Failed to spawn remove_race_async_issuer")
+        );
+    }
+
+    // Let a burst of concurrent sync + async reads actually get admitted and
+    // start hitting the driver before we remove the device out from under them.
+    sched::delay_ms(200, false);
+
+    info!(
+        "remove race: removing device {} while {} sync readers + {} async issuers are active",
+        dev_id, SYNC_READERS, ASYNC_ISSUERS
+    );
+    match io::get_device(dev_id) {
+        Some(handle) => io::remove_device(&handle),
+        None => {
+            info!("run_remove_race_tests: SKIP -- device disappeared before remove");
+            REMOVE_RACE_STOP.store(true, Ordering::Release);
+            for t in sync_threads { t.wait(false); }
+            for t in async_threads { t.wait(false); }
+            return;
+        }
+    }
+
+    REMOVE_RACE_STOP.store(true, Ordering::Release);
+    for t in sync_threads {
+        t.wait(false);
+    }
+    for t in async_threads {
+        t.wait(false);
+    }
+
+    let sync_non_success = REMOVE_RACE_SYNC_NON_SUCCESS.load(Ordering::Relaxed);
+    let async_rejected = REMOVE_RACE_ASYNC_REJECTED.load(Ordering::Relaxed);
+    let async_non_success = REMOVE_RACE_ASYNC_NON_SUCCESS.load(Ordering::Relaxed);
+    let async_completed = REMOVE_RACE_ASYNC_COMPLETED.load(Ordering::Relaxed);
+    info!(
+        "remove race: {} / {} sync readers non-success, {} async submissions rejected, {} async completions ({} non-success)",
+        sync_non_success, SYNC_READERS, async_rejected, async_completed, async_non_success
+    );
+    assert!(sync_non_success == SYNC_READERS, "all pending sync reads must be unblocked (non-success) by device removal");
+    assert!(async_rejected > 0, "async submissions issued after removal must be rejected by the state guard");
+    assert!(async_completed > 0, "async issuers must have actually gotten at least one request dispatched and completed");
+
+    assert!(io::get_device(dev_id).is_none(), "device must be gone from the registry after remove_device");
+    info!("run_remove_race_tests: PASSED");
 }
 
 // This will be called from the entry point for the corresponding arch

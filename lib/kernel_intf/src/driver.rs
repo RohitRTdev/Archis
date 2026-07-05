@@ -194,9 +194,9 @@ pub struct Irp {
     pub bytes_completed: usize,
     pub completion_routine: extern "C" fn(*mut Irp, *mut c_void),
     pub completion_ctx: *mut c_void,
-    pub device: *const DeviceObject,
 
     // Kernel accounting; drivers do not read these.
+    pub device: usize,
     pub is_cancelled: bool,
     pub cancel_routine: Option<extern "C" fn(*const DeviceObject, *mut Irp)>,
     pub cancel_lock: Lock,
@@ -237,7 +237,7 @@ impl Irp {
         offset: usize,
         completion_routine: extern "C" fn(*mut Irp, *mut c_void),
         completion_ctx: *mut c_void,
-        device: *const DeviceObject,
+        device: usize,
         thread_id: usize
     ) -> Self {
         let mut cancel_lock = Lock { lock: 0, int_status: false };

@@ -10,6 +10,8 @@ pub mod ds;
 pub use ds::list;
 pub mod driver;
 pub mod hw;
+pub mod remove_lock;
+pub use remove_lock::RemoveLock;
 use core::{ffi::c_void, fmt};
 use common::StrRef;
 use alloc::vec::Vec;

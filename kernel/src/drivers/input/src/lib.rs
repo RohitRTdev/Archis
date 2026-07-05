@@ -6,7 +6,7 @@ use core::ptr::null_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_intf::{
-    Lock, acquire_spinlock, create_spinlock, info, io_complete_irp, io_remove_device, io_send_request, io_set_cancel_routine, io_start_device, io_start_processing, io_stop_device, release_spinlock
+    Lock, RemoveLock, acquire_spinlock, create_spinlock, info, io_complete_irp, io_remove_device, io_send_request, io_set_cancel_routine, io_start_device, io_start_processing, io_stop_device, release_spinlock
 };
 use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
@@ -26,6 +26,7 @@ static STARTED_PORT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static INPUT_DEVICE_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
 static INPUT_DEVICE_PTR: AtomicUsize = AtomicUsize::new(0);
 static INPUT_CTX_PTR: AtomicUsize = AtomicUsize::new(0);
+static INPUT_REMOVE_LOCK: RemoveLock = RemoveLock::new();
 
 #[derive(Clone, Copy)]
 struct PendingEntry {
@@ -176,6 +177,8 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
         null_mut()
     );
 
+    INPUT_REMOVE_LOCK.acquire();
+
     let prev = STARTED_PORT_COUNT.fetch_add(1, Ordering::AcqRel);
     if prev == 0 {
         // First port device started — bring up the class device.
@@ -210,6 +213,10 @@ fn do_stop(device: &DeviceObject, request: &mut Irp) -> Status {
         None,
         null_mut()
     );
+
+    // Release the reference taken in do_start now that i8042 will no longer
+    // invoke keystroke_received on behalf of this port.
+    INPUT_REMOVE_LOCK.release(); 
 
     let prev = STARTED_PORT_COUNT.fetch_sub(1, Ordering::AcqRel);
     let remaining = prev.saturating_sub(1);
@@ -308,8 +315,15 @@ extern "C" fn input_cancel(dev: *const DeviceObject, irp: *mut Irp) {
 unsafe extern "C" fn keystroke_received(
     keystrokes: *const Keystroke,
     count:      usize,
-    context:    *mut c_void,
+    context:    *mut c_void
 ) {
+    // Acquired before context is dereferenced: keyboard_dw copies the
+    // handler under its lock and calls it after releasing, so deregistering
+    // the handler alone doesn't fence an in-flight call like this one.
+    if !INPUT_REMOVE_LOCK.acquire() {
+        return;
+    }
+
     let ctx = unsafe { &mut *(context as *mut InputCtx) };
 
     acquire_spinlock(&mut ctx.lock);
@@ -363,15 +377,31 @@ unsafe extern "C" fn keystroke_received(
             io_complete_irp(irp, Status::Success);
         }
     }
+
+    release_input_ctx();
+}
+
+fn release_input_ctx() {
+    if INPUT_REMOVE_LOCK.release() {
+        let ctx = INPUT_CTX_PTR.load(Ordering::Acquire);
+        if ctx != 0 {
+            unsafe { drop(alloc::boxed::Box::from_raw_in(ctx as *mut InputCtx, PoolAllocatorGlobal)); }
+        }
+    }
 }
 
 #[kmod::driver_unload]
 fn destroy(driver: &mut DriverObject) {
     info!("Destroying driver {}", driver.get_name());
 
-    let ctx = INPUT_CTX_PTR.load(Ordering::Acquire);
-    if ctx != 0 {
-        unsafe { alloc::boxed::Box::from_raw_in(ctx as *mut InputCtx, PoolAllocatorGlobal); }
+    // Every port's do_stop runs (and releases its registration reference)
+    // before unload_driver calls this, so this is normally the free path;
+    // otherwise a still in-flight keystroke_received will free it instead.
+    if INPUT_REMOVE_LOCK.begin_remove() {
+        let ctx = INPUT_CTX_PTR.load(Ordering::Acquire);
+        if ctx != 0 {
+            unsafe { drop(alloc::boxed::Box::from_raw_in(ctx as *mut InputCtx, PoolAllocatorGlobal)); }
+        }
     }
 
     let dev = INPUT_DEVICE_PTR.load(Ordering::Acquire);

@@ -3,10 +3,10 @@
 
 use core::ffi::c_void;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_intf::{
-    Lock, ProcessGroupType, SIGINT, SIGTTIN, SessionType, acquire_spinlock, create_spinlock, disable_tty_mode, enable_tty_mode, info, io_complete_irp, io_set_cancel_routine, io_start_processing, proc_drop_pgrp, proc_drop_session, proc_get_pgrp, proc_get_session, proc_is_foreground_pgrp, proc_is_pgrp_active, proc_is_session_active, proc_is_session_leader, proc_issue_pgrp, release_spinlock, sched_get_current_pid, tty_print
+    Lock, ProcessGroupType, RemoveLock, SIGINT, SIGTTIN, SessionType, acquire_spinlock, create_spinlock, disable_tty_mode, enable_tty_mode, info, io_complete_irp, io_set_cancel_routine, io_start_processing, proc_drop_pgrp, proc_drop_session, proc_get_pgrp, proc_get_session, proc_is_foreground_pgrp, proc_is_pgrp_active, proc_is_session_active, proc_is_session_leader, proc_issue_pgrp, release_spinlock, sched_get_current_pid, tty_print
 };
 use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
@@ -22,7 +22,7 @@ const MAX_TMP_CHARS:  usize = 16;
 
 static TTY_CREATED: AtomicUsize = AtomicUsize::new(0);
 static TTY_CTX_PTR: AtomicUsize = AtomicUsize::new(0);
-static TTY_CTX_LOCK: AtomicBool = AtomicBool::new(true);
+static TTY_REMOVE_LOCK: RemoveLock = RemoveLock::new();
 
 #[derive(Clone, Copy)]
 struct PendingEntry {
@@ -140,8 +140,6 @@ fn do_remove(device: &DeviceObject, request: &mut Irp) -> Status {
     info!("tty: remove");
     disable_and_fail_pending(device);
 
-    TTY_CTX_PTR.store(0, Ordering::Release);
-
     if !device.ctx.is_null() {
         unsafe {
             let ctx = &mut *(device.ctx as *mut TtyCtx);
@@ -153,10 +151,17 @@ fn do_remove(device: &DeviceObject, request: &mut Irp) -> Status {
                 proc_drop_pgrp(ctx.job.pgrp);
                 ctx.job.pgrp = 0;
             }
-            drop(alloc::boxed::Box::from_raw_in(
-                device.ctx as *mut TtyCtx,
-                PoolAllocatorGlobal
-            ));
+        }
+
+        // If an in-flight tty_input call holds the last reference, its
+        // release() will free ctx instead once it's done with it.
+        if TTY_REMOVE_LOCK.begin_remove() {
+            unsafe {
+                drop(alloc::boxed::Box::from_raw_in(
+                    device.ctx as *mut TtyCtx,
+                    PoolAllocatorGlobal
+                ));
+            }
         }
     }
 
@@ -434,12 +439,15 @@ extern "C" fn tty_cancel(dev: *const DeviceObject, irp: *mut Irp) {
 
 #[kmod::export]
 fn tty_input(bytes: *const u8, count: usize) {
-    while !TTY_CTX_LOCK.load(Ordering::Acquire) {
-        core::hint::spin_loop();
+    // Acquired before TTY_CTX_PTR is even read: if this fails, removal has
+    // already begun and ctx may already be gone, so we must not touch it.
+    if !TTY_REMOVE_LOCK.acquire() {
+        return;
     }
-    
+
     let ctx_ptr = TTY_CTX_PTR.load(Ordering::Acquire);
     if ctx_ptr == 0 || count == 0 {
+        release_tty_ctx(ctx_ptr);
         return;
     }
     let ctx = unsafe { &mut *(ctx_ptr as *mut TtyCtx) };
@@ -463,6 +471,7 @@ fn tty_input(bytes: *const u8, count: usize) {
             if pgrp != 0 && proc_is_pgrp_active(pgrp) {
                 proc_issue_pgrp(pgrp, SIGINT);
             }
+            release_tty_ctx(ctx_ptr);
             return;
         }
         tmp_buffer[tmp_offset] = b;
@@ -508,13 +517,21 @@ fn tty_input(bytes: *const u8, count: usize) {
             io_complete_irp(irp, Status::Success);
         }
     }
+
+    release_tty_ctx(ctx_ptr);
+}
+
+// Release the reference taken in tty_input; if do_remove already ran and
+// this was the last outstanding reference, we free ctx.
+fn release_tty_ctx(ctx_ptr: usize) {
+    if TTY_REMOVE_LOCK.release() && ctx_ptr != 0 {
+        unsafe { drop(alloc::boxed::Box::from_raw_in(ctx_ptr as *mut TtyCtx, PoolAllocatorGlobal)); }
+    }
 }
 
 #[kmod::driver_unload]
 fn destroy(driver: &mut DriverObject) {
     info!("Destroying {} driver", driver.get_name());
-    TTY_CTX_LOCK.store(false, Ordering::Release);
     TTY_CREATED.store(0, Ordering::Release);
     TTY_CTX_PTR.store(0, Ordering::Release);
-    TTY_CTX_LOCK.store(true, Ordering::Release);
 }

@@ -111,7 +111,10 @@ pub struct DeviceObjectK {
     // Read/write mutual exclusion is left to driver writer.
     config_sem: KSem,
     pending_irps: Spinlock<DynList<IrpPtr>>,
-    resource_list: Spinlock<Option<ResList>>
+    resource_list: Spinlock<Option<ResList>>,
+    request_lock: KSem,
+    // Signalled whenever pending_irps becomes empty
+    pending_irps_drained_event: KEvent
 }
 
 unsafe impl Send for DeviceObjectK {}
@@ -132,6 +135,10 @@ impl DeviceObjectK {
 
     pub fn get_pending_irps(&self) -> &Spinlock<DynList<IrpPtr>> {
         &self.pending_irps
+    }
+
+    pub fn pending_irps_drained_event(&self) -> &KEvent {
+        &self.pending_irps_drained_event
     }
 
     pub fn is_class_device(&self) -> bool {
@@ -200,9 +207,15 @@ impl DeviceObjectK {
 
     // PDOs are created by a bus during enumerate and are always started — they
     // only carry bus resource info and never receive start/stop dispatches.
-    pub fn mark_started_pdo(&self) {
+    // Returns false (and marks nothing) if the device was given a name --
+    // PDOs must be unnamed, since no caller may issue IO requests to one.
+    pub fn mark_started_pdo(&self) -> bool {
+        if self.device.get_name().is_some() {
+            return false;
+        }
         self.is_pdo.store(true, Ordering::Release);
         self.set_state(DeviceState::Started);
+        true
     }
 
     fn update_stack_state(&self, ls: LevelState) {
@@ -303,22 +316,36 @@ impl DeviceObjectK {
         Ok(self.stop_self(is_child))
     }
 
+    fn quiesce_requests(&self, next_state: DeviceState) {
+        let _rl = semaphore_guard(&self.request_lock);
+        self.set_state(next_state);
+    }
+
+    fn wait_pending_irps_drained(&self) {
+        loop {
+            if self.pending_irps.lock().get_nodes() == 0 {
+                break;
+            }
+            let _ = self.pending_irps_drained_event.wait(false);
+        }
+    }
+
     fn stop_self(&self, is_child: bool) -> Status {
-        if self.is_pdo() || self.state() != DeviceState::Started {
+        if self.is_pdo() {
+            assert!(self.pending_irps.lock().get_nodes() == 0, "PDO {} has pending irps", self.id);
             return Status::Success;
         }
-        self.set_state(DeviceState::Stopping);
+        if self.state() != DeviceState::Started {
+            return Status::Success;
+        }
+        self.quiesce_requests(DeviceState::Stopping);
         let status = io_request_sync(self, IrpMajor::Pnp, IrpMinor::Stop, EMPTY_REGION, 0, None, false)
             .map(|irp| irp.status)
             .unwrap_or(Status::Failed);
         self.set_state(DeviceState::Stopped);
         self.update_stack_state(LevelState::Stopped);
-        
-        let num_irps = self.pending_irps.lock().get_nodes();
-        if num_irps > 0 {
-            info!("Warning: Device {:?} has {} pending irp(s)", self.device.get_name(), num_irps);
-        }
-        
+        self.wait_pending_irps_drained();
+
         if !is_child {
             self.enabled.store(false, Ordering::Release);
         }
@@ -356,12 +383,21 @@ fn dispatch(driver: &DriverObjectK, major: IrpMajor, dev: *const DeviceObject, i
     }
 }
 
-fn allowed_in_state(state: DeviceState, major: IrpMajor, minor: IrpMinor, is_class: bool) -> bool {
+fn allowed_in_state(state: DeviceState, major: IrpMajor, minor: IrpMinor, is_class: bool, is_pdo: bool) -> bool {
     if is_class {
         return match major {
             IrpMajor::Pnp => false,
             _ => state == DeviceState::Started,
         };
+    }
+    // No caller may send read/write/control/open/close to a PDO
+    if is_pdo {
+        match major {
+            IrpMajor::Read | IrpMajor::Write | IrpMajor::Control | IrpMajor::Open | IrpMajor::Close => {
+                return false;
+            },
+            _ => {}
+        }
     }
     match (major, minor) {
         (IrpMajor::Read, _) | (IrpMajor::Write, _)   => state == DeviceState::Started,
@@ -400,30 +436,40 @@ pub fn io_request_sync(
     req_info: Option<ReqInfo>,
     is_interruptible: bool
 ) -> Result<IrpResult, KError> {
-    if !allowed_in_state(dev.state(), major, minor, dev.is_class_device) {
-        return Err(state_rejection_error(dev.state(), major, minor));
-    }
-    let driver = dev.driver.as_ref().ok_or(KError::Unsupported)?;
-
     let event = KEvent::new(false);
     let mut result = IrpResult::default();
 
-    let irp = allocate_irp(
-        major,
-        minor,
-        buffer,
-        offset,
-        dev.device_ptr(),
-        Some(event.clone()),
-        &mut result as *mut IrpResult,
-        None,
-        core::ptr::null_mut()
-    );
+    // Held across the state check and IRP admission so a concurrent
+    // stop/remove can't flip state in between
+    let irp = {
+        let _rl = semaphore_guard(&dev.request_lock);
+        if !allowed_in_state(dev.state(), major, minor, dev.is_class_device, dev.is_pdo()) {
+            return Err(state_rejection_error(dev.state(), major, minor));
+        }
+        if dev.driver.is_none() {
+            return Err(KError::Unsupported);
+        }
+        let dev_handle = resolve_device(dev.device_ptr())
+            .expect("device must still be registered while its request_lock is held");
+
+        allocate_irp(
+            major,
+            minor,
+            buffer,
+            offset,
+            dev_handle,
+            Some(event.clone()),
+            &mut result as *mut IrpResult,
+            None,
+            core::ptr::null_mut()
+        )
+    };
 
     if let Some(info) = req_info {
         unsafe { (*irp).req_info = info; }
     }
 
+    let driver = dev.driver.as_ref().ok_or(KError::Unsupported)?;
     let status = dispatch(driver, major, dev.device_ptr(), irp);
     if status == Status::Pending {
         event.wait(is_interruptible);
@@ -445,27 +491,35 @@ pub fn io_request_async(
     routine: extern "C" fn(*const IrpResult, *mut c_void),
     ctx: *mut c_void
 ) -> Result<Status, KError> {
-    if !allowed_in_state(dev.state(), major, minor, dev.is_class_device) {
-        return Err(state_rejection_error(dev.state(), major, minor));
-    }
-    let driver = dev.driver.as_ref().ok_or(KError::Unsupported)?;
+    let irp = {
+        let _rl = semaphore_guard(&dev.request_lock);
+        if !allowed_in_state(dev.state(), major, minor, dev.is_class_device, dev.is_pdo()) {
+            return Err(state_rejection_error(dev.state(), major, minor));
+        }
+        if dev.driver.is_none() {
+            return Err(KError::Unsupported);
+        }
+        let dev_handle = resolve_device(dev.device_ptr())
+            .expect("device must still be registered while its request_lock is held");
 
-    let irp = allocate_irp(
-        major,
-        minor,
-        buffer,
-        offset,
-        dev.device_ptr(),
-        None,
-        core::ptr::null_mut(),
-        Some(routine),
-        ctx
-    );
+        allocate_irp(
+            major,
+            minor,
+            buffer,
+            offset,
+            dev_handle,
+            None,
+            core::ptr::null_mut(),
+            Some(routine),
+            ctx
+        )
+    };
 
     if let Some(info) = req_info {
         unsafe { (*irp).req_info = info; }
     }
 
+    let driver = dev.driver.as_ref().ok_or(KError::Unsupported)?;
     let status = dispatch(driver, major, dev.device_ptr(), irp);
     if status == Status::Unsupported {
         io_complete_irp(irp, status);
@@ -502,7 +556,9 @@ fn create_root_device() -> DeviceHandleK {
             stack: Spinlock::new(None),
             config_sem: KSem::new(1, 1),
             pending_irps: Spinlock::new(List::new()),
-            resource_list: Spinlock::new(None)
+            resource_list: Spinlock::new(None),
+            request_lock: KSem::new(1, 1),
+            pending_irps_drained_event: KEvent::new(true)
         },
         PoolAllocatorGlobal
     );
@@ -657,7 +713,9 @@ pub extern "C" fn io_create_device(
             stack: Spinlock::new(None),
             config_sem: KSem::new(1, 1),
             pending_irps: Spinlock::new(List::new()),
-            resource_list: Spinlock::new(None)
+            resource_list: Spinlock::new(None),
+            request_lock: KSem::new(1, 1),
+            pending_irps_drained_event: KEvent::new(true)
         },
         PoolAllocatorGlobal
     );
@@ -719,8 +777,8 @@ pub fn cancel_pending_irp(dev: &DeviceObjectK) {
     .collect();
 
     for irp in snapshot {
-        cancel_irp(irp);
-    } 
+        cancel_irp(irp, dev);
+    }
 }
 
 // Tear down a device subtree. 
@@ -729,7 +787,11 @@ pub fn remove_device(dev: &DeviceObjectK) {
 
     if dev.is_class_device {
         if dev.state() != DeviceState::Removed {
-            dev.set_state(DeviceState::Removed);
+            // Class devices skip Pnp dispatch entirely, so there's no
+            // separate "stop" step to give the driver a chance to fail
+            // in-flight requests -- just close admission and wait them out.
+            dev.quiesce_requests(DeviceState::Removed);
+            dev.wait_pending_irps_drained();
             DEVICE_REGISTRY.lock().remove(&dev.id);
             if let Some(n) = dev.device.get_name() {
                 DEVICE_BY_NAME.lock().remove(n);
@@ -754,6 +816,9 @@ pub fn remove_device(dev: &DeviceObjectK) {
 
     let cur = dev.state();
     if cur != DeviceState::Removing && cur != DeviceState::Removed {
+        if dev.is_pdo() {
+            assert!(dev.pending_irps.lock().get_nodes() == 0, "PDO {} has pending irps", dev.id);
+        }
         dev.set_state(DeviceState::Removing);
         let _ = io_request_sync(dev, IrpMajor::Pnp, IrpMinor::Remove, EMPTY_REGION, 0, None, false);
         dev.set_state(DeviceState::Removed);
