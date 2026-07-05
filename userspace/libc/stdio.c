@@ -1,5 +1,8 @@
 #include <stdio.h>
 #include <sys/syscall.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
 
 static void out_char(char *buf, size_t size, size_t *pos, char c) {
     if (*pos < size) buf[*pos] = c;
@@ -152,4 +155,278 @@ unsigned int sleep(unsigned int seconds) {
     }
 
     return 0;
+}
+
+static FILE g_stdin  = { .fd = -1, .ungetc_ch = -1 };
+static FILE g_stdout = { .fd = -1, .ungetc_ch = -1 };
+static FILE g_stderr = { .fd = -1, .ungetc_ch = -1 };
+
+FILE *stdin  = &g_stdin;
+FILE *stdout = &g_stdout;
+FILE *stderr = &g_stderr;
+
+static void bind_std_handle(FILE *f, handle_t h) {
+    file_stat_t st;
+    f->rpos = f->rlen = 0;
+    f->eof = 0;
+    f->error = 0;
+    f->ungetc_ch = -1;
+    f->fd = (sys_fstat(h, &st) == E_SUCCESS) ? h : -1;
+}
+
+void stdio_init_std_handles(void) {
+    bind_std_handle(stdin, STDIN_FILENO);
+    bind_std_handle(stdout, STDOUT_FILENO);
+    bind_std_handle(stderr, STDERR_FILENO);
+}
+
+static int refill(FILE *stream) {
+    if (stream->fd < 0) return -1;
+    size_t n = 0;
+    if (sys_read(stream->fd, stream->rbuf, sizeof(stream->rbuf), &n) != E_SUCCESS) {
+        stream->error = 1;
+        return -1;
+    }
+    if (n == 0) {
+        stream->eof = 1;
+        return -1;
+    }
+    stream->rpos = 0;
+    stream->rlen = n;
+    return 0;
+}
+
+int fgetc(FILE *stream) {
+    if (!stream) return EOF;
+    if (stream->ungetc_ch >= 0) {
+        int c = stream->ungetc_ch;
+        stream->ungetc_ch = -1;
+        return c;
+    }
+    if (stream->rpos >= stream->rlen && refill(stream) < 0) {
+        return EOF;
+    }
+    return stream->rbuf[stream->rpos++];
+}
+
+int getc(FILE *stream) {
+    return fgetc(stream);
+}
+
+int ungetc(int c, FILE *stream) {
+    if (!stream || c == EOF) return EOF;
+    stream->ungetc_ch = (unsigned char)c;
+    return (unsigned char)c;
+}
+
+int fputc(int c, FILE *stream) {
+    if (!stream || stream->fd < 0) return EOF;
+    unsigned char ch = (unsigned char)c;
+    size_t written = 0;
+    if (sys_write(stream->fd, &ch, 1, &written) != E_SUCCESS || written != 1) {
+        stream->error = 1;
+        return EOF;
+    }
+    return ch;
+}
+
+int putc(int c, FILE *stream) {
+    return fputc(c, stream);
+}
+
+char *fgets(char *buf, int n, FILE *stream) {
+    if (!buf || n <= 0 || !stream) return NULL;
+    int i = 0;
+    while (i < n - 1) {
+        int c = fgetc(stream);
+        if (c == EOF) {
+            if (i == 0) return NULL;
+            break;
+        }
+        buf[i++] = (char)c;
+        if (c == '\n') break;
+    }
+    buf[i] = '\0';
+    return buf;
+}
+
+int fputs(const char *s, FILE *stream) {
+    if (!s || !stream || stream->fd < 0) return EOF;
+    size_t len = strlen(s);
+    size_t written = 0;
+    if (len > 0 && (sys_write(stream->fd, s, len, &written) != E_SUCCESS || written != len)) {
+        stream->error = 1;
+        return EOF;
+    }
+    return 0;
+}
+
+int feof(FILE *stream) {
+    return stream ? stream->eof : 0;
+}
+
+int ferror(FILE *stream) {
+    return stream ? stream->error : 0;
+}
+
+void clearerr(FILE *stream) {
+    if (!stream) return;
+    stream->eof = 0;
+    stream->error = 0;
+}
+
+FILE *fopen(const char *path, const char *mode) {
+    if (!path || !mode || !mode[0]) return NULL;
+
+    int want_append = 0, want_truncate = 0;
+    switch (mode[0]) {
+        case 'r': break;
+        case 'w': want_truncate = 1; break;
+        case 'a': want_append = 1; break;
+        default: return NULL;
+    }
+
+    handle_t h;
+    if (want_truncate) {
+        // file_exist_only=false: deletes+recreates, giving us truncation.
+        h = sys_create_file(path, 0);
+    } else if (want_append) {
+        // Open without truncating if the file already exists (preserve its
+        // contents for appending); only fall back to create-fresh if it's missing.
+        h = sys_create_file(path, CREATE_FILE_EXIST_FLAG);
+        if (h < 0) {
+            h = sys_create_file(path, 0);
+        }
+    } else {
+        h = sys_create_file(path, CREATE_FILE_EXIST_FLAG);
+    }
+    if (h < 0) return NULL;
+
+    if (want_append) {
+        sys_seek(h, 0, SEEK_END);
+    }
+
+    FILE *f = malloc(sizeof(FILE));
+    if (!f) {
+        sys_close(h);
+        return NULL;
+    }
+    f->fd = h;
+    f->rpos = f->rlen = 0;
+    f->eof = 0;
+    f->error = 0;
+    f->ungetc_ch = -1;
+    return f;
+}
+
+int fclose(FILE *stream) {
+    if (!stream) return EOF;
+    int ret = 0;
+    if (stream->fd >= 0 && sys_close(stream->fd) != E_SUCCESS) {
+        ret = EOF;
+    }
+    stream->fd = -1;
+    if (stream != stdin && stream != stdout && stream != stderr) {
+        free(stream);
+    }
+    return ret;
+}
+
+int fflush(FILE *stream) {
+    (void)stream;
+    return 0;
+}
+
+size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    if (!ptr || !stream || size == 0 || nmemb == 0 || stream->fd < 0) return 0;
+
+    unsigned char *dst = (unsigned char *)ptr;
+    size_t total = size * nmemb;
+    size_t copied = 0;
+
+    if (stream->rpos < stream->rlen) {
+        size_t avail = stream->rlen - stream->rpos;
+        size_t take = avail < total ? avail : total;
+        memcpy(dst, stream->rbuf + stream->rpos, take);
+        stream->rpos += take;
+        copied += take;
+    }
+
+    while (copied < total) {
+        size_t n = 0;
+        if (sys_read(stream->fd, dst + copied, total - copied, &n) != E_SUCCESS) {
+            stream->error = 1;
+            break;
+        }
+        if (n == 0) {
+            stream->eof = 1;
+            break;
+        }
+        copied += n;
+    }
+
+    return copied / size;
+}
+
+size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    if (!ptr || !stream || size == 0 || nmemb == 0 || stream->fd < 0) return 0;
+
+    const unsigned char *src = (const unsigned char *)ptr;
+    size_t total = size * nmemb;
+    size_t written = 0;
+
+    while (written < total) {
+        size_t n = 0;
+        if (sys_write(stream->fd, src + written, total - written, &n) != E_SUCCESS || n == 0) {
+            stream->error = 1;
+            break;
+        }
+        written += n;
+    }
+
+    return written / size;
+}
+
+long ftell(FILE *stream) {
+    if (!stream || stream->fd < 0) return -1;
+    ssize_t pos = sys_seek(stream->fd, 0, SEEK_CUR);
+    if (pos < 0) return -1;
+    size_t buffered_unread = stream->rlen - stream->rpos;
+    if (stream->ungetc_ch >= 0) buffered_unread += 1;
+    return (long)(pos - (ssize_t)buffered_unread);
+}
+
+int fseek(FILE *stream, long offset, int whence) {
+    if (!stream || stream->fd < 0) return -1;
+
+    ssize_t target;
+    if (whence == SEEK_SET) {
+        target = offset;
+    } else if (whence == SEEK_CUR) {
+        long cur = ftell(stream);
+        if (cur < 0) return -1;
+        target = cur + offset;
+    } else if (whence == SEEK_END) {
+        file_stat_t st;
+        if (sys_fstat(stream->fd, &st) != E_SUCCESS) return -1;
+        target = (ssize_t)st.size + offset;
+    } else {
+        return -1;
+    }
+
+    if (sys_seek(stream->fd, target, SEEK_SET) < 0) return -1;
+
+    stream->rpos = stream->rlen = 0;
+    stream->ungetc_ch = -1;
+    stream->eof = 0;
+    return 0;
+}
+
+void rewind(FILE *stream) {
+    fseek(stream, 0, SEEK_SET);
+    if (stream) stream->error = 0;
+}
+
+int remove(const char *path) {
+    return sys_delete_file(path) == E_SUCCESS ? 0 : -1;
 }

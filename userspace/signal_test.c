@@ -7,10 +7,9 @@ typedef struct {
     int id;
 } signal_test_ctx_t;
 
-void my_signal_handler_sig_kill(void *ctx) {
+void my_signal_handler_sig_int(void *ctx) {
     signal_test_ctx_t *c = (signal_test_ctx_t *)ctx;
     printf("signal_test: sigkill handler: name=%s id=%d\n", c->signal_name, c->id);
-    sys_delay_ms(10000);
 }
 
 void my_signal_handler_sig_segv(void *ctx) {
@@ -26,11 +25,11 @@ void my_signal_handler_sig_ill(void *ctx) {
 int main(void) {
     printf("signal_test: starting, registering handler for signals\n");
 
-    signal_test_ctx_t kill_ctx = { "SIGKILL", SIGKILL };
+    signal_test_ctx_t int_ctx = { "SIGINT", SIGINT };
     signal_test_ctx_t segv_ctx = { "SIGSEGV", SIGSEGV };
     signal_test_ctx_t ill_ctx  = { "SIGILL",  SIGILL  };
 
-    set_signal_handler(SIGKILL, my_signal_handler_sig_kill, &kill_ctx);
+    set_signal_handler(SIGINT, my_signal_handler_sig_int, &int_ctx);
     set_signal_handler(SIGSEGV, my_signal_handler_sig_segv, &segv_ctx);
     set_signal_handler(SIGILL,  my_signal_handler_sig_ill,  &ill_ctx);
 

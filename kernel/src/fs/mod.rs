@@ -9,7 +9,7 @@ pub use file::{FileInst, FileInstance};
 pub use mount::MountSource;
 pub use root::load_root_fs;
 pub use utils::FileBuffer;
-pub use vfs::{DirEntry, EntryType, FileAttrs, FileStat, make_absolute, normalize_path, MODE_FILE, MODE_DIR, MODE_SYMLINK};
+pub use vfs::{DirEntry, EntryType, FileAttrs, FileStat, HandleStatType, make_absolute, normalize_path, MODE_FILE, MODE_DIR, MODE_SYMLINK};
 
 use alloc::string::String;
 use alloc::sync::Arc;

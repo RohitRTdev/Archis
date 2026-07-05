@@ -189,6 +189,17 @@ fn load_image_inner(
                 }
             }
         }
+
+        // Check with cwd too
+        let filename = fs::make_absolute(&crate::sched::get_cwd(), path);
+        let res = do_load_image_inner(filename.as_str(), in_progress);
+
+        match res {
+            Ok(img) => {
+                return Ok(img)
+            },
+            _ => {}
+        }
     }
 
     Err(KError::NotFound)
@@ -201,15 +212,7 @@ fn load_image_uncached(
     crate::loader_log!("Loading image {} from disk", path);
     let file = open(path)?;
     let file_size = file.len();
-    // Absolute paths (e.g. module loads that happen before a cwd handle
-    // exists, like fs::load_root_fs()'s device-backend module load) must
-    // not touch get_cwd() at all — only go through it for relative paths.
-    let abs_path = if path.starts_with('/') {
-        fs::normalize_path(path)
-    } else {
-        fs::make_absolute(&crate::sched::get_cwd(), path)
-    };
-    let canonical_file_path = Some(fs::resolve_symlink(&abs_path).expect("File path could not be resolved!"));
+    let canonical_file_path = Some(fs::resolve_symlink(&path).expect("File path could not be resolved!"));
 
     let buf= FileBuffer::new(file_size, false)
     .or_else(|e| {
@@ -263,13 +266,8 @@ fn load_image_uncached(
 }
 
 fn find_loaded_module(path: &str) -> Option<LoadedImage> {
-    let abs_path = if path.starts_with('/') {
-        fs::normalize_path(path)
-    } else {
-        fs::make_absolute(&crate::sched::get_cwd(), path)
-    };
-    let canonical = fs::resolve_symlink(&abs_path).unwrap_or_else(|_| abs_path.clone());
-    crate::loader_log!("find_loaded_module: looking for {} (canonical: {})", abs_path, canonical);
+    let canonical = fs::resolve_symlink(&path).unwrap_or_else(|_| path.to_owned());
+    crate::loader_log!("find_loaded_module: looking for {} (canonical: {})", path, canonical);
 
     // Collect strong refs under the registry lock, but compare (and drop the
     // non-matching Arcs) outside of it. Dropping the last strong ref runs

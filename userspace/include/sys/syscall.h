@@ -41,7 +41,9 @@ enum syscall_t {
     SYSCALL_CREATE_FILE,
     SYSCALL_CREATE_SYMLINK,
     SYSCALL_READLINK,
-    SYSCALL_CREATE_PIPE
+    SYSCALL_CREATE_PIPE,
+    SYSCALL_CHDIR,
+    SYSCALL_GETCWD
 };
 
 typedef enum {
@@ -59,16 +61,29 @@ typedef enum {
     E_INVALID_MEMORY_RANGE = -6,
     E_PROCESS_TERMINATED = -7,
     E_NOPERM = -8,
+    E_DEV_REMOVED = -9,
+    E_DEV_STARTED = -10,
     E_WAIT_INTERRUPTED = -11,
     E_TIMEOUT          = -12,
+    E_NOT_FOUND        = -13,
+    E_IS_DIR           = -14,
+    E_NOT_DIR          = -15,
+    E_FILE_EXISTS      = -16,
+    E_FILE_BUSY        = -17,
+    E_TOO_MANY_SYMLINKS = -18,
+    E_NOT_EMPTY        = -19,
     E_BUF_TOO_SMALL    = -20,
-    E_NO_DIR_ENTRIES   = -21
+    E_NO_DIR_ENTRIES   = -21,
+    E_IS_SYMLINK       = -22,
+    E_DEVICE_MOUNTED   = -23
 } syscall_status_t;
 
 #define PROCESS_SUSPEND_FLAG    ((uint64_t)1 << 0)
 #define OPEN_INHERITABLE_FLAG   ((uint64_t)1 << 0)
 #define CREATE_FILE_EXIST_FLAG  ((uint64_t)1 << 1)
 #define OPEN_WRITE_FLAG         ((uint64_t)1 << 2)
+
+#define PATH_MAX (256)
 
 typedef enum {
     CLOCK_MONOTONIC = 0,
@@ -83,9 +98,20 @@ typedef enum {
 #define TTY_MODE_ECHO  (1 << 0)
 #define TTY_MODE_CANON (1 << 1)
 
+typedef enum {
+    HANDLE_TYPE_FILE = 0,
+    HANDLE_TYPE_DEVICE = 1,
+    HANDLE_TYPE_THREAD = 2,
+    HANDLE_TYPE_PROCESS = 3,
+    HANDLE_TYPE_SYNC = 4,
+    HANDLE_TYPE_PIPE_READ = 5,
+    HANDLE_TYPE_PIPE_WRITE = 6
+} handle_type_t;
+
 typedef struct {
     uint64_t size;
     uint16_t mode;
+    uint8_t handle_type;
 } file_stat_t;
 
 #define FILE_MODE_FILE    (1 << 0)
@@ -165,3 +191,5 @@ syscall_status_t sys_fstat(handle_t handle, file_stat_t *out);
 syscall_status_t sys_readdir(handle_t handle, size_t offset, char *buf, size_t buf_len, size_t *bytes_written);
 syscall_status_t sys_readlink(const char *path, char *buf, size_t buf_len, size_t *bytes_written);
 syscall_status_t sys_create_pipe(handle_t *read_handle, handle_t *write_handle, const char *name, boolean_t is_inheritable);
+syscall_status_t sys_chdir(const char *path);
+syscall_status_t sys_getcwd(char *buf, size_t buf_len, size_t *bytes_written);

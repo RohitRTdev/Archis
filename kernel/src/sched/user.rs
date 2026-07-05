@@ -14,13 +14,13 @@ use crate::io::io_request_sync;
 use crate::pipe::{PipeType, create_named_pipe};
 use crate::sched::Handle::{PipeReadHandle, PipeWriteHandle};
 use crate::sched::{self, Handle::{FileHandle, ProcessHandle, SyncHandle, ThreadHandle, DeviceHandle}};
-use crate::fs::{FileBuffer, FileStat};
+use crate::fs::{FileBuffer, FileStat, HandleStatType};
 use crate::sync::{KEvent, KSem, do_signal, do_wait};
 use super::*;
 use kernel_intf::*;
 use kernel_intf::driver::{IrpMajor, IrpMinor, ReqInfo, TtyControlInfo, TtyModeInfo, EMPTY_REGION, Status};
 
-const MAX_SYSCALLS: usize = 37;
+const MAX_SYSCALLS: usize = 39;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 
 const OPEN_INHERITABLE_FLAG: u64 = 1 << 0;
@@ -74,7 +74,9 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_create_file_handler,
     sys_create_symlink_handler,
     sys_readlink_handler,
-    sys_create_pipe_handler
+    sys_create_pipe_handler,
+    sys_chdir_handler,
+    sys_getcwd_handler
 ];
 
 fn read_c_strlen(start: usize) -> Option<usize> {
@@ -997,14 +999,26 @@ fn sys_seek_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-// arg0 = file handle, arg1 = ptr to file_stat_t
+// arg0 = handle, arg1 = ptr to file_stat_t
 fn sys_fstat_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    let f = match get_handle(args[0] as usize) {
-        Some(FileHandle(f)) => f,
-        _ => return E_INVALID
+    let handle = match get_handle(args[0] as usize) {
+        Some(h) => h,
+        None => return E_INVALID
     };
-    let attrs = f.fstat();
-    let stat = FileStat { size: attrs.size, mode: attrs.mode };
+
+    let stat = match handle {
+        FileHandle(f) => {
+            let attrs = f.fstat();
+            FileStat { size: attrs.size, mode: attrs.mode, handle_type: HandleStatType::File }
+        }
+        DeviceHandle(_) => FileStat { size: 0, mode: 0, handle_type: HandleStatType::Device },
+        ThreadHandle(_) => FileStat { size: 0, mode: 0, handle_type: HandleStatType::Thread },
+        ProcessHandle(_) => FileStat { size: 0, mode: 0, handle_type: HandleStatType::Process },
+        SyncHandle(_) => FileStat { size: 0, mode: 0, handle_type: HandleStatType::Sync },
+        PipeReadHandle(_) => FileStat { size: 0, mode: 0, handle_type: HandleStatType::PipeRead },
+        PipeWriteHandle(_) => FileStat { size: 0, mode: 0, handle_type: HandleStatType::PipeWrite }
+    };
+
     if mem::copy_to_user(args[1] as usize, &stat as *const FileStat as *const u8, size_of::<FileStat>()).is_err() {
         return E_INVALID_MEMORY_RANGE;
     }
@@ -1206,4 +1220,43 @@ fn sys_create_pipe_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
             E_SUCCESS
         }
     }
+}
+
+// arg0 = path ptr
+fn sys_chdir_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let path = match read_user_string(args[0] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    match crate::fs::chdir(&path) {
+        Ok(()) => E_SUCCESS,
+        Err(e) => e.into()
+    }
+}
+
+// arg0 = buf ptr, arg1 = buf len, arg2 = ptr to bytes written
+fn sys_getcwd_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let raw = sched::get_cwd();
+    // Follow any symlinks in the path so the result is a truly canonical path,
+    // not just the lexically-normalized path that was used to chdir into it.
+    let canonical = crate::fs::resolve_symlink(&raw).unwrap_or(raw);
+
+    let buf_len = args[1] as usize;
+    let bytes = canonical.as_bytes();
+    if bytes.len() + 1 > buf_len {
+        return E_BUF_TOO_SMALL;
+    }
+    if mem::copy_to_user(args[0] as usize, bytes.as_ptr(), bytes.len()).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    let nul: u8 = 0;
+    if mem::copy_to_user(args[0] as usize + bytes.len(), &nul as *const u8, 1).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    let written = bytes.len() + 1;
+    if mem::copy_to_user(args[2] as usize, &written as *const usize as *const u8, size_of::<usize>()).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+    E_SUCCESS
 }

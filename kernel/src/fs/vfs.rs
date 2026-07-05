@@ -59,11 +59,24 @@ pub enum ProbeStep {
     Symlink { dir: String, target: String, remaining: String }
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum HandleStatType {
+    File = 0,
+    Device = 1,
+    Thread = 2,
+    Process = 3,
+    Sync = 4,
+    PipeRead = 5,
+    PipeWrite = 6
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FileStat {
     pub size: u64,
-    pub mode: u16
+    pub mode: u16,
+    pub handle_type: HandleStatType
 }
 
 pub struct VfsNode {

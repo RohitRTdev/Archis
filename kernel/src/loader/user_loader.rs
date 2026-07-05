@@ -454,8 +454,7 @@ fn apply_user_relocations(
 
 // Check if this module has been loaded in some process space
 fn find_user_module(path: &str) -> Option<SharedUserModuleRef> {
-    let abs_path = fs::make_absolute(&crate::sched::get_cwd(), path);
-    let canonical = fs::resolve_symlink(&abs_path).unwrap_or_else(|_| abs_path.clone());
+    let canonical = fs::resolve_symlink(&path).unwrap_or_else(|_| path.to_owned());
 
     let candidates: Vec<SharedUserModuleRef> = {
         let registry = USER_MODULES.lock();
@@ -501,12 +500,18 @@ fn load_user_inner(path: &str, in_progress: &mut Vec<String>) -> Result<LoadedIm
         }
     }
 
+    // Check cwd
+    let filename = fs::make_absolute(&crate::sched::get_cwd(), path);
+    let res = do_load_user_inner(filename.as_str(), in_progress);
+
+    if res.is_ok() {
+        return res;
+    }
+
     Err(KError::NotFound)
 }
 
 fn do_load_user_inner(path: &str, in_progress: &mut Vec<String>) -> Result<LoadedImage, KError> {
-    let abs_path = fs::make_absolute(&crate::sched::get_cwd(), path);
-
     // If this process already mapped this module, hand back the existing
     // mapping. The snapshot is cloned out so that the shared/file locks are
     // taken without holding the process lock
@@ -516,7 +521,7 @@ fn do_load_user_inner(path: &str, in_progress: &mut Vec<String>) -> Result<Loade
         guard.get_user_modules()
     };
 
-    let canonical = fs::resolve_symlink(&abs_path).unwrap_or_else(|_| abs_path.clone());
+    let canonical = fs::resolve_symlink(&path).unwrap_or_else(|_| path.to_owned());
     for module in snapshot {
         let (name_matches, base) = {
             let module_guard = module.lock();
@@ -556,8 +561,7 @@ fn load_user_into_process(
 
     let file = open(path)?;
     let file_size = file.len();
-    let abs_path = fs::make_absolute(&crate::sched::get_cwd(), path);
-    let canonical_file_path = fs::resolve_symlink(&abs_path).expect("File path could not be resolved!");
+    let canonical_file_path = fs::resolve_symlink(&path).expect("File path could not be resolved!");
 
     let buf = FileBuffer::new(file_size, false)
     .or_else(|e| {
