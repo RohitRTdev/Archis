@@ -12,7 +12,8 @@ use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
     DeviceObject, DeviceType, DriverObject, Irp, IrpMajor, IrpMinor,
     Keystroke, KeystrokeHandler, RegisterHandlerInfo, ReqInfo, Status,
-    create_device, create_device_by_id
+    create_device, create_device_by_id,
+    KS_RELEASE, MOD_CTRL, MOD_SHIFT, MOD_CAPSLOCK
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
 
@@ -50,7 +51,7 @@ impl InputCtx {
     const fn zeroed() -> Self {
         Self {
             lock:       Lock::new(),
-            raw_ring:   RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 }),
+            raw_ring:   RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0, modifiers: 0 }),
             ascii_ring: RingBuffer::new(0u8),
             pending:    [PendingEntry { irp: null_mut(), requested: 0 }; MAX_PENDING],
             pending_len: 0
@@ -312,6 +313,55 @@ extern "C" fn input_cancel(dev: *const DeviceObject, irp: *mut Irp) {
     io_complete_irp(irp, Status::Cancelled);
 }
 
+// Shifted variant of the top-row digits/symbols and punctuation keys, US QWERTY.
+fn shifted_symbol(c: u8) -> u8 {
+    match c {
+        b'1' => b'!', b'2' => b'@', b'3' => b'#', b'4' => b'$', b'5' => b'%',
+        b'6' => b'^', b'7' => b'&', b'8' => b'*', b'9' => b'(', b'0' => b')',
+        b'-' => b'_', b'=' => b'+',
+        b'[' => b'{', b']' => b'}',
+        b';' => b':', b'\'' => b'"', b'`' => b'~',
+        b'\\' => b'|', b',' => b'<', b'.' => b'>', b'/' => b'?',
+        other => other
+    }
+}
+
+// Turn i8042's unshifted base ascii + modifier state into the final byte,
+// applying shift/caps-aware case and symbol selection, then ctrl masking
+// (e.g. Ctrl+C -> 0x03) per the standard control-character convention.
+fn decode_char(base_ascii: u8, modifiers: u8) -> u8 {
+    let ctrl  = modifiers & MOD_CTRL != 0;
+    let shift = modifiers & MOD_SHIFT != 0;
+    let caps  = modifiers & MOD_CAPSLOCK != 0;
+
+    let ch = if base_ascii.is_ascii_lowercase() {
+        if shift ^ caps { base_ascii.to_ascii_uppercase() } else { base_ascii }
+    }
+    else if shift {
+        shifted_symbol(base_ascii)
+    }
+    else {
+        base_ascii
+    };
+
+    if !ctrl {
+        return ch;
+    }
+
+    match ch {
+        b'A'..=b'Z' => ch & 0x1F,
+        b'a'..=b'z' => ch.to_ascii_uppercase() & 0x1F,
+        b'@'  => 0x00,
+        b'['  => 0x1B,
+        b'\\' => 0x1C,
+        b']'  => 0x1D,
+        b'^'  => 0x1E,
+        b'_'  => 0x1F,
+        b'?'  => 0x7F,
+        other => other
+    }
+}
+
 unsafe extern "C" fn keystroke_received(
     keystrokes: *const Keystroke,
     count:      usize,
@@ -334,10 +384,11 @@ unsafe extern "C" fn keystroke_received(
     for i in 0..count {
         let ks = unsafe { &*keystrokes.add(i) };
         ctx.raw_ring.push(*ks);
-        if ks.ascii != 0 && ks.flags & 1 == 0 {
-            ctx.ascii_ring.push(ks.ascii);
+        if ks.ascii != 0 && ks.flags & KS_RELEASE == 0 {
+            let c = decode_char(ks.ascii, ks.modifiers);
+            ctx.ascii_ring.push(c);
             if ascii_batch_len < ASCII_BUF_SIZE {
-                ascii_batch[ascii_batch_len] = ks.ascii;
+                ascii_batch[ascii_batch_len] = c;
                 ascii_batch_len += 1;
             }
         }

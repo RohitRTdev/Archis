@@ -18,7 +18,7 @@ use crate::fs::{FileBuffer, FileStat};
 use crate::sync::{KEvent, KSem, do_signal, do_wait};
 use super::*;
 use kernel_intf::*;
-use kernel_intf::driver::{IrpMajor, IrpMinor, ReqInfo, TtyControlInfo, EMPTY_REGION, Status};
+use kernel_intf::driver::{IrpMajor, IrpMinor, ReqInfo, TtyControlInfo, TtyModeInfo, EMPTY_REGION, Status};
 
 const MAX_SYSCALLS: usize = 37;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
@@ -206,7 +206,7 @@ pub extern "C" fn user_init_handler() -> ! {
                     let proc = get_current_process().unwrap();
                     proc.lock().complete_init(false);
                 }
-                exit_process(-1);
+                exit_process(ExitInfo::normal(-1));
             }
         };
 
@@ -272,15 +272,15 @@ pub fn syscall_dispatcher(syscall_number: u64, syscall_args: &[u64; MAX_ARCH_ARG
 fn sys_exit_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let id = get_current_process_id().expect("Called sys_exit_handler from idle task!");
 
-    kill_process(id, args[0] as isize);
+    kill_process(id, ExitInfo::normal(args[0] as isize));
 
     E_SUCCESS
-} 
+}
 
 fn sys_thread_exit_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let id = get_current_task_id().expect("Called sys_thread_exit_handler from idle task!");
 
-    kill_thread(id, 0);
+    kill_thread(id, ExitInfo::normal(0));
 
     E_SUCCESS
 }
@@ -331,7 +331,7 @@ fn sys_read_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
             // Tell driver to write to the kernel buffer
             let result = match io_request_sync(&**h, IrpMajor::Read, IrpMinor::None, region, 0, None, true) {
                 Ok(r) => r,
-                Err(_) => return E_INVALID
+                Err(e) => return e.into()
             };
             if result.status != Status::Success {
                 return E_INVALID;
@@ -436,7 +436,7 @@ fn read_user_string(ptr: usize) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-// arg0 = device handle, arg1 = minor code, arg2 = command (Depends on the minor code)
+// arg0 = device handle, arg1 = minor code, arg2 = command (depends on the minor code)
 fn sys_device_control_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let handle = match get_handle(args[0] as usize) {
         Some(DeviceHandle(h)) => h,
@@ -446,22 +446,40 @@ fn sys_device_control_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
         Some(m) => m,
         None => return E_INVALID
     };
-    // For now
-    assert!(minor == IrpMinor::SetForegroundPgrp || minor == IrpMinor::SetControllingTty);
 
-    // For SetForegroundPgrp and SetControllingTty, the command is the pid of process 
-    // whose process grp / session we want to set
-    let info = TtyControlInfo { pid: args[2] as usize };
-    let req_info = ReqInfo { tty_control: info };
+    let req_info = match minor {
+        // For SetForegroundPgrp and SetControllingTty, the command is the pid of
+        // process whose process grp / session we want to set
+        IrpMinor::SetForegroundPgrp | IrpMinor::SetControllingTty => {
+            ReqInfo { tty_control: TtyControlInfo { pid: args[2] as usize } }
+        },
+        // For SetTtyMode, the command is the new mode bitmask
+        IrpMinor::SetTtyMode => {
+            ReqInfo { tty_mode: TtyModeInfo { mode: args[2] as u8 } }
+        },
+        // For GetTtyMode, the command is a user pointer to write the mode byte back into
+        IrpMinor::GetTtyMode => {
+            ReqInfo { tty_mode: TtyModeInfo { mode: 0 } }
+        },
+        _ => return E_INVALID
+    };
+
     let result = match io_request_sync(&**handle, IrpMajor::Control, minor, EMPTY_REGION, 0, Some(req_info), false) {
         Ok(r) => r,
         Err(_) => return E_INVALID
     };
-    if result.status == Status::Success {
-        E_SUCCESS
-    } else {
-        E_NOPERM
+    if result.status != Status::Success {
+        return E_NOPERM;
     }
+
+    if minor == IrpMinor::GetTtyMode {
+        let mode = unsafe { result.req_info.tty_mode }.mode;
+        if mem::copy_to_user(args[2] as usize, &mode as *const u8, 1).is_err() {
+            return E_INVALID_MEMORY_RANGE;
+        }
+    }
+
+    E_SUCCESS
 }
 
 // arg 1 = delay in ms
@@ -648,7 +666,7 @@ fn sys_get_thread_info_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
             let guard = thread.lock();
             ThreadInfo {
                 id: guard.get_id() as u64,
-                exit_code: guard.get_exit_code() as i64
+                exit_info: guard.get_exit_info()
             }
         };
         if mem::copy_to_user(args[1] as usize, &info as *const _ as *const u8, size_of::<ThreadInfo>()).is_err() {

@@ -422,7 +422,9 @@ fn allowed_in_state(state: DeviceState, major: IrpMajor, minor: IrpMinor, is_cla
         | (IrpMajor::Pnp, IrpMinor::DiskGetInfo)
         | (IrpMajor::Pnp, IrpMinor::DiskCreateGpt)
         | (IrpMajor::Pnp, IrpMinor::DiskAddPartition)
-        | (IrpMajor::Pnp, IrpMinor::DiskGetPartitionInfo) => false,
+        | (IrpMajor::Pnp, IrpMinor::DiskGetPartitionInfo)
+        | (IrpMajor::Pnp, IrpMinor::SetTtyMode)
+        | (IrpMajor::Pnp, IrpMinor::GetTtyMode) => false,
     }
 }
 
@@ -481,7 +483,10 @@ pub fn io_request_sync(
     let driver = dev.driver.as_ref().ok_or(KError::Unsupported)?;
     let status = dispatch(driver, major, dev.device_ptr(), irp);
     if status == Status::Pending {
-        event.wait(is_interruptible);
+        if let Err(e) = event.wait(is_interruptible) {
+            cancel_pending_irp(dev);
+            return Err(e);
+        }
     }
     else if status == Status::Unsupported {
         io_complete_irp(irp, status);

@@ -2,7 +2,7 @@
 
 use core::ptr::null_mut;
 use kernel_intf::{
-    get_module_name, info,
+    ExitInfo, get_module_name, info,
     sched_create_process, sched_create_thread, sched_delay_ms,
     sched_exit_process, sched_exit_thread, sched_get_cur_process_arg,
     sched_get_cur_thread_arg, sched_get_num_process_args, sched_wait_process,
@@ -19,7 +19,7 @@ extern "C" fn worker_thread() -> ! {
     info!("test1: worker_thread started (tid={})", tid);
     sched_delay_ms(500);
     info!("test1: worker_thread done (tid={})", tid);
-    sched_exit_thread(0);
+    sched_exit_thread(ExitInfo::normal(0));
 }
 
 #[kmod::test_function(true)]
@@ -70,5 +70,5 @@ fn module_init() {
     sched_delay_ms(1000);
 
     info!("test1: exiting process with code 1");
-    sched_exit_process(1);
+    sched_exit_process(ExitInfo::normal(1));
 }

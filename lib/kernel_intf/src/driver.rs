@@ -47,7 +47,9 @@ pub enum IrpMinor {
     DiskGetInfo             = 10,
     DiskCreateGpt           = 11,
     DiskAddPartition        = 12,
-    DiskGetPartitionInfo    = 13
+    DiskGetPartitionInfo    = 13,
+    SetTtyMode              = 14,
+    GetTtyMode              = 15
 }
 
 impl IrpMinor {
@@ -67,6 +69,8 @@ impl IrpMinor {
             11 => Some(Self::DiskCreateGpt),
             12 => Some(Self::DiskAddPartition),
             13 => Some(Self::DiskGetPartitionInfo),
+            14 => Some(Self::SetTtyMode),
+            15 => Some(Self::GetTtyMode),
             _ => None
         }
     }
@@ -82,13 +86,23 @@ pub enum Status {
     Cancelled   = -3
 }
 
+pub const KS_RELEASE:  u8 = 1 << 0;
+pub const KS_EXTENDED: u8 = 1 << 1;
+
+pub const MOD_CTRL:     u8 = 1 << 0;
+pub const MOD_SHIFT:    u8 = 1 << 1;
+pub const MOD_ALT:      u8 = 1 << 2;
+pub const MOD_CAPSLOCK: u8 = 1 << 3;
+pub const MOD_NUMLOCK:  u8 = 1 << 4;
+
 // Raw keystroke produced by port drivers and forwarded to the input driver.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Keystroke {
-    pub scancode: u8,
-    pub ascii:    u8,  // 0 if modifier / unmapped key
-    pub flags:    u8   // bit 0 = key-release
+    pub scancode:  u8,
+    pub ascii:     u8,  // 0 if modifier / unmapped key
+    pub flags:     u8,  // bit 0 = key-release, bit 1 = extended (0xE0-prefixed)
+    pub modifiers: u8   // MOD_* bits reflecting held/toggled state at the time of this event
 }
 
 pub type KeystrokeHandler = unsafe extern "C" fn(*const Keystroke, count: usize, ctx: *mut c_void);
@@ -113,6 +127,15 @@ impl RegisterHandlerInfo {
 #[derive(Clone, Copy)]
 pub struct TtyControlInfo {
     pub pid:   usize
+}
+
+pub const TTY_MODE_ECHO:  u8 = 1 << 0;
+pub const TTY_MODE_CANON: u8 = 1 << 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TtyModeInfo {
+    pub mode: u8
 }
 
 #[repr(C)]
@@ -214,6 +237,7 @@ pub union ReqInfo {
     pub _unused:          [usize; 2],
     pub register_handler: RegisterHandlerInfo,
     pub tty_control:      TtyControlInfo,
+    pub tty_mode:         TtyModeInfo,
     pub res_list:         ResList,
     pub create_partition: CreatePartitionInfo,
     pub disk_info:        DiskInfo,

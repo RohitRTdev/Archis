@@ -11,14 +11,17 @@ use kernel_intf::{
 use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
     DeviceObject, DeviceType, DriverObject, Irp, IrpMinor, Status,
-    TtyControlInfo, create_device
+    TtyControlInfo, TtyModeInfo, TTY_MODE_CANON, TTY_MODE_ECHO, create_device
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
 
 const INPUT_BUF_SIZE: usize = 256;
 const MAX_PENDING:    usize = 16;
-const CTRL_C:         u8    = 0x1b;
+const CTRL_C:         u8    = 0x03;
+const BACKSPACE:      u8    = 0x08;
 const MAX_TMP_CHARS:  usize = 16;
+// Worst case every echoed byte is a backspace, which echoes as a 3-byte erase sequence.
+const MAX_ECHO_CHARS: usize = MAX_TMP_CHARS * 3;
 
 static TTY_CREATED: AtomicUsize = AtomicUsize::new(0);
 static TTY_CTX_PTR: AtomicUsize = AtomicUsize::new(0);
@@ -48,9 +51,6 @@ struct TtyCtx {
 unsafe impl Send for TtyCtx {}
 unsafe impl Sync for TtyCtx {}
 
-const LINE_BUFFERED: u8 = 1 << 1;
-const ECHO: u8 = 1 << 0;
-
 impl TtyCtx {
     const fn zeroed() -> Self {
         Self {
@@ -59,7 +59,7 @@ impl TtyCtx {
             pending:     [PendingEntry { irp: null_mut(), requested: 0 }; MAX_PENDING],
             pending_len: 0,
             enabled:     false,
-            mode:        LINE_BUFFERED | ECHO,
+            mode:        TTY_MODE_CANON | TTY_MODE_ECHO,
             job:         TtyJobInfo { session: 0, pgrp: 0 }
         }
     }
@@ -231,6 +231,33 @@ fn dispatch_close(device: &DeviceObject, request: &mut Irp) -> Status {
     Status::Success
 }
 
+fn find_line_len(ring: &RingBuffer<u8, INPUT_BUF_SIZE>) -> Option<usize> {
+    let mut tmp = [0u8; INPUT_BUF_SIZE];
+    let n = unsafe { ring.peek_into(tmp.as_mut_ptr(), ring.len()) };
+    tmp[..n].iter().position(|&b| b == b'\n').map(|i| i + 1)
+}
+
+// Returns Some(give) if a read for `requested` bytes can be satisfied right now
+// given the current mode and ring contents; None means keep the request pending.
+// In canonical mode, if there isn't already requested number of bytes in buffer
+// then tty waits until there is atleast one line and then returns that to the requestor
+fn compute_give(ring: &RingBuffer<u8, INPUT_BUF_SIZE>, requested: usize, canonical: bool) -> Option<usize> {
+    let avail = ring.len();
+    if avail == 0 {
+        return None;
+    }
+    if !canonical {
+        return Some(avail.min(requested));
+    }
+    if let Some(line_len) = find_line_len(ring) {
+        return Some(line_len.min(requested));
+    }
+    if avail >= requested {
+        return Some(requested);
+    }
+    None
+}
+
 #[kmod::dispatch_handler]
 fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
     let requested = request.buffer.size;
@@ -271,9 +298,8 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
 
     acquire_spinlock(&mut ctx.lock);
 
-    let avail = ctx.input_ring.len();
-    if avail > 0 {
-        let give = avail.min(requested);
+    let canonical = ctx.mode & TTY_MODE_CANON != 0;
+    if let Some(give) = compute_give(&ctx.input_ring, requested, canonical) {
         let dst = request.buffer.base_address as *mut u8;
         unsafe { ctx.input_ring.dequeue_into(dst, give); }
         request.bytes_completed = give;
@@ -415,9 +441,22 @@ fn dispatch_control(device: &DeviceObject, request: &mut Irp) -> Status {
                 return Status::Failed;
             }
         }
+        IrpMinor::SetTtyMode => {
+            // Only the foreground process group may change the tty's mode
+            let fgrp = ctx.job.pgrp;
+            if fgrp != 0 && proc_is_pgrp_active(fgrp) && !proc_is_foreground_pgrp(cur_pid, fgrp) {
+                release_spinlock(&mut ctx.lock);
+                request.complete_irp(Status::Failed);
+                return Status::Failed;
+            }
+            ctx.mode = unsafe { request.req_info.tty_mode }.mode;
+        }
+        IrpMinor::GetTtyMode => {
+            request.req_info.tty_mode = TtyModeInfo { mode: ctx.mode };
+        }
         _ => {
             release_spinlock(&mut ctx.lock);
-            // Don't call complete_request for Status::Unsupported 
+            // Don't call complete_request for Status::Unsupported
             return Status::Unsupported;
         }
     }
@@ -453,19 +492,19 @@ fn tty_input(bytes: *const u8, count: usize) {
     let ctx = unsafe { &mut *(ctx_ptr as *mut TtyCtx) };
 
     let slice = unsafe { core::slice::from_raw_parts(bytes, count) };
-    match str::from_utf8(slice) {
-        Ok(utf_str) => {
-            tty_print(utf_str);
-        },
-        _ => {}
-    }
 
     acquire_spinlock(&mut ctx.lock);
+    let echo = ctx.mode & TTY_MODE_ECHO != 0;
+    let canonical = ctx.mode & TTY_MODE_CANON != 0;
     let mut tmp_buffer: [u8; MAX_TMP_CHARS] = [0; MAX_TMP_CHARS];
     let mut tmp_offset = 0;
+    let mut echo_buffer: [u8; MAX_ECHO_CHARS] = [0; MAX_ECHO_CHARS];
+    let mut echo_offset = 0;
     for &b in slice {
         if b == CTRL_C {
-            // Skip this byte stream processing and issue signal to foreground pgrp
+            // Discard whatever is already buffered but not yet read, then
+            // issue the signal to the foreground pgrp.
+            ctx.input_ring = RingBuffer::new(0u8);
             let pgrp = ctx.job.pgrp;
             release_spinlock(&mut ctx.lock);
             if pgrp != 0 && proc_is_pgrp_active(pgrp) {
@@ -474,6 +513,31 @@ fn tty_input(bytes: *const u8, count: usize) {
             release_tty_ctx(ctx_ptr);
             return;
         }
+
+        if b == BACKSPACE && canonical {
+            // Erase the last character of the current, unterminated line —
+            // either still in this batch's staging buffer, or already in the
+            // ring from an earlier call. Never erase past a completed line.
+            let erased = if tmp_offset > 0 {
+                tmp_offset -= 1;
+                true
+            } else {
+                ctx.input_ring.peek_back() != Some(b'\n') && ctx.input_ring.pop_back().is_some()
+            };
+            if echo && erased && echo_offset + 3 <= MAX_ECHO_CHARS {
+                echo_buffer[echo_offset]     = BACKSPACE;
+                echo_buffer[echo_offset + 1] = b' ';
+                echo_buffer[echo_offset + 2] = BACKSPACE;
+                echo_offset += 3;
+            }
+            continue;
+        }
+
+        if echo && echo_offset < MAX_ECHO_CHARS {
+            echo_buffer[echo_offset] = b;
+            echo_offset += 1;
+        }
+
         tmp_buffer[tmp_offset] = b;
         tmp_offset += 1;
         if tmp_offset >= MAX_TMP_CHARS {
@@ -489,11 +553,15 @@ fn tty_input(bytes: *const u8, count: usize) {
     let mut collected_len = 0usize;
     let mut satisfied     = 0usize;
 
-    // Complete as many requests as possible whilst obeying the fifo order
-    while ctx.input_ring.len() > 0 && satisfied < ctx.pending_len {
+    // Complete as many requests as possible whilst obeying the fifo order.
+    // A request that can't yet be satisfied must not be skipped over.
+    while satisfied < ctx.pending_len {
         let entry = ctx.pending[satisfied];
-        let give  = ctx.input_ring.len().min(entry.requested);
-        let dst   = unsafe { (*entry.irp).buffer.base_address as *mut u8 };
+        let give = match compute_give(&ctx.input_ring, entry.requested, canonical) {
+            Some(g) => g,
+            None => break
+        };
+        let dst = unsafe { (*entry.irp).buffer.base_address as *mut u8 };
         unsafe {
             ctx.input_ring.dequeue_into(dst, give);
             (*entry.irp).bytes_completed = give;
@@ -510,6 +578,12 @@ fn tty_input(bytes: *const u8, count: usize) {
     ctx.pending_len = remaining;
 
     release_spinlock(&mut ctx.lock);
+
+    if echo_offset > 0 {
+        if let Ok(s) = str::from_utf8(&echo_buffer[..echo_offset]) {
+            tty_print(s);
+        }
+    }
 
     for i in 0..collected_len {
         let irp = collected[i];

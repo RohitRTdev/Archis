@@ -5,7 +5,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use alloc::borrow::ToOwned;
 use common::{MemoryRegion, StrRef};
-use kernel_intf::{KError, info, debug};
+use kernel_intf::{KError, ExitInfo, ExitReason, info, debug};
 use kernel_intf::list::{List, DynList};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use crate::fs::FileInstance;
@@ -18,7 +18,7 @@ use crate::sync::{KEvent, KSemInnerType, Spinlock};
 use crate::io::OpenDeviceHandle;
 use core::ffi::c_void;
 use core::mem::ManuallyDrop;
-use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
 
 static PROCESS_ID: AtomicUsize = AtomicUsize::new(0);
 static PROCESSES: Spinlock<BTreeMap<usize, KProcess>> = Spinlock::new(BTreeMap::new());
@@ -83,6 +83,7 @@ pub struct Process {
     pending_signals: u8,
     signal_guard: Arc<Spinlock<bool>>,
     args: Vec<String>,
+    exit_reason: AtomicU8,
     exit_code: AtomicIsize,
     image: Option<LoadedImage>
 }
@@ -94,13 +95,13 @@ pub struct ProcessInfo {
     pub id: usize,
     pub pid: usize,
     pub sid: usize,
-    pub exit_code: isize
+    pub exit_info: ExitInfo
 }
 
 #[repr(C)]
 pub struct ThreadInfo {
     pub id: u64,
-    pub exit_code: i64
+    pub exit_info: ExitInfo
 }
 
 impl Process {
@@ -151,6 +152,7 @@ impl Process {
             pending_signals: 0,
             signal_guard: Arc::new(Spinlock::new(true)),
             args,
+            exit_reason: AtomicU8::new(ExitReason::Normal as u8),
             exit_code: AtomicIsize::new(0),
             image: None
         }), PoolAllocatorGlobal);
@@ -168,8 +170,12 @@ impl Process {
         self.image = Some(img);
     }
 
-    pub fn get_exit_code(&self) -> isize {
-        self.exit_code.load(Ordering::Relaxed)
+    pub fn get_exit_info(&self) -> ExitInfo {
+        let reason = match self.exit_reason.load(Ordering::Relaxed) {
+            v if v == ExitReason::Signal as u8 => ExitReason::Signal,
+            _ => ExitReason::Normal
+        };
+        ExitInfo { reason, code: self.exit_code.load(Ordering::Relaxed) }
     }
 
     pub fn get_vcb(&self) -> VCB {
@@ -211,13 +217,13 @@ impl Process {
     }
 
     // Returns cleanup_work if this was last thread that removed itself from this process
-    pub fn remove_thread(&mut self, thread_id: usize, exit_code: isize) -> Option<ProcessCleanupWork> {
+    pub fn remove_thread(&mut self, thread_id: usize, exit_info: ExitInfo) -> Option<ProcessCleanupWork> {
         self.threads.find_and_remove(|t| {*t == thread_id});
         crate::sched_log!("Remove thread called with id {}", thread_id);
 
-        // Run the cleanup for this process once the last thread dies 
+        // Run the cleanup for this process once the last thread dies
         if self.threads.get_nodes() == 0 {
-            Some(self.destroy_process(exit_code))
+            Some(self.destroy_process(exit_info))
         }
         else {
             None
@@ -253,16 +259,17 @@ impl Process {
             id: self.id,
             pid: self.pid,
             sid: self.session.lock().sid,
-            exit_code: self.get_exit_code()
+            exit_info: self.get_exit_info()
         }
     }
 
-    fn destroy_process(&mut self, exit_code: isize) -> ProcessCleanupWork {
+    fn destroy_process(&mut self, exit_info: ExitInfo) -> ProcessCleanupWork {
         // If kill/exit_process wasn't called, the
-        // exit code will be same as exit code passed
+        // exit info will be same as exit info passed
         // to the last killed thread
         if self.status != ProcessStatus::Terminated {
-            self.exit_code.store(exit_code, Ordering::Relaxed);
+            self.exit_reason.store(exit_info.reason as u8, Ordering::Relaxed);
+            self.exit_code.store(exit_info.code, Ordering::Relaxed);
             self.status = ProcessStatus::Terminated;
         }
         PROCESSES.lock().remove(&self.id);
@@ -520,7 +527,7 @@ extern "C" fn kernel_init_handler() -> ! {
         Ok(img) => img,
         Err(e) => {
             info!("kernel_init_handler: failed to load image '{}': {:?}", path, e);
-            exit_process(-1);
+            exit_process(ExitInfo::normal(-1));
         }
     };
 
@@ -630,7 +637,7 @@ pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_us
     Ok(process)
 }
 
-pub fn kill_process(proc_id: usize, exit_code: isize) {
+pub fn kill_process(proc_id: usize, exit_info: ExitInfo) {
     let proc = get_process_info(proc_id);
     if proc.is_none() {
         return;
@@ -653,7 +660,8 @@ pub fn kill_process(proc_id: usize, exit_code: isize) {
         }
 
         guard.status = ProcessStatus::Terminated;
-        guard.exit_code.store(exit_code, Ordering::Relaxed);
+        guard.exit_reason.store(exit_info.reason as u8, Ordering::Relaxed);
+        guard.exit_code.store(exit_info.code, Ordering::Relaxed);
         guard.threads.clone()
     };
 
@@ -671,7 +679,7 @@ pub fn kill_process(proc_id: usize, exit_code: isize) {
         // This happens if the current process is killing itself (exit)
         if is_idle_task || **thread_id != cur_task_id {
             crate::sched_log!("Issuing kill to thread {}", **thread_id);
-            sched::kill_thread(**thread_id, exit_code);
+            sched::kill_thread(**thread_id, exit_info);
         }
         else {
             is_exit = true;
@@ -682,16 +690,16 @@ pub fn kill_process(proc_id: usize, exit_code: isize) {
 
     // Kill the current thread last
     if is_exit {
-        sched::kill_thread(cur_task_id, exit_code);
+        sched::kill_thread(cur_task_id, exit_info);
     }
 }
 
 /* Important to ensure that no locks are held or that preemption is not disabled during this call */
-pub fn exit_process(exit_code: isize) -> ! {
+pub fn exit_process(exit_info: ExitInfo) -> ! {
     assert!(super::is_preemption_enabled());
     let proc_id = get_current_process_id().expect("Attempted to kill idle process!!");
 
-    kill_process(proc_id, exit_code);
+    kill_process(proc_id, exit_info);
 
     // We could land here. Suppose two thread of a process call exit_process.
     // Only one of them succeeds in acquiring lock and setting status to terminate.
@@ -810,8 +818,8 @@ pub fn place_handle_in_proc(proc: &KProcess, index: usize, handle: Handle, is_in
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn sched_exit_process_ffi(exit_code: isize) -> ! {
-    exit_process(exit_code)
+extern "C" fn sched_exit_process_ffi(exit_info: ExitInfo) -> ! {
+    exit_process(exit_info)
 }
 
 #[unsafe(no_mangle)]
@@ -864,8 +872,8 @@ extern "C" fn sched_wait_process_ffi(proc_id: usize) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn sched_kill_process_ffi(proc_id: usize, exit_code: isize) {
-    kill_process(proc_id, exit_code);
+extern "C" fn sched_kill_process_ffi(proc_id: usize, exit_info: ExitInfo) {
+    kill_process(proc_id, exit_info);
 }
 
 pub fn issue_pgrp(pgrp: &KProcessGroup, signal: u8) {

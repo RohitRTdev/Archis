@@ -77,6 +77,11 @@ typedef enum {
 
 #define SET_FOREGROUND_PGRP (8)
 #define SET_CTTY (9)
+#define SET_TTY_MODE (14)
+#define GET_TTY_MODE (15)
+
+#define TTY_MODE_ECHO  (1 << 0)
+#define TTY_MODE_CANON (1 << 1)
 
 typedef struct {
     uint64_t size;
@@ -94,16 +99,26 @@ typedef enum {
 } seek_whence_t;
 
 
+typedef enum {
+    EXIT_NORMAL = 0,
+    EXIT_SIGNAL = 1
+} exit_reason_t;
+
+typedef struct {
+    uint8_t reason;  // exit_reason_t
+    int64_t code;    // exit code if reason == EXIT_NORMAL, signal number if reason == EXIT_SIGNAL
+} exit_info_t;
+
 typedef struct {
     uint64_t id;
     uint64_t pid;
     uint64_t sid;
-    int64_t  exit_code;
+    exit_info_t exit_info;
 } process_info_t;
 
 typedef struct {
     uint64_t id;
-    int64_t  exit_code;
+    exit_info_t exit_info;
 } thread_info_t;
 
 syscall_status_t sys_exit(ssize_t exit_code);

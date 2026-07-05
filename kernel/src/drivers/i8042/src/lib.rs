@@ -120,7 +120,15 @@ struct I8042Ctx {
     interrupt_handle: KInterruptHandle,
     port_data:        u16,
     port_cmd:         u16,
-    remove_lock:      RemoveLock
+    remove_lock:      RemoveLock,
+    // Decode state carried across interrupts.
+    extended_prefix:  bool,
+    pause_skip:       u8,
+    ctrl_held:        bool,
+    shift_held:       bool,
+    alt_held:         bool,
+    caps_lock:        bool,
+    num_lock:         bool
 }
 
 unsafe impl Send for I8042Ctx {}
@@ -130,15 +138,22 @@ impl I8042Ctx {
     const fn zeroed() -> Self {
         Self {
             lock:             Lock::new(),
-            ks_ring:          RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 }),
-            sc_pending:       RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 }),
+            ks_ring:          RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0, modifiers: 0 }),
+            sc_pending:       RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0, modifiers: 0 }),
             pending:          [PendingEntry { irp: core::ptr::null_mut(), requested: 0 }; MAX_PENDING],
             pending_len:      0,
             keystroke_handler: RegisterHandlerInfo::new(),
             interrupt_handle: KInterruptHandle::new(),
             port_data:        DEFAULT_PORT_DATA,
             port_cmd:         DEFAULT_PORT_CMD,
-            remove_lock:      RemoveLock::new()
+            remove_lock:      RemoveLock::new(),
+            extended_prefix:  false,
+            pause_skip:       0,
+            ctrl_held:        false,
+            shift_held:       false,
+            alt_held:         false,
+            caps_lock:        false,
+            num_lock:         false
         }
     }
 
@@ -208,9 +223,16 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
     let ctx = unsafe { &mut *(device.ctx as *mut I8042Ctx) };
 
     create_spinlock(&mut ctx.lock);
-    ctx.ks_ring    = RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 });
-    ctx.sc_pending = RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0 });
+    ctx.ks_ring    = RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0, modifiers: 0 });
+    ctx.sc_pending = RingBuffer::new(Keystroke { scancode: 0, ascii: 0, flags: 0, modifiers: 0 });
     ctx.pending_len = 0;
+    ctx.extended_prefix = false;
+    ctx.pause_skip = 0;
+    ctx.ctrl_held = false;
+    ctx.shift_held = false;
+    ctx.alt_held = false;
+    ctx.caps_lock = false;
+    ctx.num_lock = false;
 
     // Read I/O port addresses and interrupt vector from the resource list.
     let res_list = unsafe { request.req_info.res_list };
@@ -393,8 +415,28 @@ extern "C" fn i8042_cancel(dev: *const DeviceObject, irp: *mut Irp) {
     io_complete_irp(irp, Status::Cancelled);
 }
 
+// Base (non-extended) scancodes for the modifier keys.
+const SC_CTRL:       u8 = 0x1D;
+const SC_LSHIFT:     u8 = 0x2A;
+const SC_RSHIFT:     u8 = 0x36;
+const SC_ALT:        u8 = 0x38;
+const SC_CAPSLOCK:   u8 = 0x3A;
+const SC_NUMLOCK:    u8 = 0x45;
+
+fn current_modifiers(ctx: &I8042Ctx) -> u8 {
+    let mut m = 0u8;
+    if ctx.ctrl_held  { m |= kernel_intf::driver::MOD_CTRL; }
+    if ctx.shift_held { m |= kernel_intf::driver::MOD_SHIFT; }
+    if ctx.alt_held   { m |= kernel_intf::driver::MOD_ALT; }
+    if ctx.caps_lock  { m |= kernel_intf::driver::MOD_CAPSLOCK; }
+    if ctx.num_lock   { m |= kernel_intf::driver::MOD_NUMLOCK; }
+    m
+}
+
 // ISR — decode one scancode into a Keystroke and stash it in sc_pending.
-// Key-release events (bit 7) are recorded with flags=1 but ASCII=0.
+// Handles the 0xE0 extended-key prefix and 0xE1 Pause/Break sequence, and
+// tracks modifier key (Ctrl/Shift/Alt/CapsLock/NumLock) state across calls.
+// Key-release events (bit 7) are recorded with flags bit 0 set but ASCII=0.
 extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -405,13 +447,55 @@ extern "C" fn keyboard_isr(ctx_ptr: *mut c_void) -> bool {
         }
 
         let raw_sc = unsafe { inb(ctx.port_data) };
+
+        if raw_sc == 0xE0 {
+            ctx.extended_prefix = true;
+            if ctx.remove_lock.release() {
+                unsafe { drop(alloc::boxed::Box::from_raw_in(ctx_ptr as *mut I8042Ctx, PoolAllocatorGlobal)); }
+            }
+            return true;
+        }
+
+        if raw_sc == 0xE1 {
+            // Pause/Break sends a fixed 6-byte sequence with no break code;
+            // discard the remaining 5 bytes without touching any state.
+            ctx.pause_skip = 5;
+            if ctx.remove_lock.release() {
+                unsafe { drop(alloc::boxed::Box::from_raw_in(ctx_ptr as *mut I8042Ctx, PoolAllocatorGlobal)); }
+            }
+            return true;
+        }
+
+        if ctx.pause_skip > 0 {
+            ctx.pause_skip -= 1;
+            if ctx.remove_lock.release() {
+                unsafe { drop(alloc::boxed::Box::from_raw_in(ctx_ptr as *mut I8042Ctx, PoolAllocatorGlobal)); }
+            }
+            return true;
+        }
+
+        let extended = ctx.extended_prefix;
+        ctx.extended_prefix = false;
+
         let is_release = raw_sc & 0x80 != 0;
         let scancode = raw_sc & 0x7F;
+
+        match scancode {
+            SC_CTRL => ctx.ctrl_held = !is_release,
+            SC_LSHIFT | SC_RSHIFT if !extended => ctx.shift_held = !is_release,
+            SC_ALT => ctx.alt_held = !is_release,
+            SC_CAPSLOCK if !is_release => ctx.caps_lock = !ctx.caps_lock,
+            SC_NUMLOCK if !is_release && !extended => ctx.num_lock = !ctx.num_lock,
+            _ => {}
+        }
 
         let idx = scancode as usize;
         let ascii = if idx < SCANCODE_MAP.len() { SCANCODE_MAP[idx] } else { 0 };
 
-        let ks = Keystroke { scancode, ascii, flags: if is_release {1} else {0} };
+        let flags = (is_release as u8) | ((extended as u8) << 1);
+        let modifiers = current_modifiers(ctx);
+
+        let ks = Keystroke { scancode, ascii, flags, modifiers };
 
         acquire_spinlock(&mut ctx.lock);
         ctx.sc_pending.push(ks);

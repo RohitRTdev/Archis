@@ -19,7 +19,7 @@ use kernel_intf::mem::{PoolAllocator, PoolAllocatorGlobal};
 use kernel_intf::list::{DynList, List, ListNode, ListNodeGuard};
 use kernel_intf::driver::{Irp, IrpMajor, IrpMinor, IrpResult, Status};
 use kernel_intf::{acquire_spinlock, release_spinlock};
-use kernel_intf::{KError, debug, info};
+use kernel_intf::{KError, ExitInfo, ExitReason, debug, info};
 
 #[cfg(target_arch = "x86_64")]
 use crate::hal::{get_per_cpu_kernel_base_for_core, set_tss_stack};
@@ -130,6 +130,7 @@ pub struct Task {
     process: Option<KProcess>,
     vcb: Option<VCB>,
     arg_context: *mut c_void,
+    exit_reason: AtomicU8,
     exit_code: AtomicIsize,
     pending_signals: u8,
     completed_signals: u8,
@@ -179,6 +180,7 @@ impl Task {
             process: None,
             vcb: None,
             arg_context: null_mut(),
+            exit_reason: AtomicU8::new(ExitReason::Normal as u8),
             exit_code: AtomicIsize::new(0),
             pending_signals: 0,
             completed_signals: 0,
@@ -259,8 +261,12 @@ impl Task {
         }
     }
 
-    pub fn get_exit_code(&self) -> isize {
-        self.exit_code.load(Ordering::Relaxed)
+    pub fn get_exit_info(&self) -> ExitInfo {
+        let reason = match self.exit_reason.load(Ordering::Relaxed) {
+            v if v == ExitReason::Signal as u8 => ExitReason::Signal,
+            _ => ExitReason::Normal
+        };
+        ExitInfo { reason, code: self.exit_code.load(Ordering::Relaxed) }
     }
 
     fn register_irp(&mut self, entry: IssuedIrp) {
@@ -700,7 +706,7 @@ fn remove_timer_from_task_queue(sched_cb: &mut TaskQueue, id: usize) {
 // Note that there is no stack unwinding destructor calls to avoid this problem within the kernel
 // Doing stack unwinding for every process/task destruction is not practical and can cause lot
 // of bookkeeping and performance issues
-pub fn kill_thread(task_id: usize, exit_code: isize) {
+pub fn kill_thread(task_id: usize, exit_info: ExitInfo) {
     let mut yield_flag = false;
     let mut drop_task  = false;
     let mut skip_notify  = false;
@@ -741,7 +747,8 @@ pub fn kill_thread(task_id: usize, exit_code: isize) {
             let mut task_locked = this_task.lock();
             let status = task_locked.status;
             task_locked.status = TaskStatus::Terminated;
-            task_locked.exit_code.store(exit_code, Ordering::Relaxed);
+            task_locked.exit_reason.store(exit_info.reason as u8, Ordering::Relaxed);
+            task_locked.exit_code.store(exit_info.code, Ordering::Relaxed);
             status
         };
         sweep_irps = status != TaskStatus::Terminated;
@@ -980,12 +987,12 @@ fn kill_sweep_irps(task: &KThread) {
     }
 }
 
-pub fn exit_thread(exit_code: isize) -> ! {
+pub fn exit_thread(exit_info: ExitInfo) -> ! {
     let thread_id = get_current_task_id().expect("Attempted to kill idle task!!");
 
     assert!(is_preemption_enabled(), "exit_thread() called with preemption disabled!");
 
-    kill_thread(thread_id, exit_code);
+    kill_thread(thread_id, exit_info);
 
     panic!("exit_thread() unreachable reached!!");
 }
@@ -1042,7 +1049,7 @@ fn reap_tasks(sched_cb: &mut TaskQueue) {
         };
         
         let id = task_inner.lock().get_id();
-        let thread_exit_code = task_inner.lock().exit_code.load(Ordering::Relaxed);
+        let thread_exit_info = task_inner.lock().get_exit_info();
         sched_cb.notifier_list.add_node(task_inner.lock().term_notify.clone()).expect("Failed to add semaphore to notifier list!");
 
         // Extract the pointer, release the lock and then call remove_thread
@@ -1050,10 +1057,10 @@ fn reap_tasks(sched_cb: &mut TaskQueue) {
         {
             let process_ref = task_inner.lock().process.as_ref().unwrap().clone();
             let mut process_guard = process_ref.lock();
-            
+
             // If thread is last in the process and process is not already being killed with kill_process
-            // then set the process's exit code as the exit code for this thread
-            let is_last_thread_in_proc = process_guard.remove_thread(id, thread_exit_code);
+            // then set the process's exit info as the exit info for this thread
+            let is_last_thread_in_proc = process_guard.remove_thread(id, thread_exit_info);
 
             if is_last_thread_in_proc.is_some() {
                 crate::sched_log!("Adding process {} notifier to notifier list as task {} is terminating", process_guard.get_id(), id);
@@ -1995,7 +2002,7 @@ pub fn issue_signal_to_thread(tid: usize, signal: u8) {
         drop(task);
         drop(proc);
         enable_preemption();
-        kill_process(pid, -1);
+        kill_process(pid, ExitInfo::signal(signal));
     }
     else {
         let SignalHandler { user_ctx, handler } = handler_opt.unwrap();
@@ -2064,7 +2071,7 @@ pub fn issue_signal(pid: usize, signal: u8) {
         drop(_guard);
         drop(sig_guard);
         enable_preemption();
-        kill_process(pid, -1);
+        kill_process(pid, ExitInfo::signal(signal));
     }
     else {
         // We have found an eligible thread to issue the signal to
@@ -2090,7 +2097,7 @@ pub fn complete_signal() -> ! {
             debug!("complete_signal: no pending signal to complete for task {}", guard.id);
             drop(guard);
             enable_preemption();
-            exit_process(-1);
+            exit_process(ExitInfo::normal(-1));
         }
         debug!("complete_signal: marking signal {} as completed for task {}", pend_signal, guard.id);
         guard.completed_signals |= 1 << pend_signal;
@@ -2109,7 +2116,7 @@ pub fn complete_signal() -> ! {
     };
 
     let mut pending_signal = get_highest_set_bit(pending_signal_mask);
-    let mut kill_signal = false;
+    let mut kill_signal: Option<u8> = None;
     while pending_signal != -1 {
         let signal = pending_signal as u8;
         let handler_opt = this_proc.lock().get_signal_handler(signal);
@@ -2117,7 +2124,7 @@ pub fn complete_signal() -> ! {
         if handler_opt.is_none() {
             debug!("complete_signal: Taking default action for signal {}", signal);
             pending_signal_mask &= !(1 << signal);
-            kill_signal = true;
+            kill_signal = Some(signal);
             break;
         }
         else {
@@ -2138,8 +2145,8 @@ pub fn complete_signal() -> ! {
     drop(sig_guard);
     drop(this_proc);
     enable_preemption();
-    if kill_signal {
-        kill_process(pid, -1);
+    if let Some(sig) = kill_signal {
+        kill_process(pid, ExitInfo::signal(sig));
     }
 
     yield_cpu();
@@ -2369,13 +2376,13 @@ extern "C" fn sched_create_thread_ffi(
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn sched_exit_thread_ffi(exit_code: isize) -> ! {
-    exit_thread(exit_code)
+extern "C" fn sched_exit_thread_ffi(exit_info: ExitInfo) -> ! {
+    exit_thread(exit_info)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn sched_kill_thread_ffi(thread_id: usize, exit_code: isize) {
-    kill_thread(thread_id, exit_code)
+extern "C" fn sched_kill_thread_ffi(thread_id: usize, exit_info: ExitInfo) {
+    kill_thread(thread_id, exit_info)
 }
 
 // Do not call this function from interrupt context

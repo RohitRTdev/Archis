@@ -50,4 +50,22 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
         let copied = unsafe { self.peek_into(dst, n) };
         self.advance(copied);
     }
+
+    // Returns the most recently pushed item without removing it.
+    pub fn peek_back(&self) -> Option<T> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(self.buf[(self.head + self.len - 1) % N])
+        }
+    }
+
+    // Removes and returns the most recently pushed item.
+    pub fn pop_back(&mut self) -> Option<T> {
+        let item = self.peek_back();
+        if item.is_some() {
+            self.len -= 1;
+        }
+        item
+    }
 }

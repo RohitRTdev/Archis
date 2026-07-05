@@ -28,7 +28,7 @@ use {
     io::OpenDeviceHandle
 };
 
-use kernel_intf::{info, debug};
+use kernel_intf::{info, debug, ExitInfo};
 use common::*;
 use loader::module;
 
@@ -92,7 +92,7 @@ extern "C" fn test_thread_runner() -> ! {
     sched::delay_ms(500, false);
     info!("test_thread_runner: signaling done (id={})", id);
     THREAD_DONE_SEM.get().unwrap().signal();
-    sched::exit_thread(0);
+    sched::exit_thread(ExitInfo::normal(0));
 }
 
 // Tests:
@@ -120,7 +120,7 @@ fn run_proc_thread_tests() {
     .expect("proc/thread test 1: failed to create process");
 
     proc1.wait(false);
-    let code1 = proc1.lock().get_exit_code();
+    let code1 = proc1.lock().get_exit_info().code;
     info!("proc/thread test 1: process exited with code {}", code1);
     info!("proc/thread test 1: ctx.val1 after = {} (expect 10)", ctx.val1);
 
@@ -143,7 +143,7 @@ fn run_proc_thread_tests() {
 
     for (i, p) in procs.iter().enumerate() {
         p.wait(false);
-        info!("proc/thread test 2: process {} exited with code {}", i, p.lock().get_exit_code());
+        info!("proc/thread test 2: process {} exited with code {}", i, p.lock().get_exit_info().code);
     }
 
     // Test 3: thread creation + semaphore synchronisation
@@ -195,7 +195,7 @@ extern "C" fn task_kill_cancel_runner() -> ! {
         Ok(h) => h,
         Err(_) => {
             info!("task_kill_cancel_runner: input device could not be opened");
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
     };
 
@@ -216,7 +216,7 @@ extern "C" fn self_cancel_runner() -> ! {
         Ok(h) => h,
         Err(_) => {
             info!("self_cancel_runner: input device could not be opened");
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
     };
 
@@ -242,7 +242,7 @@ extern "C" fn self_cancel_runner() -> ! {
         "self_cancel_runner: pending_irps on input = {}",
         handle.get_pending_irps().lock().get_nodes()
     );
-    sched::exit_thread(0);
+    sched::exit_thread(ExitInfo::normal(0));
 }
 
 #[kmod::test_function(false)]
@@ -256,7 +256,7 @@ fn run_cancel_tests() {
     sched::delay_ms(2000, false);
     let tid = killer_target.lock().get_id();
     info!("cancel test (a): killing thread {}", tid);
-    sched::kill_thread(tid, 0);
+    sched::kill_thread(tid, ExitInfo::normal(0));
     sched::delay_ms(500, false);
 
     // per-handle self-cancellation
@@ -323,7 +323,7 @@ extern "C" fn state_reject_loop() -> ! {
         }
         sched::delay_ms(10, false);
     }
-    sched::exit_thread(0);
+    sched::exit_thread(ExitInfo::normal(0));
 }
 
 #[cfg(feature = "kunit-test")]
@@ -333,7 +333,7 @@ extern "C" fn state_start_once() -> ! {
     info!("state_start_once (tid={}): start -> {:?}",
           sched::get_current_task_id().unwrap_or(0),
           r.map(|s| s as isize));
-    sched::exit_thread(0);
+    sched::exit_thread(ExitInfo::normal(0));
 }
 
 // Issue a size-0 read. i8042 returns Ok(Status::Failed) for empty buffers when
@@ -352,7 +352,7 @@ extern "C" fn state_io_once() -> ! {
     info!("state_io_once (tid={}): read -> {:?}",
           sched::get_current_task_id().unwrap_or(0),
           res.map(|s| s as isize));
-    sched::exit_thread(0);
+    sched::exit_thread(ExitInfo::normal(0));
 }
 
 #[kmod::test_function(false)]
@@ -579,7 +579,7 @@ fn run_sync_tests() {
         extern "C" fn t5_signaller() -> ! {
             sched::delay_ms(200, false);
             T5_SEM.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
         let h = sched::create_thread(t5_signaller, core::ptr::null_mut())
             .expect("test 5: spawn signaller");
@@ -612,7 +612,7 @@ fn run_sync_tests() {
             else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
             SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
             SYNC_TEST_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
         extern "C" fn t6_short() -> ! {
             let res = T6_SEM.get().unwrap().wait_with_timeout(200, false).is_ok();
@@ -620,7 +620,7 @@ fn run_sync_tests() {
             else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
             SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
             SYNC_TEST_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
 
         let l1 = sched::create_thread(t6_long,  core::ptr::null_mut()).unwrap();
@@ -663,7 +663,7 @@ fn run_sync_tests() {
             else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
             SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
             SYNC_TEST_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
 
         let mut handles = alloc::vec::Vec::new();
@@ -700,7 +700,7 @@ fn run_sync_tests() {
             T8_EV.get().unwrap().wait(false);
             SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
             SYNC_TEST_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
 
         let mut hs = alloc::vec::Vec::new();
@@ -742,7 +742,7 @@ fn run_sync_tests() {
             else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
             SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
             SYNC_TEST_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
 
         let mut hs = alloc::vec::Vec::new();
@@ -807,13 +807,13 @@ fn run_sync_tests() {
             if res { SYNC_SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed); }
             else   { SYNC_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed); }
             SYNC_TEST_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
         extern "C" fn t11_signaller() -> ! {
             for _ in 0..N {
                 T11_SEM.get().unwrap().signal();
             }
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
 
         let mut waiters = alloc::vec::Vec::new();
@@ -1044,7 +1044,7 @@ fn run_fs_correctness_tests() {
             handle.write(&wbuf, 16, 0).expect("test 8: worker write");
             drop(handle);
             FS_CONC_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
 
         let mut handles = alloc::vec::Vec::new();
@@ -1087,7 +1087,7 @@ fn run_fs_correctness_tests() {
             let path = alloc::format!("/conc_dir/f{}.txt", idx);
             fs::create_file(&path, 0).expect("test 9: worker create");
             FS_CONC_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
 
         let mut handles = alloc::vec::Vec::new();
@@ -1141,7 +1141,7 @@ fn run_fs_correctness_tests() {
                 drop(handle);
             }
             FS_CONC_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
 
         extern "C" fn conc_churner() -> ! {
@@ -1152,7 +1152,7 @@ fn run_fs_correctness_tests() {
                 fs::delete(&path).expect("test 10: churner delete");
             }
             FS_CONC_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
 
         let mut handles = alloc::vec::Vec::new();
@@ -1188,7 +1188,7 @@ fn run_fs_correctness_tests() {
                 FS_CONC_COUNTER.fetch_add(1, Ordering::Relaxed);
             }
             FS_CONC_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
 
         let mut handles = alloc::vec::Vec::new();
@@ -1272,7 +1272,7 @@ fn run_fs_correctness_tests() {
                 let _ = fs::delete("/symrace_link");
             }
             FS_CONC_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
 
         // Whenever a reader observes /symrace_link as a symlink at all, its
@@ -1290,7 +1290,7 @@ fn run_fs_correctness_tests() {
                 }
             }
             FS_CONC_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
 
         let mut handles = alloc::vec::Vec::new();
@@ -1368,7 +1368,7 @@ fn run_fs_correctness_tests() {
                 fs::rename("/rendir_b/ping.txt", "/rendir_a/ping.txt").expect("test 15: b->a");
             }
             FS_CONC_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
         extern "C" fn renamer_b_to_a() -> ! {
             for _ in 0..ITERS {
@@ -1376,7 +1376,7 @@ fn run_fs_correctness_tests() {
                 fs::rename("/rendir_a/pong.txt", "/rendir_b/pong.txt").expect("test 15: a->b");
             }
             FS_CONC_DONE.get().unwrap().signal();
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
 
         let mut handles = alloc::vec::Vec::new();
@@ -1446,30 +1446,21 @@ fn kern_main() -> ! {
     fs::init();
     loader::init();
     io::init();
-    #[cfg(feature = "kunit-test")]
-    fs::load_root_fs();
+    //#[cfg(feature = "kunit-test")]
+    //fs::load_root_fs();
 
     kernel_intf::run_tests!();
 
-    #[cfg(feature = "kunit-test")]
-    {
-        info!("kunit-test build: skipping init launch");
-        hal::sleep();
-    }
+    info!("Launching init...");
+    let init_proc = sched::create_process(
+        &["/bin/init"],
+        core::ptr::null_mut(),
+        true,
+        false
+    ).expect("Failed to create init process!");
 
-    #[cfg(not(feature = "kunit-test"))]
-    {
-        info!("Launching init...");
-        let init_proc = sched::create_process(
-            &["/bin/init"],
-            core::ptr::null_mut(),
-            true,
-            false
-        ).expect("Failed to create init process!");
-
-        init_proc.wait(false);
-        panic!("init process returned!");
-    }
+    init_proc.wait(false);
+    panic!("init process returned!");
 }
 
 // === Driver worker (DPC) tests ===
@@ -1652,7 +1643,7 @@ extern "C" fn i8042_reader_a() -> ! {
         offset: 0,
     }, false);
     info!("i8042 reader-a: got chars: {:?}", buf);
-    sched::exit_thread(0)
+    sched::exit_thread(ExitInfo::normal(0))
 }
 
 #[cfg(feature = "kunit-test")]
@@ -1665,7 +1656,7 @@ extern "C" fn i8042_reader_b() -> ! {
         offset: 0,
     }, false);
     info!("i8042 reader-b: got chars: {:?}", buf);
-    sched::exit_thread(0)
+    sched::exit_thread(ExitInfo::normal(0))
 }
 
 #[cfg(feature = "kunit-test")]
@@ -1678,7 +1669,7 @@ extern "C" fn i8042_reader_c() -> ! {
         offset: 0,
     }, false);
     info!("i8042 reader-c: got char: {:?}", buf);
-    sched::exit_thread(0)
+    sched::exit_thread(ExitInfo::normal(0))
 }
 
 #[cfg(feature = "kunit-test")]
@@ -1700,7 +1691,7 @@ extern "C" fn remove_race_sync_reader() -> ! {
         Ok(h) => h,
         Err(_) => {
             info!("remove_race_sync_reader: device could not be opened");
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
     };
 
@@ -1713,7 +1704,7 @@ extern "C" fn remove_race_sync_reader() -> ! {
 
         if !matches!(res, Ok(Status::Success)) {
             REMOVE_RACE_SYNC_NON_SUCCESS.fetch_add(1, Ordering::Relaxed);
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
     }
 }
@@ -1734,7 +1725,7 @@ extern "C" fn remove_race_async_issuer() -> ! {
         Ok(h) => h,
         Err(_) => {
             info!("remove_race_async_issuer: device could not be opened");
-            sched::exit_thread(0);
+            sched::exit_thread(ExitInfo::normal(0));
         }
     };
 
@@ -1767,7 +1758,7 @@ extern "C" fn remove_race_async_issuer() -> ! {
             }
         }
     }
-    sched::exit_thread(0);
+    sched::exit_thread(ExitInfo::normal(0));
 }
 
 #[kmod::test_function(true)]

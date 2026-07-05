@@ -30,6 +30,38 @@ pub const SIGILL:  u8 = 3;
 pub const SIGKILL: u8 = 4;
 pub const SIGTTIN: u8 = 5;
 
+// Why a thread/process exited: either a normal exit code, or the signal
+// number that killed it via the default (unhandled) signal action.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    Normal = 0,
+    Signal = 1
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ExitInfo {
+    pub reason: ExitReason,
+    pub code:   isize   // exit code if reason == Normal, signal number if reason == Signal
+}
+
+impl ExitInfo {
+    pub const fn normal(code: isize) -> Self {
+        Self { reason: ExitReason::Normal, code }
+    }
+
+    pub const fn signal(sig: u8) -> Self {
+        Self { reason: ExitReason::Signal, code: sig as isize }
+    }
+}
+
+impl Default for ExitInfo {
+    fn default() -> Self {
+        Self::normal(0)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct KInterruptHandle {
@@ -315,7 +347,7 @@ unsafe extern "C" {
     ) -> KInterruptHandle;
 
     fn io_remove_interrupt_handler_ffi(handle: KInterruptHandle);
-    fn sched_exit_process_ffi(exit_code: isize) -> !;
+    fn sched_exit_process_ffi(exit_info: ExitInfo) -> !;
     fn sched_get_num_process_args_ffi() -> usize;
     fn sched_get_cur_process_arg_ffi(num: usize) -> StrRef;
     fn sched_get_cur_thread_arg_ffi() -> *mut c_void;
@@ -324,10 +356,10 @@ unsafe extern "C" {
     fn sched_create_process_ffi(args: *const StrRef, args_len: usize, context_ptr: *mut c_void) -> usize;
     fn sched_get_current_pid_ffi() -> isize;
     fn sched_wait_process_ffi(proc_id: usize);
-    fn sched_kill_process_ffi(proc_id: usize, exit_code: isize);
+    fn sched_kill_process_ffi(proc_id: usize, exit_info: ExitInfo);
     fn sched_create_thread_ffi(handler: extern "C" fn() -> !, context_ptr: *mut c_void) -> usize;
-    fn sched_exit_thread_ffi(exit_code: isize) -> !;
-    fn sched_kill_thread_ffi(thread_id: usize, exit_code: isize);
+    fn sched_exit_thread_ffi(exit_info: ExitInfo) -> !;
+    fn sched_kill_thread_ffi(thread_id: usize, exit_info: ExitInfo);
 
     fn io_create_driver_worker_ffi(
         routine: extern "C" fn(*mut c_void),
@@ -420,8 +452,8 @@ pub fn io_set_cancel_routine(
     unsafe { io_set_cancel_routine_ffi(irp, routine); }
 }
 
-pub fn sched_exit_process(exit_code: isize) -> ! {
-    unsafe { sched_exit_process_ffi(exit_code) }
+pub fn sched_exit_process(exit_info: ExitInfo) -> ! {
+    unsafe { sched_exit_process_ffi(exit_info) }
 }
 
 pub fn sched_get_num_process_args() -> usize {
@@ -459,8 +491,8 @@ pub fn sched_wait_process(proc_id: usize) {
     unsafe { sched_wait_process_ffi(proc_id) }
 }
 
-pub fn sched_kill_process(proc_id: usize, exit_code: isize) {
-    unsafe { sched_kill_process_ffi(proc_id, exit_code) }
+pub fn sched_kill_process(proc_id: usize, exit_info: ExitInfo) {
+    unsafe { sched_kill_process_ffi(proc_id, exit_info) }
 }
 
 pub fn sched_create_thread(handler: extern "C" fn() -> !, context_ptr: *mut c_void) -> Option<usize> {
@@ -473,12 +505,12 @@ pub fn sched_create_thread(handler: extern "C" fn() -> !, context_ptr: *mut c_vo
     }
 }
 
-pub fn sched_exit_thread(exit_code: isize) -> ! {
-    unsafe { sched_exit_thread_ffi(exit_code) }
+pub fn sched_exit_thread(exit_info: ExitInfo) -> ! {
+    unsafe { sched_exit_thread_ffi(exit_info) }
 }
 
-pub fn sched_kill_thread(thread_id: usize, exit_code: isize) {
-    unsafe { sched_kill_thread_ffi(thread_id, exit_code) }
+pub fn sched_kill_thread(thread_id: usize, exit_info: ExitInfo) {
+    unsafe { sched_kill_thread_ffi(thread_id, exit_info) }
 }
 
 pub fn create_spinlock(lock: &mut Lock) {
