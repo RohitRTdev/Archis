@@ -27,7 +27,7 @@ enum syscall_t {
     SYSCALL_SIGNAL,
     SYSCALL_GET_TIME_MS,
     SYSCALL_DUPLICATE_HANDLE,
-    SYSCALL_CREATE_PGRP,
+    SYSCALL_SET_PGRP,
     SYSCALL_GET_TID,
     SYSCALL_GET_THREAD_INFO,
     SYSCALL_DEVICE_CONTROL,
@@ -43,7 +43,8 @@ enum syscall_t {
     SYSCALL_READLINK,
     SYSCALL_CREATE_PIPE,
     SYSCALL_CHDIR,
-    SYSCALL_GETCWD
+    SYSCALL_GETCWD,
+    SYSCALL_ISSUE_SIGNAL
 };
 
 typedef enum {
@@ -175,7 +176,7 @@ handle_t sys_create_sync_object(
 syscall_status_t sys_wait(handle_t handle, ssize_t timeout);
 syscall_status_t sys_signal(handle_t handle);
 handle_t         sys_duplicate_handle(handle_t target_proc, handle_t old, handle_t new, boolean_t is_inheritable);
-syscall_status_t sys_create_pgrp(handle_t process_handle);
+syscall_status_t sys_set_pgrp(handle_t process_handle, size_t target_pgid);
 syscall_status_t sys_get_time_ms(clock_type_t clock, size_t *out);
 uint64_t         sys_get_tid(void);
 syscall_status_t sys_get_thread_info(handle_t handle, thread_info_t *out);
@@ -193,3 +194,4 @@ syscall_status_t sys_readlink(const char *path, char *buf, size_t buf_len, size_
 syscall_status_t sys_create_pipe(handle_t *read_handle, handle_t *write_handle, const char *name, boolean_t is_inheritable);
 syscall_status_t sys_chdir(const char *path);
 syscall_status_t sys_getcwd(char *buf, size_t buf_len, size_t *bytes_written);
+syscall_status_t sys_issue_signal(int64_t target, uint8_t signal);

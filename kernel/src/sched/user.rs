@@ -20,7 +20,7 @@ use super::*;
 use kernel_intf::*;
 use kernel_intf::driver::{IrpMajor, IrpMinor, ReqInfo, TtyControlInfo, TtyModeInfo, EMPTY_REGION, Status};
 
-const MAX_SYSCALLS: usize = 39;
+const MAX_SYSCALLS: usize = 40;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 
 const OPEN_INHERITABLE_FLAG: u64 = 1 << 0;
@@ -60,7 +60,7 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_signal_handler,
     sys_get_time_ms_handler,
     sys_duplicate_handler,
-    sys_create_pgrp_handler,
+    sys_set_pgrp_handler,
     sys_get_tid_handler,
     sys_get_thread_info_handler,
     sys_device_control_handler,
@@ -76,7 +76,8 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_readlink_handler,
     sys_create_pipe_handler,
     sys_chdir_handler,
-    sys_getcwd_handler
+    sys_getcwd_handler,
+    sys_issue_signal_handler
 ];
 
 fn read_c_strlen(start: usize) -> Option<usize> {
@@ -682,7 +683,8 @@ fn sys_set_session_leader_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 }
 
 // arg0 = process_handle (-1 if current process)
-fn sys_create_pgrp_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+// arg1 = target pgid (0 = found/use a new group led by this process's own pid)
+fn sys_set_pgrp_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let pid = if args[0] as i64 == -1 {
         get_current_process_id().expect("syscall called from idle task!")
     }
@@ -704,12 +706,36 @@ fn sys_create_pgrp_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
         }
     };
 
-    if proc::set_pgroup_leader(pid) {
+    let target_pgid = args[1] as usize;
+
+    if proc::set_pgroup(pid, target_pgid) {
         E_SUCCESS
     }
     else {
         E_NOPERM
     }
+}
+
+// arg0 = target (i64: >0 = pid, ==0 = self, <0 = pgrp of pid -target), arg1 = signal
+fn sys_issue_signal_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let target = args[0] as i64;
+    let signal = args[1] as u8;
+
+    if target > 0 {
+        issue_signal(target as usize, signal);
+    }
+    else if target == 0 {
+        let cur_pid = get_current_process_id().expect("syscall called from idle task!");
+        issue_signal(cur_pid, signal);
+    }
+    else {
+        let pid = (-target) as usize;
+        if let Some(pgrp) = proc::get_pgroup(pid) {
+            proc::issue_pgrp(&pgrp, signal);
+        }
+    }
+
+    E_SUCCESS
 }
 
 fn sys_get_pid_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {

@@ -94,8 +94,8 @@ handle_t sys_duplicate_handle(handle_t target_proc, handle_t old, handle_t new, 
     return do_syscall(SYSCALL_DUPLICATE_HANDLE, (uint64_t)target_proc, (uint64_t)old, (uint64_t)new, (uint64_t)is_inheritable, 0, 0);
 }
 
-syscall_status_t sys_create_pgrp(handle_t process_handle) {
-    return do_syscall(SYSCALL_CREATE_PGRP, (uint64_t)process_handle, 0, 0, 0, 0, 0);
+syscall_status_t sys_set_pgrp(handle_t process_handle, size_t target_pgid) {
+    return do_syscall(SYSCALL_SET_PGRP, (uint64_t)process_handle, target_pgid, 0, 0, 0, 0);
 }
 
 syscall_status_t sys_get_time_ms(clock_type_t clock, size_t *out) {
@@ -164,4 +164,8 @@ syscall_status_t sys_chdir(const char *path) {
 
 syscall_status_t sys_getcwd(char *buf, size_t buf_len, size_t *bytes_written) {
     return do_syscall(SYSCALL_GETCWD, (uint64_t)buf, buf_len, (uint64_t)bytes_written, 0, 0, 0);
+}
+
+syscall_status_t sys_issue_signal(int64_t target, uint8_t signal) {
+    return do_syscall(SYSCALL_ISSUE_SIGNAL, (uint64_t)target, signal, 0, 0, 0, 0);
 }

@@ -44,7 +44,7 @@ signal_test_LIBS := c
 init_SRCS := init.c
 init_LIBS := c
 
-sh_SRCS := sh.c
+sh_SRCS := sh/*.c
 sh_LIBS := c
 
 producer_SRCS := producer.c

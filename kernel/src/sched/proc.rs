@@ -22,6 +22,7 @@ use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
 
 static PROCESS_ID: AtomicUsize = AtomicUsize::new(0);
 static PROCESSES: Spinlock<BTreeMap<usize, KProcess>> = Spinlock::new(BTreeMap::new());
+static PGRP_DIRECTORY: Spinlock<BTreeMap<usize, KProcessGroup>> = Spinlock::new(BTreeMap::new());
 
 pub type KProcess = Arc<Spinlock<Process>, PoolAllocatorGlobal>;
 
@@ -288,11 +289,8 @@ impl Process {
                 sess.leader = None;
             }
         }
-        {
-            let mut pg = self.pgroup.lock();
-            pg.processes.find_and_remove(|&p| p == self.id);
-        }
-        
+        leave_pgroup(&self.pgroup, self.id);
+
         // This function is called in critical section
         // We want the cleanup code to execute in lock free code
         // So we submit to dedicated reaper system thread
@@ -361,22 +359,28 @@ impl Process {
             new_sess.lock().processes.add_node(self.id).expect("set_session_leader: add to new session failed");
             new_sess.lock().leader = Some(self.id);
             self.session = new_sess;
-            
-            // Create new process group too
-            self.pgroup.lock().processes.find_and_remove(|&p| p == self.id);
-            let new_pg = ProcessGroup::new(self.id);
-            new_pg.lock().processes.add_node(self.id).expect("set_pgroup_leader: add to new pgroup failed");
+
+            // Becoming a new session leader also means becoming leader of a new process group
+            leave_pgroup(&self.pgroup, self.id);
+            let new_pg = ProcessGroup::new(self.id, self.session.lock().sid);
+            PGRP_DIRECTORY.lock().insert(self.id, Arc::clone(&new_pg));
+            new_pg.lock().processes.add_node(self.id).expect("set_session_leader: add to new pgroup failed");
             self.pgroup = new_pg;
         }
 
         allowed
     }
 
-    fn set_pgroup_leader(&mut self, id: usize) -> bool {
+    // target_pgid == 0 means "found/use a new group whose id is this process's own id"
+    // a non-zero target_pgid joins that group if it
+    // already exists (must be in the same session), or creates it if target_pgid == id.
+    fn set_pgroup(&mut self, id: usize, target_pgid: usize) -> bool {
         assert!(self.id != 0, "Attempted to change pgroup for system process!");
 
-        // This process is already process group leader (pgid == process id)
-        if self.pgroup.lock().pgid == self.id {
+        let target_pgid = if target_pgid == 0 { self.id } else { target_pgid };
+
+        // Already a member of the requested group
+        if self.pgroup.lock().pgid == target_pgid {
             return false;
         }
 
@@ -393,14 +397,38 @@ impl Process {
             Arc::ptr_eq(&parent_guard.pgroup, &self.pgroup)
         };
 
-        if allowed {
-            self.pgroup.lock().processes.find_and_remove(|&p| p == self.id);
-            let new_pg = ProcessGroup::new(self.id);
-            new_pg.lock().processes.add_node(self.id).expect("set_pgroup_leader: add to new pgroup failed");
-            self.pgroup = new_pg;
+        if !allowed {
+            return false;
         }
 
-        allowed
+        let my_sid = self.session.lock().sid;
+
+        let new_pg = {
+            let mut dir = PGRP_DIRECTORY.lock();
+            match dir.get(&target_pgid) {
+                Some(existing) => {
+                    if existing.lock().sid != my_sid {
+                        return false;
+                    }
+                    Arc::clone(existing)
+                },
+                None => {
+                    // A brand new group's id must be the joining process's own pid
+                    if target_pgid != self.id {
+                        return false;
+                    }
+                    let pg = ProcessGroup::new(target_pgid, my_sid);
+                    dir.insert(target_pgid, Arc::clone(&pg));
+                    pg
+                }
+            }
+        };
+
+        leave_pgroup(&self.pgroup, self.id);
+        new_pg.lock().processes.add_node(self.id).expect("set_pgroup: add to new pgroup failed");
+        self.pgroup = new_pg;
+
+        true
     }
 
 #[cfg(debug_assertions)]
@@ -454,9 +482,10 @@ impl Drop for Process {
 
 pub fn init() {
     let sess = Session::new(0);
-    let pgrp = ProcessGroup::new(0);
+    let pgrp = ProcessGroup::new(0, 0);
     sess.lock().processes.add_node(0).expect("init: session add failed");
     pgrp.lock().processes.add_node(0).expect("init: pgroup add failed");
+    PGRP_DIRECTORY.lock().insert(0, Arc::clone(&pgrp));
 
     // Create init process and attach init task (task id = 0) to it.
     // CWD is set to "/" later by fs::init via set_init_cwd().
@@ -500,6 +529,10 @@ pub fn get_process_info(proc_id: usize) -> Option<KProcess> {
     })
 }
 
+pub fn get_pgroup(proc_id: usize) -> Option<KProcessGroup> {
+    Some(Arc::clone(&get_process_info(proc_id)?.lock().pgroup))
+}
+
 pub fn set_session_leader(pid: usize) -> bool {
     let cur_proc_id = get_current_process_id().expect("set_sid() called from idle process!");
     let res = get_process_info(pid);
@@ -512,8 +545,8 @@ pub fn set_session_leader(pid: usize) -> bool {
     this_proc.lock().set_session_leader(cur_proc_id)
 }
 
-pub fn set_pgroup_leader(pid: usize) -> bool {
-    let cur_proc_id = get_current_process_id().expect("set_pgroup_leader() called from idle process!");
+pub fn set_pgroup(pid: usize, target_pgid: usize) -> bool {
+    let cur_proc_id = get_current_process_id().expect("set_pgroup() called from idle process!");
     let res = get_process_info(pid);
 
     if res.is_none() {
@@ -521,7 +554,17 @@ pub fn set_pgroup_leader(pid: usize) -> bool {
     }
 
     let this_proc = res.unwrap();
-    this_proc.lock().set_pgroup_leader(cur_proc_id)
+    this_proc.lock().set_pgroup(cur_proc_id, target_pgid)
+}
+
+fn leave_pgroup(pg: &KProcessGroup, pid: usize) {
+    let mut guard = pg.lock();
+    guard.processes.find_and_remove(|&p| p == pid);
+    if guard.processes.get_nodes() == 0 {
+        let pgid = guard.pgid;
+        drop(guard);
+        PGRP_DIRECTORY.lock().remove(&pgid);
+    }
 }
 
 extern "C" fn kernel_init_handler() -> ! {

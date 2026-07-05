@@ -14,6 +14,7 @@ pub struct Session {
 
 pub struct ProcessGroup {
     pub pgid:      usize,
+    pub sid:       usize,
     pub processes: DynList<usize>
 }
 
@@ -28,9 +29,10 @@ impl Session {
 }
 
 impl ProcessGroup {
-    pub fn new(pgid: usize) -> KProcessGroup {
+    pub fn new(pgid: usize, sid: usize) -> KProcessGroup {
         Arc::new_in(Spinlock::new(Self {
             pgid,
+            sid,
             processes: List::new()
         }), PoolAllocatorGlobal)
     }

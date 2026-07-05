@@ -1,54 +1,58 @@
 #include <stdio.h>
 #include <string.h>
-#include <ctype.h>
 #include <signal.h>
 #include <sys/syscall.h>
 
+#include "parse.h"
+#include "exec.h"
+#include "builtins.h"
+
 #define LINE_BUF_SIZE 256
-#define MAX_ARGS 16
 
 static void sigint_handler(void *ctx) {
     (void)ctx;
 }
 
-static size_t split_args(char *line, char *out_argv[], size_t max_args) {
-    size_t argc = 0;
-    char *p = line;
-    while (*p && argc < max_args) {
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (!*p) break;
-        out_argv[argc++] = p;
-        while (*p && !isspace((unsigned char)*p)) p++;
-        if (*p) {
-            *p = '\0';
-            p++;
+static void run_job(sh_ctx_t *ctx, job_t *job) {
+    // Builtins only handle the simple "single stage, no redirects" case —
+    // they run directly in the shell and never go through exec_job's fd
+    // wiring, so a redirected/piped builtin falls through to path search
+    // instead of silently ignoring the redirect.
+    if (job->stage_count == 1 && job->stages[0].redirect_count == 0) {
+        int should_exit = 0;
+        if (sh_run_builtin(ctx, job->stages[0].argv, job->stages[0].argc, &should_exit)) {
+            return;
         }
     }
-    return argc;
+    exec_job(ctx, job);
 }
 
-int main(int argc, char* argv[]) {
+int main(int argc, char *argv[]) {
+    (void)argc; (void)argv;
     printf("Starting shell process!\n");
 
-    handle_t tty_dev = sys_open("device", "tty", 0);
-    if (tty_dev < 0) {
+    sh_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    ctx.tty = sys_open("device", "tty", 0);
+    if (ctx.tty < 0) {
         printf("sh: Unable to open tty device!\n");
         return -1;
     }
 
-    int pid = sys_get_pid();
+    ctx.shell_pid = (size_t)sys_get_pid();
 
     if (sys_set_session_leader(-1) < 0) {
         printf("sh: Unable to create new session!\n");
         return -1;
     }
 
-    if (sys_device_control(tty_dev, SET_CTTY, (void*)pid) < 0) {
+    if (sys_device_control(ctx.tty, SET_CTTY, (void *)ctx.shell_pid) < 0) {
         printf("sh: Unable to set controlling tty for this session!\n");
         return -1;
     }
 
-    if (sys_device_control(tty_dev, SET_FOREGROUND_PGRP, (void*)pid) < 0) {
+    if (sys_device_control(ctx.tty, SET_FOREGROUND_PGRP, (void *)ctx.shell_pid) < 0) {
         printf("sh: Unable to set sh as foreground process!\n");
         return -1;
     }
@@ -62,7 +66,7 @@ int main(int argc, char* argv[]) {
     for (;;) {
         char buf[64];
         size_t n = 0;
-        syscall_status_t ret = sys_read(tty_dev, buf, sizeof(buf), &n);
+        syscall_status_t ret = sys_read(ctx.tty, buf, sizeof(buf), &n);
 
         if (ret == E_WAIT_INTERRUPTED) {
             // Ctrl-C fired while we were blocked waiting for input: drop
@@ -80,20 +84,18 @@ int main(int argc, char* argv[]) {
             if (c == '\n') {
                 line[line_len] = '\0';
 
-                char *cmd_argv[MAX_ARGS];
-                size_t cmd_argc = split_args(line, cmd_argv, MAX_ARGS);
-
-                if (cmd_argc > 0) {
-                    handle_t child = sys_create_process(cmd_argv, cmd_argc, NULL, 0);
-                    if (child < 0) {
-                        printf("sh: failed to launch %s\n", cmd_argv[0]);
-                    }
-                    else {
-                        sys_wait(child, -1);
-                    }
+                job_t job;
+                int rc = parse_line(line, &job);
+                if (rc == 0) {
+                    run_job(&ctx, &job);
+                    job_free(&job);
+                }
+                else if (rc < 0) {
+                    printf("sh: syntax error\n");
                 }
 
                 line_len = 0;
+                sh_reap_background_jobs(&ctx);
                 printf("$ ");
             }
             else if (line_len < LINE_BUF_SIZE - 1) {
