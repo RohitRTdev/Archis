@@ -24,7 +24,7 @@ use kernel_intf::list::{List, DynList};
 use super::module;
 
 pub static KERNEL_MODULES: Spinlock<DynList<LoadedImageWeak>> = Spinlock::new(List::new());
-pub(super) const PREDEFINED_DIRECTORIES: [&str; 4] = ["", "/sys", "/sys/drivers", "/bin"];
+pub(super) const PREDEFINED_DIRECTORIES: [&str; 3] = ["", "/sys", "/sys/drivers"];
 
 static LOAD_LOCK: Once<KSem> = Once::new();
 
@@ -136,7 +136,7 @@ pub fn load_image(path: &str, is_user: bool) -> Result<LoadedImage, KError> {
     let _guard = semaphore_guard(LOAD_LOCK.get().expect("loader::init() not called before load_image()"));
 
     let mut in_progress: Vec<String> = Vec::new();
-    load_image_inner(path, &mut in_progress)
+    load_image_inner(path, &mut in_progress, &[])
 }
 
 
@@ -165,15 +165,17 @@ fn do_load_image_inner(
 
 fn load_image_inner(
     path: &str,
-    in_progress: &mut Vec<String>
+    in_progress: &mut Vec<String>,
+    extra_dirs: &[String]
 ) -> Result<LoadedImage, KError> {
     // This is an absolute path
     if path.starts_with("/") {
         return do_load_image_inner(path, in_progress);
     }
     else {
-        // Check for the file in all the predefined directories
-        for prefix in PREDEFINED_DIRECTORIES {
+        // Check for the file in all the predefined directories, then any
+        // caller-supplied extra directories
+        for prefix in PREDEFINED_DIRECTORIES.iter().copied().chain(extra_dirs.iter().map(|s| s.as_str())) {
             let filename = format!("{}/{}", prefix, path);
             let res = do_load_image_inner(filename.as_str(), in_progress);
 
@@ -612,6 +614,30 @@ fn parse_dynamic_section(load_base: usize, dyn_shn: &ArrayTable) -> DynamicInfo 
     }
 }
 
+// Reads this module's own DT_RUNPATH (or DT_RPATH, as a fallback) entry and
+// splits it into individual directories, standard ELF colon-separated style
+fn parse_runpath(entries: &[ElfDyn], dyn_str_base: usize) -> Vec<String> {
+    let mut runpath_off = None;
+    let mut rpath_off = None;
+
+    for entry in entries {
+        match entry.tag {
+            DT_NULL => break,
+            DT_RUNPATH => runpath_off = Some(entry.val as usize),
+            DT_RPATH => rpath_off = Some(entry.val as usize),
+            _ => {}
+        }
+    }
+
+    match runpath_off.or(rpath_off) {
+        Some(off) => {
+            let raw = unsafe { read_cstr(dyn_str_base, off) };
+            raw.split(':').filter(|s| !s.is_empty()).map(|s| s.to_owned()).collect()
+        },
+        None => Vec::new()
+    }
+}
+
 fn load_dependencies(
     mod_info: &ModuleInfo,
     in_progress: &mut Vec<String>
@@ -626,6 +652,8 @@ fn load_dependencies(
         core::slice::from_raw_parts(dyn_shn.start as *const ElfDyn, num_entries)
     };
 
+    let extra_dirs = parse_runpath(entries, dyn_str.base_address);
+
     for entry in entries {
         if entry.tag == DT_NULL {
             break;
@@ -638,12 +666,13 @@ fn load_dependencies(
         crate::loader_log!("Loading dependency {}", name);
         let res = load_image_inner(
             name,
-            in_progress
+            in_progress,
+            &extra_dirs
         )?;
-        
+
         deps.push(res);
     }
-            
+
     Ok(deps)
 }
 

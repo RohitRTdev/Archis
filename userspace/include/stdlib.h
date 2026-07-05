@@ -20,3 +20,10 @@ unsigned long long strtoull(const char *s, char **end, int base);
 char *itoa(int n, char *buf, int base);
 char *ltoa(long n, char *buf, int base);
 char *ultoa(unsigned long n, char *buf, int base);
+
+extern char **environ;
+
+char *getenv(const char *name);
+int   setenv(const char *name, const char *value, int overwrite);
+int   putenv(char *string);
+int   unsetenv(const char *name);

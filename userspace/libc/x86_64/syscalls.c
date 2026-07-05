@@ -23,8 +23,8 @@ syscall_status_t sys_delay_ms(size_t ms) {
     return do_syscall(SYSCALL_DELAY_MS, ms, 0, 0, 0, 0, 0);
 }
 
-handle_t sys_create_process(char *const args[], size_t len, uint64_t flags) {
-    return do_syscall(SYSCALL_CREATE_PROCESS, (uint64_t)args, len, flags, 0, 0, 0);
+handle_t sys_create_process(char *const args[], size_t len, char *const envp[], uint64_t flags) {
+    return do_syscall(SYSCALL_CREATE_PROCESS, (uint64_t)args, len, (uint64_t)envp, flags, 0, 0);
 }
 
 syscall_status_t sys_create_thread(uint64_t fn_addr, void *context) {

@@ -350,10 +350,12 @@ unsafe extern "C" {
     fn sched_exit_process_ffi(exit_info: ExitInfo) -> !;
     fn sched_get_num_process_args_ffi() -> usize;
     fn sched_get_cur_process_arg_ffi(num: usize) -> StrRef;
+    fn sched_get_num_process_envp_ffi() -> usize;
+    fn sched_get_cur_process_envp_ffi(num: usize) -> StrRef;
     fn sched_get_cur_thread_arg_ffi() -> *mut c_void;
     fn sched_get_cur_thread_id_ffi() -> usize;
 
-    fn sched_create_process_ffi(args: *const StrRef, args_len: usize, context_ptr: *mut c_void) -> usize;
+    fn sched_create_process_ffi(args: *const StrRef, args_len: usize, envp: *const StrRef, envp_len: usize, context_ptr: *mut c_void) -> usize;
     fn sched_get_current_pid_ffi() -> isize;
     fn sched_wait_process_ffi(proc_id: usize);
     fn sched_kill_process_ffi(proc_id: usize, exit_info: ExitInfo);
@@ -464,6 +466,14 @@ pub fn sched_get_cur_process_arg(num: usize) -> StrRef {
     unsafe { sched_get_cur_process_arg_ffi(num) }
 }
 
+pub fn sched_get_num_process_envp() -> usize {
+    unsafe { sched_get_num_process_envp_ffi() }
+}
+
+pub fn sched_get_cur_process_envp(num: usize) -> StrRef {
+    unsafe { sched_get_cur_process_envp_ffi(num) }
+}
+
 pub fn sched_get_cur_thread_arg() -> *mut c_void {
     unsafe { sched_get_cur_thread_arg_ffi() }
 }
@@ -472,9 +482,12 @@ pub fn sched_get_cur_thread_id() -> usize {
     unsafe { sched_get_cur_thread_id_ffi() }
 }
 
-pub fn sched_create_process(args: &[&str], context_ptr: *mut c_void) -> Option<usize> {
-    let refs: Vec<StrRef> = args.iter().map(|s| StrRef::from_str(s)).collect();
-    let res = unsafe { sched_create_process_ffi(refs.as_ptr(), refs.len(), context_ptr) };
+pub fn sched_create_process(args: &[&str], envp: &[&str], context_ptr: *mut c_void) -> Option<usize> {
+    let arg_refs: Vec<StrRef> = args.iter().map(|s| StrRef::from_str(s)).collect();
+    let envp_refs: Vec<StrRef> = envp.iter().map(|s| StrRef::from_str(s)).collect();
+    let res = unsafe {
+        sched_create_process_ffi(arg_refs.as_ptr(), arg_refs.len(), envp_refs.as_ptr(), envp_refs.len(), context_ptr)
+    };
     if res == usize::MAX {
         None
     }

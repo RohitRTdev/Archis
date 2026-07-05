@@ -20,9 +20,14 @@ int main(int argc, const char* argv[]) {
 
     printf("Hello from init\n");
 
+    char *envtest_args[] = {"/bin/envtest"};
+    char *envtest_envp[] = {"PATH=/bin", "USER=root", NULL};
+    handle_t envtest_proc = sys_create_process(envtest_args, 1, envtest_envp, 0);
+    sys_wait(envtest_proc, -1);
+
     char* args[] = {"/bin/sh"};
     process_info_t info;
-    handle_t proc_handle = sys_create_process(args, 1, 0);
+    handle_t proc_handle = sys_create_process(args, 1, NULL, 0);
     sys_get_process_info(proc_handle, &info);
     sys_wait(proc_handle, -1);
     printf("Shell process killed!\n");

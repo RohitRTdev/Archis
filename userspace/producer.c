@@ -40,7 +40,7 @@ int main(int argc, char *argv[]) {
     char wh_str[16];
     snprintf(wh_str, sizeof(wh_str), "%d", (int)write_h);
     char *p3_args[] = {"/bin/producer3", wh_str};
-    handle_t p3 = sys_create_process(p3_args, 2, 0);
+    handle_t p3 = sys_create_process(p3_args, 2, NULL, 0);
     if (p3 < 0) {
         printf("[P1] Failed to spawn producer3\n");
         return -1;
@@ -48,7 +48,7 @@ int main(int argc, char *argv[]) {
 
     // Spawn Producer 2 (opens the named pipe independently)
     char *p2_args[] = {"/bin/producer2"};
-    handle_t p2 = sys_create_process(p2_args, 1, 0);
+    handle_t p2 = sys_create_process(p2_args, 1, NULL, 0);
     if (p2 < 0) {
         printf("[P1] Failed to spawn producer2\n");
         return -1;

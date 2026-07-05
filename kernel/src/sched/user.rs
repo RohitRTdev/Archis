@@ -141,21 +141,33 @@ fn setup_user_stack() -> usize {
     stack_base
 }
 
-// Lays out process arguments on the user stack, main(argc, argv) style:
+// Lays out process arguments and environment on the user stack,
+// main(argc, argv, envp) style:
 //
-//  high │ arg strings (NUL terminated, packed)
+//  high │ argv strings (NUL terminated, packed)
+//       │ envp strings (NUL terminated, packed)
+//       │ envp[envc] = NULL
+//       │ envp[envc-1] ... envp[0]   (user VAs of the strings)
 //       │ argv[argc] = NULL
 //       │ argv[argc-1] ... argv[0]   (user VAs of the strings)
 //  rsp →│ argc
 //
-// The module entry is extern "C" fn() -> !, so the user-side runtime reads
-// argc at [rsp] and argv at rsp + 8. Returns the adjusted (16-byte aligned) rsp
+// The module entry is extern "C" fn() -> !, so the user-side runtime 
+// reads argc at [rsp], argv at rsp + 8, and derives envp as argv + (argc + 1) * 8 
+// Returns the adjusted (16-byte aligned) rsp
 #[cfg(target_arch = "x86_64")]
-fn push_args_to_user_stack(stack_top: usize, args: &[String]) -> usize {
+fn push_args_and_envp_to_user_stack(stack_top: usize, args: &[String], envp: &[String]) -> usize {
     let argc = args.len();
-    let strings_len: usize = args.iter().map(|a| a.len() + 1).sum();
-    let ptrs_len = (argc + 1) * size_of::<usize>();   // + NULL terminator
-    let block_len = size_of::<usize>() + ptrs_len + strings_len;
+    let envc = envp.len();
+
+    let argv_strings_len: usize = args.iter().map(|a| a.len() + 1).sum();
+    let envp_strings_len: usize = envp.iter().map(|a| a.len() + 1).sum();
+
+    let argv_ptrs_len = (argc + 1) * size_of::<usize>();   // + NULL terminator
+    let envp_ptrs_len = (envc + 1) * size_of::<usize>();   // + NULL terminator
+
+    let header_len = size_of::<usize>() + argv_ptrs_len + envp_ptrs_len;
+    let block_len = header_len + argv_strings_len + envp_strings_len;
 
     // aligning down is the right move here since stack grows down
     let rsp = (stack_top - block_len) & !0xF;
@@ -165,9 +177,12 @@ fn push_args_to_user_stack(stack_top: usize, args: &[String]) -> usize {
     let mut block = vec![0u8; block_size];
     block[0..size_of::<usize>()].copy_from_slice(&argc.to_ne_bytes());
 
-    let mut str_cursor = size_of::<usize>() + ptrs_len;
+    let argv_ptrs_off = size_of::<usize>();
+    let envp_ptrs_off = argv_ptrs_off + argv_ptrs_len;
+    let mut str_cursor = header_len;
+
     for (idx, arg) in args.iter().enumerate() {
-        let ptr_off = size_of::<usize>() * (idx + 1);
+        let ptr_off = argv_ptrs_off + size_of::<usize>() * idx;
         let user_str_addr = rsp + str_cursor;
         block[ptr_off..ptr_off + size_of::<usize>()].copy_from_slice(&user_str_addr.to_ne_bytes());
 
@@ -175,6 +190,18 @@ fn push_args_to_user_stack(stack_top: usize, args: &[String]) -> usize {
         // NUL terminator is already zero from vec init
         str_cursor += arg.len() + 1;
     }
+    // argv[argc] = NULL is already zero from vec init
+
+    for (idx, e) in envp.iter().enumerate() {
+        let ptr_off = envp_ptrs_off + size_of::<usize>() * idx;
+        let user_str_addr = rsp + str_cursor;
+        block[ptr_off..ptr_off + size_of::<usize>()].copy_from_slice(&user_str_addr.to_ne_bytes());
+
+        block[str_cursor..str_cursor + e.len()].copy_from_slice(e.as_bytes());
+        // NUL terminator is already zero from vec init
+        str_cursor += e.len() + 1;
+    }
+    // envp[envc] = NULL is already zero from vec init
 
     unsafe {
         copy_user_memory(rsp as *mut u8, block.as_ptr(), block_size);
@@ -189,10 +216,10 @@ pub extern "C" fn user_init_handler() -> ! {
     // Everything heap-allocated must drop before transfer_control_to_user —
     // it never returns, so anything still live here leaks
     let (entry, rsp, is_suspended) = {
-        let args: Vec<String> = {
+        let (args, envp): (Vec<String>, Vec<String>) = {
             let proc = get_current_process().expect("user_init_handler called outside process context!");
             let guard = proc.lock();
-            guard.get_args().to_vec()
+            (guard.get_args().to_vec(), guard.get_envp().to_vec())
         };
 
         // create_process guarantees args[0] exists; it names the module to run
@@ -212,7 +239,7 @@ pub extern "C" fn user_init_handler() -> ! {
             }
         };
 
-        let rsp = push_args_to_user_stack(stack_top, &args);
+        let rsp = push_args_and_envp_to_user_stack(stack_top, &args, &envp);
         let entry = load_info.lock().user().entry;
 
         // Let parent process know that user init is complete
@@ -438,6 +465,34 @@ fn read_user_string(ptr: usize) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
+const MAX_ENVP_ENTRIES: usize = 256;
+
+// Reads a NUL-pointer-terminated array of C string pointers from user memory
+// stopping at the first NULL entry or MAX_ENVP_ENTRIES, whichever comes first.
+// A NULL `ptr` (or a first entry that is NULL) yields an empty environment.
+fn read_user_envp(ptr: usize) -> Option<Vec<String>> {
+    if ptr == 0 {
+        return Some(Vec::new());
+    }
+
+    let mut envp = Vec::new();
+    for idx in 0..MAX_ENVP_ENTRIES {
+        let mut entry: usize = 0;
+        let entry_ptr = ptr + idx * size_of::<usize>();
+        if mem::copy_from_user(&mut entry as *mut usize as *mut u8, entry_ptr, size_of::<usize>()).is_err() {
+            return None;
+        }
+        if entry == 0 {
+            return Some(envp);
+        }
+
+        let s = read_user_string(entry)?;
+        envp.push(s);
+    }
+
+    Some(envp)
+}
+
 // arg0 = device handle, arg1 = minor code, arg2 = command (depends on the minor code)
 fn sys_device_control_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let handle = match get_handle(args[0] as usize) {
@@ -509,7 +564,8 @@ fn sys_create_thread_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 }
 
 // arg0 = command list ptr, arg1 = length of command list
-// arg2 = flags
+// arg2 = envp list ptr (NUL-pointer-terminated array; 0 = no environment)
+// arg3 = flags
 fn sys_create_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let len = args[1] as usize;
     if args[0] == 0 || len == 0 {
@@ -547,10 +603,16 @@ fn sys_create_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
         command_args_str.push(path);
     }
 
-    let is_suspended = args[2] & PROCESS_SUSPENDED_FLAG != 0;
+    let envp_str = match read_user_envp(args[2] as usize) {
+        Some(v) => v,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+
+    let is_suspended = args[3] & PROCESS_SUSPENDED_FLAG != 0;
     let res = create_process(
-        command_args_str.as_slice(), 
-        core::ptr::null_mut(), 
+        command_args_str.as_slice(),
+        envp_str.as_slice(),
+        core::ptr::null_mut(),
         true,
         is_suspended
     );

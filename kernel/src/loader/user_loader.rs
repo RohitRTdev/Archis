@@ -111,7 +111,10 @@ struct DynFileInfo {
     pltsz: usize,
     num_syms: usize,
     // String table offsets of DT_NEEDED entries
-    needed: Vec<usize>
+    needed: Vec<usize>,
+    // String table offsets of DT_RUNPATH / DT_RPATH, if present
+    runpath_off: Option<usize>,
+    rpath_off: Option<usize>
 }
 
 struct ParsedImage {
@@ -229,7 +232,8 @@ fn parse_user_elf(bytes: &[u8]) -> Result<ParsedImage, KError> {
             symtab_va: None, strtab_va: None, strsz: 0,
             rela_va: None, relasz: 0, relacount: 0,
             plt_va: None, pltsz: 0,
-            num_syms: 0, needed: Vec::new()
+            num_syms: 0, needed: Vec::new(),
+            runpath_off: None, rpath_off: None
         };
 
         let mut hash_va = None;
@@ -247,6 +251,8 @@ fn parse_user_elf(bytes: &[u8]) -> Result<ParsedImage, KError> {
                 DT_PLTRELSZ  => info.pltsz    = dynent.val as usize,
                 DT_RELAENT   => assert_eq!(dynent.val as usize, size_of::<Elf64Rela>()),
                 DT_HASH      => hash_va        = Some(dynent.val as usize),
+                DT_RUNPATH   => info.runpath_off = Some(dynent.val as usize),
+                DT_RPATH     => info.rpath_off    = Some(dynent.val as usize),
                 _ => {}
             }
         }
@@ -480,17 +486,18 @@ pub fn load_user_image(path: &str) -> Result<LoadedImage, KError> {
     let _guard = semaphore_guard(USER_LOAD_LOCK.get().expect("loader::init() not called before load_user_image()"));
 
     let mut in_progress: Vec<String> = Vec::new();
-    load_user_inner(path, &mut in_progress)
+    load_user_inner(path, &mut in_progress, &[])
 }
 
-fn load_user_inner(path: &str, in_progress: &mut Vec<String>) -> Result<LoadedImage, KError> {
+fn load_user_inner(path: &str, in_progress: &mut Vec<String>, extra_dirs: &[String]) -> Result<LoadedImage, KError> {
     // This is an absolute path
     if path.starts_with("/") {
         return do_load_user_inner(path, in_progress);
     }
 
-    // Check for the file in all the predefined directories
-    for prefix in PREDEFINED_DIRECTORIES {
+    // Check for the file in all the predefined directories, then any
+    // caller-supplied extra directories
+    for prefix in PREDEFINED_DIRECTORIES.iter().copied().chain(extra_dirs.iter().map(|s| s.as_str())) {
         let filename = format!("{}/{}", prefix, path);
         let res = do_load_user_inner(filename.as_str(), in_progress);
 
@@ -593,12 +600,22 @@ fn load_user_into_process(
     let mut deps: Vec<LoadedImage> = Vec::new();
     if let Some(dyn_info) = &img.dyn_info {
         let strtab_off = dyn_info.strtab_va.and_then(|v| img.va_to_off(v));
+
+        // This module's own DT_RUNPATH/DT_RPATH applies when resolving its DT_NEEDED entries
+        let extra_dirs: Vec<String> = match (dyn_info.runpath_off.or(dyn_info.rpath_off), strtab_off) {
+            (Some(off), Some(strtab_off)) => {
+                let raw = unsafe { read_cstr(bytes.as_ptr().addr(), strtab_off + off) };
+                raw.split(':').filter(|s| !s.is_empty()).map(|s| s.to_owned()).collect()
+            },
+            _ => Vec::new()
+        };
+
         for &needed_off in dyn_info.needed.iter() {
             let strtab_off = strtab_off.ok_or(InvalidArgument)?;
             let name = unsafe { read_cstr(bytes.as_ptr().addr(), strtab_off + needed_off) };
 
             crate::loader_log!("Loading user dependency {}", name);
-            deps.push(load_user_inner(&name, in_progress)?);
+            deps.push(load_user_inner(&name, in_progress, &extra_dirs)?);
         }
     }
 

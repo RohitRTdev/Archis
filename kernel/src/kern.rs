@@ -113,6 +113,7 @@ fn run_proc_thread_tests() {
     let mut ctx = TestCtx { val1: 42, val2: -7 };
     let proc1 = sched::create_process(
         &["libtest1.so", "hello_from_test1"],
+        &[],
         &mut ctx as *mut TestCtx as *mut core::ffi::c_void,
         false,
         false
@@ -132,6 +133,7 @@ fn run_proc_thread_tests() {
     for i in 0..PROC_COUNT {
         let p = sched::create_process(
             &["libtest1.so", alloc::format!("concurrent_proc_{}", i).as_str()],
+            &[],
             core::ptr::null_mut(),
             false,
             false
@@ -1454,6 +1456,7 @@ fn kern_main() -> ! {
     info!("Launching init...");
     let init_proc = sched::create_process(
         &["/bin/init"],
+        &[],
         core::ptr::null_mut(),
         true,
         false

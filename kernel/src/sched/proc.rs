@@ -83,6 +83,7 @@ pub struct Process {
     pending_signals: u8,
     signal_guard: Arc<Spinlock<bool>>,
     args: Vec<String>,
+    envp: Vec<String>,
     exit_reason: AtomicU8,
     exit_code: AtomicIsize,
     image: Option<LoadedImage>
@@ -113,6 +114,7 @@ impl Process {
         session: KSession,
         pgroup: KProcessGroup,
         args: Vec<String>,
+        envp: Vec<String>,
         handle_table: Vec<Option<HandleType>>,
         cwd: Option<FileInstance>
     ) -> Result<KProcess, KError> {
@@ -152,6 +154,7 @@ impl Process {
             pending_signals: 0,
             signal_guard: Arc::new(Spinlock::new(true)),
             args,
+            envp,
             exit_reason: AtomicU8::new(ExitReason::Normal as u8),
             exit_code: AtomicIsize::new(0),
             image: None
@@ -164,6 +167,10 @@ impl Process {
 
     pub fn get_args(&self) -> &[String] {
         &self.args
+    }
+
+    pub fn get_envp(&self) -> &[String] {
+        &self.envp
     }
 
     pub fn set_image(&mut self, img: LoadedImage) {
@@ -462,6 +469,7 @@ pub fn init() {
         pgrp,
         vec!(KERNEL_PATH.into()),
         Vec::new(),
+        Vec::new(),
         None)
     .expect("Failed to create init process");
 
@@ -546,13 +554,24 @@ pub fn get_current_process_args() -> *const Vec<String> {
         None => return core::ptr::null(),
     };
     let guard = proc.lock();
-    
+
     // The Arc keeps the Process alive as long as any thread runs within it,
     // so this pointer remains valid for the caller's lifetime on the current thread.
     &guard.args as *const Vec<String>
 }
 
-pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_user: bool, is_suspended: bool) -> Result<KProcess, KError> {
+pub fn get_current_process_envp() -> *const Vec<String> {
+    let proc = match get_current_process() {
+        Some(p) => p,
+        None => return core::ptr::null(),
+    };
+    let guard = proc.lock();
+
+    // Same lifetime guarantee as get_current_process_args()
+    &guard.envp as *const Vec<String>
+}
+
+pub fn create_process<T: AsRef<str>>(args: &[T], envp: &[T], context_ptr: *mut c_void, is_user: bool, is_suspended: bool) -> Result<KProcess, KError> {
     // args[0] must name the module to load (kernel and user alike)
     if args.is_empty() {
         return Err(KError::InvalidArgument);
@@ -578,6 +597,9 @@ pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_us
     let args = args.iter()
         .map(|s| s.as_ref().to_owned())
         .collect();
+    let envp = envp.iter()
+        .map(|s| s.as_ref().to_owned())
+        .collect();
 
     let process = match Process::new(
         true,
@@ -587,6 +609,7 @@ pub fn create_process<T: AsRef<str>>(args: &[T], context_ptr: *mut c_void, is_us
         Arc::clone(&session),
         Arc::clone(&pgroup),
         args,
+        envp,
         inherited_table,
         inherited_cwd) {
         Ok(p) => p,
@@ -839,9 +862,27 @@ extern "C" fn sched_get_cur_process_arg_ffi(num: usize) -> StrRef {
 }
 
 #[unsafe(no_mangle)]
+extern "C" fn sched_get_num_process_envp_ffi() -> usize {
+    get_current_process().expect("get_num_process_envp() called in idle process!").lock().envp.len()
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn sched_get_cur_process_envp_ffi(num: usize) -> StrRef {
+    let proc = get_current_process().expect("get_cur_process_envp() called in idle process!");
+    let guard = proc.lock();
+
+    assert!(num < guard.envp.len());
+
+    // This is fine since the argument location is valid for the lifetime of this process
+    StrRef::from_str(guard.envp[num].as_str())
+}
+
+#[unsafe(no_mangle)]
 extern "C" fn sched_create_process_ffi(
     args: *const StrRef,
     args_len: usize,
+    envp: *const StrRef,
+    envp_len: usize,
     context_ptr: *mut c_void
 ) -> usize {
     let args_vec: Vec<String> = unsafe {
@@ -850,7 +891,13 @@ extern "C" fn sched_create_process_ffi(
             .map(|s| String::from(s.as_str()))
             .collect()
     };
-    match create_process(args_vec.as_slice(), context_ptr, false, false) {
+    let envp_vec: Vec<String> = unsafe {
+        core::slice::from_raw_parts(envp, envp_len)
+            .iter()
+            .map(|s| String::from(s.as_str()))
+            .collect()
+    };
+    match create_process(args_vec.as_slice(), envp_vec.as_slice(), context_ptr, false, false) {
         Ok(proc) => proc.lock().get_id(),
         Err(_) => usize::MAX,
     }

@@ -84,7 +84,7 @@ int main(int argc, char* argv[]) {
                 size_t cmd_argc = split_args(line, cmd_argv, MAX_ARGS);
 
                 if (cmd_argc > 0) {
-                    handle_t child = sys_create_process(cmd_argv, cmd_argc, 0);
+                    handle_t child = sys_create_process(cmd_argv, cmd_argc, NULL, 0);
                     if (child < 0) {
                         printf("sh: failed to launch %s\n", cmd_argv[0]);
                     }

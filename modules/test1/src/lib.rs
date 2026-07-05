@@ -56,7 +56,7 @@ fn module_init() {
     // itself, which prevents infinite recursion.
     if num_args > 1 {
         info!("test1: spawning child process libtest1.so");
-        let child_pid = sched_create_process(&["libtest1.so"], null_mut()).unwrap();
+        let child_pid = sched_create_process(&["libtest1.so"], &[], null_mut()).unwrap();
         info!("test1: child process spawned (pid={})", child_pid);
 
         // Wait for the child to finish before exiting.

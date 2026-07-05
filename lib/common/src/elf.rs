@@ -103,7 +103,9 @@ pub const DT_RELA:      i64 = 7;
 pub const DT_RELASZ:    i64 = 8;
 pub const DT_RELAENT:   i64 = 9;
 pub const DT_STRSZ:     i64 = 10;
+pub const DT_RPATH:     i64 = 15;
 pub const DT_JMPREL:    i64 = 23;
+pub const DT_RUNPATH:   i64 = 29;
 pub const DT_RELACOUNT: i64 = 0x6ffffff9;
 
 // ELF Magic numbers

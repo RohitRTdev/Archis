@@ -153,7 +153,7 @@ handle_t         sys_open(const char *type, const char *name, uint64_t flags);
 syscall_status_t sys_read(handle_t handle, void *buf, size_t len, size_t *bytes_read);
 syscall_status_t sys_write(handle_t handle, const void *buf, size_t len, size_t *bytes_written);
 syscall_status_t sys_delay_ms(size_t ms);
-handle_t         sys_create_process(char *const args[], size_t len, uint64_t flags);
+handle_t         sys_create_process(char *const args[], size_t len, char *const envp[], uint64_t flags);
 syscall_status_t sys_create_thread(uint64_t fn_addr, void *context);
 syscall_status_t sys_exit_thread(void);
 syscall_status_t sys_resume_process(handle_t process_handle);

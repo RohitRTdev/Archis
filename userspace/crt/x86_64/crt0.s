@@ -4,9 +4,10 @@
 .text
 
 _start:
-    // TOS is argc, followed by argc number of args
+    // TOS is argc, followed by argc number of args, then envp
     movq (%rsp), %rdi
     leaq 8(%rsp), %rsi
+    leaq 8(%rsi, %rdi, 8), %rdx
     call crt_main
     call exit
 

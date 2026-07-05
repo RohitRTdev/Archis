@@ -23,14 +23,14 @@ RUST_HOST := $(shell rustc -vV | grep '^host:' | cut -d' ' -f2)
 RUST_LLD := $(shell rustc --print sysroot)/lib/rustlib/$(RUST_HOST)/bin/rust-lld
 
 LINKER_SCRIPT := $(USER_LINKER_SCRIPT)
-USER_LLD_FLAGS := -flavor gnu --hash-style=sysv -T $(LINKER_SCRIPT)
+USER_LLD_FLAGS := -flavor gnu --hash-style=sysv -T $(LINKER_SCRIPT) -rpath /bin
 COMMON_CFLAGS := -target $(TARGET) -ffreestanding -fPIC -nostdinc -Wall -Wextra -MMD -MP -I$(CURDIR)/include
 
 # crt object files will be compiled into every binary that is generated
 CRT_SRCS := crt/*.c crt/$(ARCH)/*
 
 # Mention the binaries to be compiled in this list
-BINARIES := signal_test init sh producer producer2 producer3 consumer stdio_test
+BINARIES := signal_test init sh producer producer2 producer3 consumer stdio_test envtest
 
 # Shared libraries (dynamically loaded) and static libraries(.a archives) are to be mentioned here
 SHARED_LIBS := c
@@ -61,6 +61,9 @@ consumer_LIBS := c
 
 stdio_test_SRCS := stdio_test.c
 stdio_test_LIBS := c
+
+envtest_SRCS := envtest.c
+envtest_LIBS := c
 
 c_SRCS := libc/*.c libc/*.s libc/$(ARCH)/*
 
