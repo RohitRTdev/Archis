@@ -105,6 +105,13 @@ fn dispatch_pnp(device: &DeviceObject, req: &mut Irp) -> Status {
         IrpMinor::Query => do_query(device, req),
         IrpMinor::Resources => do_resources(device, req),
         IrpMinor::Stop => {
+            if let Some(name) = device.get_name() {
+                info!("Device {} stopped", name);
+            }
+            else {
+                let pci_ctx = unsafe { &*(device.ctx as *const PciCtx) };
+                info!("pci pdo {:02X}:{:02X}:{} stopped", pci_ctx.bus, pci_ctx.device, pci_ctx.function);
+            }
             req.complete_irp(Status::Success);
             Status::Success
         }

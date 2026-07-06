@@ -29,23 +29,38 @@ static void report_stage_status(const char *name, handle_t handle) {
     }
 }
 
-void exec_job(sh_ctx_t *ctx, job_t *job) {
+// Spawns every stage of `job`, wiring pipes/redirects and setting each
+// stage's process group (stage 0 becomes the new job's pgid). Every stage is
+// created PROCESS_SUSPEND_FLAG'd -- the caller decides whether/when to grab
+// the tty's foreground pgrp before resuming them.
+//
+// On success (*aborted == 0), fills stage_handles/stage_pids/stage_names (up
+// to job->stage_count entries) and *job_pgid, and every stage is still
+// suspended (not yet resumed). On failure (*aborted == 1), every partially
+// spawned stage has already been killed and closed -- there is nothing left
+// for the caller to clean up.
+static void spawn_stages(
+    sh_ctx_t *ctx, job_t *job,
+    handle_t stage_handles[SH_MAX_STAGES],
+    size_t stage_pids[SH_MAX_STAGES],
+    char *stage_names[SH_MAX_STAGES],
+    size_t *job_pgid,
+    int *aborted
+) {
     int total = job->stage_count;
     handle_t pipe_r[SH_MAX_STAGES - 1];
     handle_t pipe_w[SH_MAX_STAGES - 1];
-    handle_t stage_handles[SH_MAX_STAGES];
-    size_t stage_pids[SH_MAX_STAGES];
-    char *stage_names[SH_MAX_STAGES];
     handle_t opened_files[SH_MAX_STAGES * SH_MAX_REDIRECTS];
     int n_opened = 0;
-    size_t job_pgid = 0;
     int created = 0;
-    int aborted = 0;
+    *aborted = 0;
+    *job_pgid = 0;
 
     for (int i = 0; i < total - 1; i++) {
         if (sys_create_pipe(&pipe_r[i], &pipe_w[i], NULL, TRUE) < 0) {
             printf("sh: failed to create pipe\n");
             for (int j = 0; j < i; j++) { sys_close(pipe_r[j]); sys_close(pipe_w[j]); }
+            *aborted = 1;
             return;
         }
     }
@@ -53,7 +68,7 @@ void exec_job(sh_ctx_t *ctx, job_t *job) {
     for (created = 0; created < total; created++) {
         stage_t *st = &job->stages[created];
         handle_t h = sh_create_process_path_search(st->argv, st->argc, environ, PROCESS_SUSPEND_FLAG);
-        if (h < 0) { aborted = 1; break; }
+        if (h < 0) { *aborted = 1; break; }
 
         stage_handles[created] = h;
         stage_names[created] = st->argv[0];
@@ -64,12 +79,12 @@ void exec_job(sh_ctx_t *ctx, job_t *job) {
 
         if (created == 0) {
             sys_set_pgrp(h, 0);
-            job_pgid = stage_pids[0];
+            *job_pgid = stage_pids[0];
         }
         else {
-            // Remaining spawned processes in this job must 
+            // Remaining spawned processes in this job must
             // be attached to the newly created process group
-            sys_set_pgrp(h, job_pgid);
+            sys_set_pgrp(h, *job_pgid);
         }
 
         handle_t cur[3];
@@ -90,7 +105,7 @@ void exec_job(sh_ctx_t *ctx, job_t *job) {
         sys_duplicate_handle(h, cur[1], STDOUT_FILENO, TRUE);
         sys_duplicate_handle(h, cur[2], STDERR_FILENO, TRUE);
 
-        if (redirect_failed) { created++; aborted = 1; break; }
+        if (redirect_failed) { created++; *aborted = 1; break; }
     }
 
     for (int i = 0; i < total - 1; i++) {
@@ -99,57 +114,88 @@ void exec_job(sh_ctx_t *ctx, job_t *job) {
     }
     for (int i = 0; i < n_opened; i++) sys_close(opened_files[i]);
 
-    if (aborted) {
+    if (*aborted) {
         for (int i = 0; i < created; i++) {
+            sys_issue_signal((int64_t)stage_pids[i], SIGKILL);
+            sys_close(stage_handles[i]);
+        }
+    }
+}
+
+int exec_job_fg(sh_ctx_t *ctx, job_t *job, int grab_fg) {
+    int total = job->stage_count;
+    handle_t stage_handles[SH_MAX_STAGES];
+    size_t stage_pids[SH_MAX_STAGES];
+    char *stage_names[SH_MAX_STAGES];
+    size_t job_pgid;
+    int aborted;
+
+    spawn_stages(ctx, job, stage_handles, stage_pids, stage_names, &job_pgid, &aborted);
+    if (aborted) return -1;
+
+    if (grab_fg) {
+        sys_device_control(ctx->tty, SET_FOREGROUND_PGRP, (void *)job_pgid);
+    }
+
+    for (int i = 0; i < total; i++) sys_resume_process(stage_handles[i]);
+    for (int i = 0; i < total; i++) sys_wait(stage_handles[i], -1);
+
+    if (grab_fg) {
+        // Restore foreground process group back to our own process group
+        sys_device_control(ctx->tty, SET_FOREGROUND_PGRP, (void *)ctx->shell_pid);
+        sys_device_control(ctx->tty, SET_TTY_MODE, (void *)(size_t)(TTY_MODE_ECHO | TTY_MODE_CANON));
+    }
+
+    int status = 0;
+    for (int i = 0; i < total; i++) {
+        process_info_t info;
+        int have_info = sys_get_process_info(stage_handles[i], &info) >= 0;
+        report_stage_status(stage_names[i], stage_handles[i]);
+        if (i == total - 1 && have_info) {
+            status = (info.exit_info.reason == EXIT_NORMAL && info.exit_info.code == 0) ? 0 : 1;
+        }
+        sys_close(stage_handles[i]);
+    }
+
+    return status;
+}
+
+void exec_job_bg(sh_ctx_t *ctx, job_t *job) {
+    int total = job->stage_count;
+    handle_t stage_handles[SH_MAX_STAGES];
+    size_t stage_pids[SH_MAX_STAGES];
+    char *stage_names[SH_MAX_STAGES];
+    size_t job_pgid;
+    int aborted;
+
+    spawn_stages(ctx, job, stage_handles, stage_pids, stage_names, &job_pgid, &aborted);
+    if (aborted) return;
+
+    for (int i = 0; i < total; i++) sys_resume_process(stage_handles[i]);
+
+    int slot = -1;
+    for (int i = 0; i < SH_MAX_BG_JOBS; i++) {
+        if (!ctx->bg_jobs[i].in_use) { slot = i; break; }
+    }
+    if (slot < 0) {
+        printf("sh: too many background jobs\n");
+        for (int i = 0; i < total; i++) {
             sys_issue_signal((int64_t)stage_pids[i], SIGKILL);
             sys_close(stage_handles[i]);
         }
         return;
     }
 
-    if (!job->background) {
-        sys_device_control(ctx->tty, SET_FOREGROUND_PGRP, (void *)job_pgid);
-    }
-
-    for (int i = 0; i < total; i++) sys_resume_process(stage_handles[i]);
-
-    if (job->background) {
-        int slot = -1;
-        for (int i = 0; i < SH_MAX_BG_JOBS; i++) {
-            if (!ctx->bg_jobs[i].in_use) { slot = i; break; }
-        }
-        if (slot < 0) {
-            printf("sh: too many background jobs\n");
-            for (int i = 0; i < total; i++) {
-                sys_issue_signal((int64_t)stage_pids[i], SIGKILL);
-                sys_close(stage_handles[i]);
-            }
-            return;
-        }
-
-        bg_job_t *bg = &ctx->bg_jobs[slot];
-        bg->in_use = 1;
-        bg->job_pgid = job_pgid;
-        bg->stage_count = total;
-        for (int i = 0; i < total; i++) {
-            bg->handles[i] = stage_handles[i];
-            bg->pids[i] = stage_pids[i];
-            bg->names[i] = sh_strdup(stage_names[i]);
-        }
-        printf("[%d] %zu\n", slot + 1, job_pgid);
-        return;
-    }
-
-    for (int i = 0; i < total; i++) sys_wait(stage_handles[i], -1);
-
-    // Restore foreground process group back to our own process group
-    sys_device_control(ctx->tty, SET_FOREGROUND_PGRP, (void *)ctx->shell_pid);
-    sys_device_control(ctx->tty, SET_TTY_MODE, (void *)(size_t)(TTY_MODE_ECHO | TTY_MODE_CANON));
-
+    bg_job_t *bg = &ctx->bg_jobs[slot];
+    bg->in_use = 1;
+    bg->job_pgid = job_pgid;
+    bg->stage_count = total;
     for (int i = 0; i < total; i++) {
-        report_stage_status(stage_names[i], stage_handles[i]);
-        sys_close(stage_handles[i]);
+        bg->handles[i] = stage_handles[i];
+        bg->pids[i] = stage_pids[i];
+        bg->names[i] = sh_strdup(stage_names[i]);
     }
+    printf("[%d] %zu\n", slot + 1, job_pgid);
 }
 
 void sh_reap_background_jobs(sh_ctx_t *ctx) {

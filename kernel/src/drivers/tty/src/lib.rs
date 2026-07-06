@@ -289,8 +289,7 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
         let caller_pgrp = proc_get_pgrp(pid);
         if caller_pgrp != 0 {
             info!("Not foreground process group!");
-            proc_issue_pgrp(caller_pgrp, SIGTTIN);
-            proc_drop_pgrp(caller_pgrp);
+            proc_issue_pgrp(caller_pgrp, SIGTTIN, true);
         }
         request.complete_irp(Status::Failed);
         return Status::Failed;
@@ -347,8 +346,7 @@ fn dispatch_write(device: &DeviceObject, request: &mut Irp) -> Status {
         let caller_pgrp = proc_get_pgrp(pid);
         if caller_pgrp != 0 {
             info!("Not foreground process group");
-            proc_issue_pgrp(caller_pgrp, SIGTTIN);
-            proc_drop_pgrp(caller_pgrp);
+            proc_issue_pgrp(caller_pgrp, SIGTTIN, true);
         }
         request.complete_irp(Status::Failed);
         return Status::Failed;
@@ -497,7 +495,7 @@ fn tty_input(bytes: *const u8, count: usize) {
             let pgrp = ctx.job.pgrp;
             release_spinlock(&mut ctx.lock);
             if pgrp != 0 && proc_is_pgrp_active(pgrp) {
-                proc_issue_pgrp(pgrp, SIGINT);
+                proc_issue_pgrp(pgrp, SIGINT, false);
             }
             release_tty_ctx(ctx_ptr);
             return;

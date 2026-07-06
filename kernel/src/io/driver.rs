@@ -302,7 +302,7 @@ impl DeviceObjectK {
         self.do_start(false)
     }
 
-    fn do_stop(&self, is_child: bool) -> Result<Status, KError> {
+    fn do_stop(&self, is_child: bool, stop_only_child: bool) -> Result<Status, KError> {
         let _g = self.config_guard();
         if self.is_class_device {
             if self.state() == DeviceState::Removed {
@@ -315,11 +315,16 @@ impl DeviceObjectK {
         // Stop all child devices first
         for cid in self.children_snapshot() {
             if let Some(child) = get_device(cid) {
-                let _ = child.do_stop(true);
+                let _ = child.do_stop(true, false);
             }
         }
 
-        Ok(self.stop_self(is_child))
+        Ok(if !stop_only_child {
+            self.stop_self(is_child)
+        }
+        else {
+            Status::Success
+        })
     }
 
     fn quiesce_requests(&self, next_state: DeviceState) {
@@ -361,8 +366,8 @@ impl DeviceObjectK {
     // Every attached child is stopped first (we wait for each, regardless of its
     // result); then this device stops. PDOs skip their own stop dispatch but
     // still propagate the stop to their children.
-    pub fn stop(&self) -> Result<Status, KError> {
-        self.do_stop(false)
+    pub fn stop(&self, stop_only_child: bool) -> Result<Status, KError> {
+        self.do_stop(false, stop_only_child)
     }
 }
 
@@ -925,7 +930,7 @@ pub extern "C" fn io_stop_device_ffi(device: *const DeviceObject) -> Status {
         Some(d) => d,
         None => return Status::Failed,
     };
-    let res = dev.stop();
+    let res = dev.stop(false);
     if res.is_err() {
         Status::Failed
     }

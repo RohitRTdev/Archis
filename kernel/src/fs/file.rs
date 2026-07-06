@@ -100,6 +100,7 @@ impl FileInst {
         match self.kind {
             HandleKind::Dir => Err(KError::IsADirectory),
             HandleKind::File => {
+                let _fs_guard = super::FsOpGuard::enter()?;
                 let _guard = semaphore_guard(&self.sem);
                 let offset = unsafe { &mut *self.offset.get() };
                 let len = match &self.backing {
@@ -128,6 +129,7 @@ impl FileInst {
         match self.kind {
             HandleKind::Dir => Err(KError::IsADirectory),
             HandleKind::File => {
+                let _fs_guard = super::FsOpGuard::enter()?;
                 let _guard = semaphore_guard(&self.sem);
                 let offset = unsafe { &mut *self.offset.get() };
                 let cur = *offset;
@@ -166,9 +168,12 @@ impl FileInst {
     pub fn readdir_at(&self, offset: usize) -> Result<DirEntry, KError> {
         match self.kind {
             HandleKind::File => Err(KError::NotADirectory),
-            HandleKind::Dir => match &self.backing {
-                Backing::Memory { node, ancestors } => Vfs::readdir(node, ancestors, offset),
-                Backing::Module { backend, handle } => backend.readdir(*handle, offset)
+            HandleKind::Dir => {
+                let _fs_guard = super::FsOpGuard::enter()?;
+                match &self.backing {
+                    Backing::Memory { node, ancestors } => Vfs::readdir(node, ancestors, offset),
+                    Backing::Module { backend, handle } => backend.readdir(*handle, offset)
+                }
             }
         }
     }

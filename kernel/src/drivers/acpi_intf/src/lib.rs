@@ -132,6 +132,7 @@ unsafe extern "C" {
 
     fn acpi_enter_sleep_state_prep_ffi(sleep_state: u8) -> ACPI_STATUS;
     fn acpi_enter_sleep_state_ffi(sleep_state: u8) -> ACPI_STATUS;
+    fn acpi_reset_ffi() -> ACPI_STATUS;
 
     fn acpi_enumerate_devices_ffi(cb: AcpiWalkCallback, ctx: *mut c_void) -> ACPI_STATUS;
     fn acpi_get_devices_ffi(
@@ -202,6 +203,10 @@ pub fn acpi_enter_sleep_state_prep(sleep_state: u8) -> ACPI_STATUS {
 
 pub fn acpi_enter_sleep_state(sleep_state: u8) -> ACPI_STATUS {
     unsafe { acpi_enter_sleep_state_ffi(sleep_state) }
+}
+
+pub fn acpi_reset() -> ACPI_STATUS {
+    unsafe { acpi_reset_ffi() }
 }
 
 pub fn acpi_enumerate_devices(cb: AcpiWalkCallback, ctx: *mut c_void) -> ACPI_STATUS {

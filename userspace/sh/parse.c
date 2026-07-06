@@ -120,12 +120,13 @@ static int tokenize(const char *line, token_t *toks, int max_toks) {
                 const char *dstart = p;
                 int ddig = 0;
                 while (isdigit((unsigned char)*p)) { p++; ddig++; }
-                if (ddig == 0) {
-                    free_tokens(toks, ntoks);
-                    return -1;
+                if (ddig > 0) {
+                    dup_target = atoi(dstart);
+                    kind = REDIR_DUP_FD;
                 }
-                dup_target = atoi(dstart);
-                kind = REDIR_DUP_FD;
+                // else: no digits after '&' -- fall back to a plain file
+                // redirect, identical to `>target` without the `&`
+                // (kind stays REDIR_TRUNC, dup_target stays unused).
             }
 
             t->type = TOK_REDIR;
@@ -189,28 +190,16 @@ static int build_job(token_t *toks, int ntoks, job_t *job) {
     return 0;
 }
 
-int parse_line(const char *raw_line, job_t *job) {
+// Parses one `&&`-segment (no background/chain syntax of its own) into `job`.
+// Returns 0 on success, -1 on a syntax error (including an empty segment --
+// e.g. the gap in "a && && b" or a trailing "a &&").
+static int parse_segment(const char *seg, job_t *job) {
     memset(job, 0, sizeof(*job));
 
-    char line[SH_LINE_BUF];
-    strncpy(line, raw_line, sizeof(line) - 1);
-    line[sizeof(line) - 1] = '\0';
-
-    size_t len = strlen(line);
-    while (len > 0 && isspace((unsigned char)line[len - 1])) len--;
-    line[len] = '\0';
-
-    if (len > 0 && line[len - 1] == '&') {
-        job->background = 1;
-        len--;
-        line[len] = '\0';
-        while (len > 0 && isspace((unsigned char)line[len - 1])) { len--; line[len] = '\0'; }
-    }
-
     token_t toks[SH_MAX_TOKENS];
-    int ntoks = tokenize(line, toks, SH_MAX_TOKENS);
+    int ntoks = tokenize(seg, toks, SH_MAX_TOKENS);
     if (ntoks < 0) return -1;
-    if (ntoks == 0) return 1;
+    if (ntoks == 0) return -1;
 
     int rc = build_job(toks, ntoks, job);
     if (rc != 0) {
@@ -222,10 +211,67 @@ int parse_line(const char *raw_line, job_t *job) {
     return 0;
 }
 
+int parse_line(const char *raw_line, job_list_t *list) {
+    memset(list, 0, sizeof(*list));
+
+    char line[SH_LINE_BUF];
+    strncpy(line, raw_line, sizeof(line) - 1);
+    line[sizeof(line) - 1] = '\0';
+
+    size_t len = strlen(line);
+    while (len > 0 && isspace((unsigned char)line[len - 1])) len--;
+    line[len] = '\0';
+
+    if (len > 0 && line[len - 1] == '&') {
+        list->background = 1;
+        len--;
+        line[len] = '\0';
+        while (len > 0 && isspace((unsigned char)line[len - 1])) { len--; line[len] = '\0'; }
+    }
+
+    if (len == 0) return 1;
+
+    // Split on top-level "&&" in place: the first '&' of each match becomes
+    // the NUL terminator for the segment before it; the second '&' is
+    // skipped and the next segment starts right after it. A lone '&' that
+    // isn't part of "&&" is still rejected -- by parse_segment's tokenizer,
+    // which errors on any stray '&' it encounters.
+    const char *seg_start = line;
+    char *p = line;
+    while (1) {
+        char *amp = strstr(p, "&&");
+        if (!amp) break;
+
+        if (list->job_count >= SH_MAX_CHAIN) { job_list_free(list); return -1; }
+        *amp = '\0';
+        if (parse_segment(seg_start, &list->jobs[list->job_count]) != 0) {
+            job_list_free(list);
+            return -1;
+        }
+        list->job_count++;
+
+        p = amp + 2;
+        seg_start = p;
+    }
+
+    if (list->job_count >= SH_MAX_CHAIN) { job_list_free(list); return -1; }
+    if (parse_segment(seg_start, &list->jobs[list->job_count]) != 0) {
+        job_list_free(list);
+        return -1;
+    }
+    list->job_count++;
+
+    return 0;
+}
+
 void job_free(job_t *job) {
     for (int i = 0; i < job->stage_count; i++) {
         stage_t *st = &job->stages[i];
         for (int a = 0; a < st->argc; a++) free(st->argv[a]);
         for (int r = 0; r < st->redirect_count; r++) free(st->redirects[r].path);
     }
+}
+
+void job_list_free(job_list_t *list) {
+    for (int i = 0; i < list->job_count; i++) job_free(&list->jobs[i]);
 }

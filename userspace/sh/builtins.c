@@ -5,9 +5,13 @@
 
 #include "builtins.h"
 
-static void builtin_cd(char *const argv[], int argc) {
+static int builtin_cd(char *const argv[], int argc) {
     const char *target = argc > 1 ? argv[1] : "/";
-    if (sys_chdir(target) < 0) printf("sh: cd: %s: No such directory\n", target);
+    if (sys_chdir(target) < 0) {
+        printf("sh: cd: %s: No such directory\n", target);
+        return 1;
+    }
+    return 0;
 }
 
 static void builtin_pwd(void) {
@@ -44,11 +48,12 @@ static void builtin_exit(sh_ctx_t *ctx) {
     sys_exit(0);
 }
 
-int sh_run_builtin(sh_ctx_t *ctx, char *const argv[], int argc, int *should_exit) {
+int sh_run_builtin(sh_ctx_t *ctx, char *const argv[], int argc, int *should_exit, int *status) {
     *should_exit = 0;
+    *status = 0;
     if (argc == 0) return 1;
 
-    if (strcmp(argv[0], "cd") == 0) { builtin_cd(argv, argc); return 1; }
+    if (strcmp(argv[0], "cd") == 0) { *status = builtin_cd(argv, argc); return 1; }
     if (strcmp(argv[0], "pwd") == 0) { builtin_pwd(); return 1; }
     if (strcmp(argv[0], "export") == 0) { builtin_export(argv, argc); return 1; }
     if (strcmp(argv[0], "exit") == 0) { *should_exit = 1; builtin_exit(ctx); return 1; }

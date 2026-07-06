@@ -108,7 +108,8 @@ pub enum KError {
     BufferTooSmall,
     NoMoreEntries,
     IsSymlink,
-    DeviceMounted
+    DeviceMounted,
+    FsStopped
 }
 
 pub const E_SUCCESS: i64 = 0;
@@ -135,6 +136,7 @@ pub const E_BUF_TOO_SMALL: i64  = -20;
 pub const E_NO_DIR_ENTRIES: i64 = -21;
 pub const E_IS_SYMLINK: i64     = -22;
 pub const E_DEVICE_MOUNTED: i64     = -23;
+pub const E_FS_STOPPED: i64         = -24;
 
 impl<T> From<Result<T, KError>> for KError {
     fn from(e: Result<T, KError>) -> Self {
@@ -167,7 +169,8 @@ impl From<KError> for i64 {
             KError::BufferTooSmall => E_BUF_TOO_SMALL,
             KError::NoMoreEntries => E_NO_DIR_ENTRIES,
             KError::IsSymlink => E_IS_SYMLINK,
-            KError::DeviceMounted => E_DEVICE_MOUNTED
+            KError::DeviceMounted => E_DEVICE_MOUNTED,
+            KError::FsStopped => E_FS_STOPPED
         }
     }
 }
@@ -196,6 +199,7 @@ impl From<i64> for KError {
             E_NO_DIR_ENTRIES => KError::NoMoreEntries,
             E_IS_SYMLINK => KError::IsSymlink,
             E_DEVICE_MOUNTED => KError::DeviceMounted,
+            E_FS_STOPPED => KError::FsStopped,
             _ => KError::InvalidArgument
         }
     }
@@ -230,6 +234,7 @@ impl fmt::Display for KError {
             KError::NoMoreEntries => "No more directory entries",
             KError::IsSymlink => "Path component is a symlink",
             KError::DeviceMounted => "Device is already mounted",
+            KError::FsStopped => "Filesystem is stopped",
             KError::Success => "Success"
         };
         write!(f, "{}", description)
@@ -377,7 +382,7 @@ unsafe extern "C" {
     fn proc_is_pgrp_active_ffi(val: ProcessGroupType) -> bool;
     fn proc_is_foreground_pgrp_ffi(pid: usize, val: ProcessGroupType) -> bool;
     fn proc_issue_signal_ffi(pid: usize, signal: u8);
-    fn proc_issue_pgrp_ffi(val: ProcessGroupType, signal: u8);
+    fn proc_issue_pgrp_ffi(val: ProcessGroupType, signal: u8, consume: bool);
 
     fn allocate_vector_ffi() -> usize;
     fn allocate_vector_for_irq_ffi(irq: usize) -> usize;
@@ -612,8 +617,8 @@ pub fn proc_issue_signal(pid: usize, signal: u8) {
     unsafe { proc_issue_signal_ffi(pid, signal) }
 }
 
-pub fn proc_issue_pgrp(val: ProcessGroupType, signal: u8) {
-    unsafe { proc_issue_pgrp_ffi(val, signal) }
+pub fn proc_issue_pgrp(val: ProcessGroupType, signal: u8, consume: bool) {
+    unsafe { proc_issue_pgrp_ffi(val, signal, consume) }
 }
     
 pub fn io_allocate_vector() -> usize {

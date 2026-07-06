@@ -11,11 +11,48 @@ pub use root::load_root_fs;
 pub use utils::FileBuffer;
 pub use vfs::{DirEntry, EntryType, FileAttrs, FileStat, HandleStatType, make_absolute, normalize_path, MODE_FILE, MODE_DIR, MODE_SYMLINK};
 
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloc::string::String;
 use alloc::sync::Arc;
 use kernel_intf::{info, KError};
 use crate::sched::OPEN_CREATE_FLAG;
+use crate::sync::{KEvent, Once};
 use vfs::ProbeStep;
+
+static STOP_FS: AtomicBool = AtomicBool::new(false);
+static FS_OP_COUNT: AtomicUsize = AtomicUsize::new(0);
+static FS_STOP_EVENT: Once<KEvent> = Once::new();
+
+struct FsOpGuard;
+
+impl FsOpGuard {
+    fn enter() -> Result<FsOpGuard, KError> {
+        FS_OP_COUNT.fetch_add(1, Ordering::AcqRel);
+        if STOP_FS.load(Ordering::Acquire) {
+            Self::leave();
+            crate::fs_log!("fs operation aborted, fs is stopped");
+            return Err(KError::FsStopped);
+        }
+        Ok(FsOpGuard)
+    }
+
+    fn leave() {
+        if FS_OP_COUNT.fetch_sub(1, Ordering::AcqRel) == 1 {
+            FS_STOP_EVENT.get().expect("fs::init not called").signal();
+        }
+    }
+}
+
+impl Drop for FsOpGuard {
+    fn drop(&mut self) { Self::leave(); }
+}
+
+pub fn stop_fs() {
+    STOP_FS.store(true, Ordering::Release);
+    if FS_OP_COUNT.load(Ordering::Acquire) != 0 {
+        let _ = FS_STOP_EVENT.get().expect("fs::init not called").wait(false);
+    }
+}
 
 // A fresh, empty in-memory mount source, for callers outside this module that
 // want to mount a scratch backend without needing the private `Vfs` type.
@@ -77,6 +114,7 @@ pub fn unmount(path: &str) -> Result<(), KError> {
 }
 
 pub fn open(path: &str) -> Result<FileInstance, KError> {
+    let _guard = FsOpGuard::enter()?;
     let full = abs(path);
     let (backend, _, rel, attrs, _) = resolve(path, true)?;
     match backend {
@@ -94,14 +132,17 @@ pub fn open(path: &str) -> Result<FileInstance, KError> {
 }
 
 pub fn stat(path: &str) -> Result<FileAttrs, KError> {
+    let _guard = FsOpGuard::enter()?;
     resolve(path, true).map(|(_, _, _, attrs, _)| attrs)
 }
 
 pub fn lstat(path: &str) -> Result<(FileAttrs, Option<String>), KError> {
+    let _guard = FsOpGuard::enter()?;
     resolve(path, false).map(|(_, _, _, attrs, target)| (attrs, target))
 }
 
 pub fn create_file(path: &str, mode: u16) -> Result<(), KError> {
+    let _guard = FsOpGuard::enter()?;
     let full = abs(path);
     let (parent_path, leaf) = vfs::split_parent(&full);
     if leaf.is_empty() { return Err(KError::InvalidArgument); }
@@ -113,6 +154,7 @@ pub fn create_file(path: &str, mode: u16) -> Result<(), KError> {
 }
 
 pub fn mkdir(path: &str, mode: u16) -> Result<(), KError> {
+    let _guard = FsOpGuard::enter()?;
     let full = abs(path);
     let (parent_path, leaf) = vfs::split_parent(&full);
     if leaf.is_empty() { return Err(KError::InvalidArgument); }
@@ -124,6 +166,7 @@ pub fn mkdir(path: &str, mode: u16) -> Result<(), KError> {
 }
 
 pub fn create_symlink(path: &str, target: &str) -> Result<(), KError> {
+    let _guard = FsOpGuard::enter()?;
     let full = abs(path);
     let (parent_path, leaf) = vfs::split_parent(&full);
     if leaf.is_empty() { return Err(KError::InvalidArgument); }
@@ -135,6 +178,7 @@ pub fn create_symlink(path: &str, target: &str) -> Result<(), KError> {
 }
 
 pub fn delete(path: &str) -> Result<(), KError> {
+    let _guard = FsOpGuard::enter()?;
     // follow_final=false: deleting a symlink deletes the symlink itself.
     let (backend, mount_point, rel, _, _) = resolve(path, false)?;
     let target_full = mount::to_absolute(&mount_point, &rel);
@@ -158,6 +202,7 @@ pub fn delete(path: &str) -> Result<(), KError> {
 }
 
 pub fn rename(from: &str, to: &str) -> Result<(), KError> {
+    let _guard = FsOpGuard::enter()?;
     let full_to = abs(to);
     let (to_parent_path, to_leaf) = vfs::split_parent(&full_to);
     if to_leaf.is_empty() { return Err(KError::InvalidArgument); }
@@ -197,6 +242,7 @@ pub fn rename(from: &str, to: &str) -> Result<(), KError> {
 }
 
 pub fn resolve_symlink(path: &str) -> Result<String, KError> {
+    let _guard = FsOpGuard::enter()?;
     resolve(path, true).map(|(_, mp, rel, _, _)| mount::to_absolute(&mp, &rel))
 }
 
@@ -230,6 +276,8 @@ fn open_fs_handler(name: &str, flags: u64) -> Result<crate::sched::Handle, KErro
 }
 
 pub fn init() {
+    FS_STOP_EVENT.call_once(|| KEvent::new(true));
+
     let init_fs = crate::INIT_FS.get().expect("fs::init called before INIT_FS is ready");
     let mut vfs_instance = vfs::Vfs::new();
     vfs_instance.populate(&init_fs.fs, &init_fs.symlinks);

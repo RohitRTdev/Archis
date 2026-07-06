@@ -6,6 +6,7 @@
 #define SH_MAX_STAGES    8
 #define SH_MAX_REDIRECTS 4
 #define SH_MAX_BG_JOBS   16
+#define SH_MAX_CHAIN     8
 
 typedef enum {
     REDIR_TRUNC,  // >
@@ -30,8 +31,13 @@ typedef struct {
 typedef struct {
     stage_t stages[SH_MAX_STAGES];
     int stage_count;
-    int background;
 } job_t;
+
+typedef struct {
+    job_t jobs[SH_MAX_CHAIN];
+    int job_count;
+    int background;   // trailing `&` -- applies to the entire chain
+} job_list_t;
 
 typedef struct {
     int in_use;

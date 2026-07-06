@@ -15,6 +15,7 @@ unsafe extern "C" {
     fn AcpiInitializeObjects(flags: u32) -> ACPI_STATUS;
     fn AcpiEnterSleepStatePrep(sleep_state: u8) -> ACPI_STATUS;
     fn AcpiEnterSleepState(sleep_state: u8) -> ACPI_STATUS;
+    fn AcpiReset() -> ACPI_STATUS;
 
     fn AcpiGetDevices(
         hid: *const c_char,
@@ -132,6 +133,11 @@ extern "C" fn acpi_enter_sleep_state_prep_ffi(sleep_state: u8) -> ACPI_STATUS {
 #[unsafe(no_mangle)]
 extern "C" fn acpi_enter_sleep_state_ffi(sleep_state: u8) -> ACPI_STATUS {
     unsafe { AcpiEnterSleepState(sleep_state) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn acpi_reset_ffi() -> ACPI_STATUS {
+    unsafe { AcpiReset() }
 }
 
 #[unsafe(no_mangle)]

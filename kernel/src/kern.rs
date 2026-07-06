@@ -21,6 +21,8 @@ mod pipe;
 #[cfg(feature = "acpi")]
 mod acpica;
 
+use crate::io::{open_device_handle, pnp_post};
+
 #[cfg(feature = "kunit-test")] 
 use {
     core::sync::atomic::{AtomicUsize, AtomicBool, Ordering},
@@ -388,7 +390,7 @@ fn run_state_tests() {
     }
     sched::delay_ms(50, false);
     info!("state phase 2: stopping device");
-    dev.stop().expect("stop must succeed");
+    dev.stop(false).expect("stop must succeed");
     sched::delay_ms(300, false);
     STATE_TEST_RUN.store(false, Ordering::Release);
     sched::delay_ms(100, false);
@@ -1860,4 +1862,45 @@ unsafe extern "C" fn kern_start(boot_info: *const BootInfo) -> ! {
     debug!("{:?}", *BOOT_INFO.get().unwrap());
 
     hal::init();
+}
+
+pub fn system_shutdown(restart: bool) -> ! {
+    info!("system_shutdown: restart={}", restart);
+
+    fs::stop_fs();
+    info!("system_shutdown: fs stopped");
+
+    let dev = io::open_device_handle("acpi");
+    if let Ok(device) = dev {
+        io::stop_device(device.id(), true);
+        io::pnp_fence();
+    }
+
+    info!("system_shutdown: devices stopped");
+
+    if restart {
+        #[cfg(feature = "acpi")]
+        {
+            let status = acpi_intf::acpi_reset();
+            if status != acpi_intf::AE_OK {
+                info!("system_shutdown: AcpiReset failed ({:#X}), falling back to 8042 reset", status);
+                
+                #[cfg(target_arch = "x86_64")]
+                unsafe { kernel_intf::hw::outb(0x64, 0xFE); }
+            }
+        }
+        #[cfg(all(not(feature = "acpi"), target_arch = "x86_64"))]
+        unsafe { kernel_intf::hw::outb(0x64, 0xFE); }
+    } else {
+        #[cfg(feature = "acpi")]
+        {
+            acpi_intf::acpi_enter_sleep_state_prep(acpi_intf::ACPI_SLEEP_S5);
+            let int_status = hal::disable_interrupts();
+            acpi_intf::acpi_enter_sleep_state(acpi_intf::ACPI_SLEEP_S5);
+            hal::enable_interrupts(int_status);
+        }
+    }
+
+    info!("system_shutdown: power action did not take effect, halting");
+    hal::halt();
 }

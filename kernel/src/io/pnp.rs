@@ -17,7 +17,7 @@ use super::stack;
 pub enum PnpRequest {
     InvalidateDevice { device_id: usize },
     StartDevice      { device_id: usize },
-    StopDevice       { device_id: usize },
+    StopDevice       { device_id: usize, stop_only_child: bool },
     RemoveDevice     { device_id: usize },
     RemoveDriver     { name: String },
     AddConfig        { new_config: String },
@@ -32,8 +32,8 @@ impl core::fmt::Debug for PnpRequest {
                 write!(f, "InvalidateDevice {{ device_id: {} }}", device_id),
             PnpRequest::StartDevice { device_id } =>
                 write!(f, "StartDevice {{ device_id: {} }}", device_id),
-            PnpRequest::StopDevice { device_id } =>
-                write!(f, "StopDevice {{ device_id: {} }}", device_id),
+            PnpRequest::StopDevice { device_id, stop_only_child} =>
+                write!(f, "StopDevice {{ device_id: {}, stop_only_child: {} }}", device_id, stop_only_child),
             PnpRequest::RemoveDevice { device_id } =>
                 write!(f, "RemoveDevice {{ device_id: {} }}", device_id),
             PnpRequest::RemoveDriver { name } =>
@@ -58,8 +58,8 @@ pub fn start_device(device_id: usize) {
     pnp_post(PnpRequest::StartDevice { device_id });
 }
 
-pub fn stop_device(device_id: usize) {
-    pnp_post(PnpRequest::StopDevice { device_id });
+pub fn stop_device(device_id: usize, stop_only_child: bool) {
+    pnp_post(PnpRequest::StopDevice { device_id, stop_only_child });
 }
 
 pub fn remove_device_async(device_id: usize) {
@@ -100,9 +100,9 @@ fn handle(req: &PnpRequest) {
                 None => info!("pnp: start target device {} no longer exists", device_id)
             }
         },
-        PnpRequest::StopDevice { device_id } => {
+        PnpRequest::StopDevice { device_id, stop_only_child } => {
             match get_device(*device_id) {
-                Some(dev) => { let _ = dev.stop(); }
+                Some(dev) => { let _ = dev.stop(*stop_only_child); }
                 None => info!("pnp: stop target device {} no longer exists", device_id)
             }
         },

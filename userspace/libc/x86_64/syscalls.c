@@ -169,3 +169,7 @@ syscall_status_t sys_getcwd(char *buf, size_t buf_len, size_t *bytes_written) {
 syscall_status_t sys_issue_signal(int64_t target, uint8_t signal) {
     return do_syscall(SYSCALL_ISSUE_SIGNAL, (uint64_t)target, signal, 0, 0, 0, 0);
 }
+
+syscall_status_t sys_shutdown(boolean_t restart) {
+    return do_syscall(SYSCALL_SHUTDOWN, restart, 0, 0, 0, 0, 0);
+}

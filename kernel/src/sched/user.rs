@@ -20,7 +20,7 @@ use super::*;
 use kernel_intf::*;
 use kernel_intf::driver::{IrpMajor, IrpMinor, ReqInfo, TtyControlInfo, TtyModeInfo, EMPTY_REGION, Status};
 
-const MAX_SYSCALLS: usize = 40;
+const MAX_SYSCALLS: usize = 41;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 
 const OPEN_INHERITABLE_FLAG: u64 = 1 << 0;
@@ -78,7 +78,8 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_create_pipe_handler,
     sys_chdir_handler,
     sys_getcwd_handler,
-    sys_issue_signal_handler
+    sys_issue_signal_handler,
+    sys_shutdown_handler
 ];
 
 fn read_c_strlen(start: usize) -> Option<usize> {
@@ -732,11 +733,16 @@ fn sys_issue_signal_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     else {
         let pid = (-target) as usize;
         if let Some(pgrp) = proc::get_pgroup(pid) {
-            proc::issue_pgrp(&pgrp, signal);
+            proc::issue_pgrp(pgrp, signal, true);
         }
     }
 
     E_SUCCESS
+}
+
+// arg0 = restart (0 = shutdown)
+fn sys_shutdown_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    crate::system_shutdown(args[0] != 0)
 }
 
 fn sys_get_pid_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {

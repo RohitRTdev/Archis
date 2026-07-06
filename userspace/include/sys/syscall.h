@@ -44,7 +44,8 @@ enum syscall_t {
     SYSCALL_CREATE_PIPE,
     SYSCALL_CHDIR,
     SYSCALL_GETCWD,
-    SYSCALL_ISSUE_SIGNAL
+    SYSCALL_ISSUE_SIGNAL,
+    SYSCALL_SHUTDOWN
 };
 
 typedef enum {
@@ -76,7 +77,8 @@ typedef enum {
     E_BUF_TOO_SMALL    = -20,
     E_NO_DIR_ENTRIES   = -21,
     E_IS_SYMLINK       = -22,
-    E_DEVICE_MOUNTED   = -23
+    E_DEVICE_MOUNTED   = -23,
+    E_FS_STOPPED       = -24
 } syscall_status_t;
 
 #define PROCESS_SUSPEND_FLAG    ((uint64_t)1 << 0)
@@ -200,3 +202,4 @@ syscall_status_t sys_create_pipe(handle_t *read_handle, handle_t *write_handle, 
 syscall_status_t sys_chdir(const char *path);
 syscall_status_t sys_getcwd(char *buf, size_t buf_len, size_t *bytes_written);
 syscall_status_t sys_issue_signal(int64_t target, uint8_t signal);
+syscall_status_t sys_shutdown(boolean_t restart);

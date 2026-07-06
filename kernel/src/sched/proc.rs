@@ -967,8 +967,13 @@ extern "C" fn sched_kill_process_ffi(proc_id: usize, exit_info: ExitInfo) {
     kill_process(proc_id, exit_info);
 }
 
-pub fn issue_pgrp(pgrp: &KProcessGroup, signal: u8) {
+pub fn issue_pgrp(pgrp: KProcessGroup, signal: u8, consume: bool) {
     let pids: Vec<usize> = pgrp.lock().processes.iter().map(|p| **p).collect();
+    if consume {
+        drop(pgrp);
+    } else {
+        core::mem::forget(pgrp);
+    }
     for pid in pids {
         issue_signal(pid, signal);
     }
@@ -1042,9 +1047,10 @@ extern "C" fn proc_issue_signal_ffi(pid: usize, signal: u8) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn proc_issue_pgrp_ffi(val: usize, signal: u8) {
-    let arc = ManuallyDrop::new(unsafe { Arc::from_raw_in(val as *const Spinlock<ProcessGroup>, PoolAllocatorGlobal) });
-    issue_pgrp(&arc, signal);
+extern "C" fn proc_issue_pgrp_ffi(val: usize, signal: u8, consume: bool) {
+    if val == 0 { return; }
+    let arc = unsafe { Arc::from_raw_in(val as *const Spinlock<ProcessGroup>, PoolAllocatorGlobal) };
+    issue_pgrp(arc, signal, consume);
 }
 
 pub fn get_cwd() -> String {
