@@ -15,6 +15,28 @@ static void sigint_handler(void *ctx) {
     (void)ctx;
 }
 
+static int read_line(sh_ctx_t *ctx, char *line, size_t line_cap) {
+    size_t line_len = 0;
+
+    for (;;) {
+        size_t n = 0;
+        syscall_status_t ret = sys_read(ctx->tty, line + line_len, line_cap - 1 - line_len, &n);
+
+        if (ret == E_WAIT_INTERRUPTED) {
+            printf("\n$ ");
+            return 0;
+        }
+        if (ret < 0 || n == 0) continue;
+
+        line_len += n;
+        if (line[line_len - 1] == '\n' || line_len >= line_cap - 1) break;
+    }
+
+    if (line_len > 0 && line[line_len - 1] == '\n') line_len--;
+    line[line_len] = '\0';
+    return 1;
+}
+
 // Runs one job (builtin or external), returning its exit status (0 = success)
 // for use by run_job_list's `&&` short-circuiting.
 static int run_job(sh_ctx_t *ctx, job_t *job, int grab_fg) {
@@ -143,48 +165,28 @@ int main(int argc, char *argv[]) {
     set_signal_handler(SIGINT, sigint_handler, 0);
 
     char line[LINE_BUF_SIZE];
-    size_t line_len = 0;
 
     printf("$ ");
     for (;;) {
-        char buf[64];
-        size_t n = 0;
-        syscall_status_t ret = sys_read(ctx.tty, buf, sizeof(buf), &n);
-
-        if (ret == E_WAIT_INTERRUPTED) {
-            // Ctrl-C fired while we were blocked waiting for input: drop
-            // whatever was typed so far and redraw the prompt on a new line.
-            line_len = 0;
-            printf("\n$ ");
-            continue;
-        }
-        if (ret < 0 || n == 0) {
+        if (!read_line(&ctx, line, sizeof(line))) {
+            // Ctrl-C fired while blocked waiting for input; read_line already
+            // redrew the prompt on a new line, and the ring's in-progress
+            // line was discarded tty-side (see tty_input's CTRL_C handling).
             continue;
         }
 
-        for (size_t i = 0; i < n; i++) {
-            char c = buf[i];
-            if (c == '\n') {
-                line[line_len] = '\0';
-
-                job_list_t list;
-                int rc = parse_line(line, &list);
-                if (rc == 0) {
-                    run_job_list(&ctx, &list);
-                    job_list_free(&list);
-                }
-                else if (rc < 0) {
-                    printf("sh: syntax error\n");
-                }
-
-                line_len = 0;
-                sh_reap_background_jobs(&ctx);
-                printf("$ ");
-            }
-            else if (line_len < LINE_BUF_SIZE - 1) {
-                line[line_len++] = c;
-            }
+        job_list_t list;
+        int rc = parse_line(line, &list);
+        if (rc == 0) {
+            run_job_list(&ctx, &list);
+            job_list_free(&list);
         }
+        else if (rc < 0) {
+            printf("sh: syntax error\n");
+        }
+
+        sh_reap_background_jobs(&ctx);
+        printf("$ ");
     }
 
     return 0;

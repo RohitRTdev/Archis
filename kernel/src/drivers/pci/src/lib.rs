@@ -110,7 +110,7 @@ fn dispatch_pnp(device: &DeviceObject, req: &mut Irp) -> Status {
             }
             else {
                 let pci_ctx = unsafe { &*(device.ctx as *const PciCtx) };
-                info!("pci pdo {:02X}:{:02X}:{} stopped", pci_ctx.bus, pci_ctx.device, pci_ctx.function);
+                info!("pci fdo {:02X}:{:02X}:{} stopped", pci_ctx.bus, pci_ctx.device, pci_ctx.function);
             }
             req.complete_irp(Status::Success);
             Status::Success

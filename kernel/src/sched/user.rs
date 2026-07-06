@@ -20,7 +20,7 @@ use super::*;
 use kernel_intf::*;
 use kernel_intf::driver::{IrpMajor, IrpMinor, ReqInfo, TtyControlInfo, TtyModeInfo, EMPTY_REGION, Status};
 
-const MAX_SYSCALLS: usize = 41;
+const MAX_SYSCALLS: usize = 44;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 
 const OPEN_INHERITABLE_FLAG: u64 = 1 << 0;
@@ -79,39 +79,41 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_chdir_handler,
     sys_getcwd_handler,
     sys_issue_signal_handler,
-    sys_shutdown_handler
+    sys_shutdown_handler,
+    sys_intf_request_handler,
+    sys_terminate_process_handler,
+    sys_terminate_thread_handler
 ];
+
+const STRLEN_SCAN_CHUNK: usize = 128;
 
 fn read_c_strlen(start: usize) -> Option<usize> {
     let mut len = 0;
     let mut cur_ptr = start;
-    let mut cur_range = align_up(start, PAGE_SIZE) - start;
-    if cur_range == 0 {
-        cur_range = PAGE_SIZE;
-    }
+    let mut total_scanned = 0;
 
-    let mut pages_checked = 0;
     loop {
-        let mut buf = vec![0u8; cur_range];
-        if mem::copy_from_user(buf.as_mut_ptr(), cur_ptr, cur_range).is_err() {
-            debug!("User range: {:#X} with size {} invalid", cur_ptr, cur_range);
+        let dist_to_page_end = align_up(cur_ptr, PAGE_SIZE) - cur_ptr;
+        let chunk = if dist_to_page_end == 0 { PAGE_SIZE } else { dist_to_page_end }.min(STRLEN_SCAN_CHUNK);
+
+        let mut buf = [0u8; STRLEN_SCAN_CHUNK];
+        if mem::copy_from_user(buf.as_mut_ptr(), cur_ptr, chunk).is_err() {
+            debug!("User range: {:#X} with size {} invalid", cur_ptr, chunk);
             return None;
         }
 
-        for &b in buf.iter() {
+        for &b in &buf[..chunk] {
             if b == 0 {
                 return Some(len);
             }
             len += 1;
         }
 
-        pages_checked += 1;
-        if pages_checked >= 2 {
+        cur_ptr += chunk;
+        total_scanned += chunk;
+        if total_scanned >= 2 * PAGE_SIZE {
             return None;
         }
-
-        cur_ptr += cur_range;
-        cur_range = PAGE_SIZE;
     }
 }
 
@@ -743,6 +745,79 @@ fn sys_issue_signal_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 // arg0 = restart (0 = shutdown)
 fn sys_shutdown_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     crate::system_shutdown(args[0] != 0)
+}
+
+// arg0 = intf_name C-string ptr, arg1 = request struct ptr (userspace)
+fn sys_intf_request_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let name = match read_user_string(args[0] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    let request_ptr = args[1] as usize;
+    if request_ptr == 0 {
+        return E_INVALID;
+    }
+    let (handler, len) = match crate::intf::lookup_intf(&name) {
+        Some(e) => e,
+        None => return E_NOT_FOUND
+    };
+
+    let mut kbuf = vec![0u8; len];
+    if mem::copy_from_user(kbuf.as_mut_ptr(), request_ptr, len).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+
+    let result = handler(kbuf.as_mut_ptr());
+
+    if mem::copy_to_user(request_ptr, kbuf.as_ptr(), len).is_err() {
+        return E_INVALID_MEMORY_RANGE;
+    }
+
+    match result {
+        Ok(()) => E_SUCCESS,
+        Err(e) => e.into()
+    }
+}
+
+// arg0 = pid, arg1 = exit_code
+fn sys_terminate_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let pid = args[0] as i64;
+    if pid <= 0 {
+        // pid 0 is the system/init process; kill_process() asserts on it internally,
+        // so it must never be reached with pid 0. Process-group (negative) targets
+        // are not supported by this syscall.
+        return E_INVALID;
+    }
+    let pid = pid as usize;
+    if proc::get_process_info(pid).is_none() {
+        return E_NOT_FOUND;
+    }
+    kill_process(pid, ExitInfo::normal(args[1] as i64 as isize));
+    E_SUCCESS
+}
+
+// arg0 = tid, arg1 = exit_code
+fn sys_terminate_thread_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let tid = args[0] as i64;
+    if tid < 0 {
+        return E_INVALID;
+    }
+    let tid = tid as usize;
+    let task = match get_task_info(tid) {
+        Some(t) => t,
+        None => return E_NOT_FOUND
+    };
+    let owning_pid = match task.lock().get_process() {
+        Some(p) => p.lock().get_id(),
+        None => return E_NOT_FOUND // idle task has no process
+    };
+    if owning_pid == 0 {
+        // Do not allow userspace to kill process 0 
+        return E_NOPERM;
+    }
+    kill_thread(tid, ExitInfo::normal(args[1] as i64 as isize));
+    E_SUCCESS
 }
 
 fn sys_get_pid_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {

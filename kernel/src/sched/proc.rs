@@ -530,6 +530,25 @@ pub fn get_process_info(proc_id: usize) -> Option<KProcess> {
     })
 }
 
+pub struct ProcessSnapshot {
+    pub id: usize,
+    pub ppid: usize,
+    pub num_threads: usize,
+    pub status: ProcessStatus
+}
+
+pub fn snapshot_all_processes() -> Vec<ProcessSnapshot> {
+    PROCESSES.lock().values().map(|p| {
+        let guard = p.lock();
+        ProcessSnapshot {
+            id: guard.get_id(),
+            ppid: guard.pid,
+            num_threads: guard.get_num_threads(),
+            status: guard.get_status()
+        }
+    }).collect()
+}
+
 pub fn get_pgroup(proc_id: usize) -> Option<KProcessGroup> {
     Some(Arc::clone(&get_process_info(proc_id)?.lock().pgroup))
 }

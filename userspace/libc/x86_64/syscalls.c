@@ -173,3 +173,15 @@ syscall_status_t sys_issue_signal(int64_t target, uint8_t signal) {
 syscall_status_t sys_shutdown(boolean_t restart) {
     return do_syscall(SYSCALL_SHUTDOWN, restart, 0, 0, 0, 0, 0);
 }
+
+syscall_status_t sys_intf_request(const char *intf_name, void *request) {
+    return do_syscall(SYSCALL_INTF_REQUEST, (uint64_t)intf_name, (uint64_t)request, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_terminate_process(int64_t pid, int64_t exit_code) {
+    return do_syscall(SYSCALL_TERMINATE_PROCESS, (uint64_t)pid, (uint64_t)exit_code, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_terminate_thread(int64_t tid, int64_t exit_code) {
+    return do_syscall(SYSCALL_TERMINATE_THREAD, (uint64_t)tid, (uint64_t)exit_code, 0, 0, 0, 0);
+}

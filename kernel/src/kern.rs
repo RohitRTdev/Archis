@@ -17,6 +17,7 @@ mod io;
 mod object;
 mod utils;
 mod pipe;
+mod intf;
 
 #[cfg(feature = "acpi")]
 mod acpica;
@@ -1450,6 +1451,7 @@ fn kern_main() -> ! {
     fs::init();
     loader::init();
     io::init();
+    intf::init();
     //#[cfg(feature = "kunit-test")]
     //fs::load_root_fs();
 

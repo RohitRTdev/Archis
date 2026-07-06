@@ -28,5 +28,6 @@ int main(int argc, char *argv[]) {
         write_all(wh, buf);
     }
 
+    sys_close(wh);
     return 0;
 }

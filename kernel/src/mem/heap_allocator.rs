@@ -49,11 +49,52 @@ impl LinkedListAllocator {
         None
     }
 
+    // Merge the newly freed region with any address-adjacent free regions already
+    // in the list before inserting it
     fn add_free_region(&mut self, addr: usize, size: usize) {
-        let node = addr as *mut ListNode;
+        let mut merged_addr = addr;
+        let mut merged_size = size;
+
+        loop {
+            let mut prev: *mut ListNode = core::ptr::null_mut();
+            let mut current = self.head;
+            let mut merged = false;
+
+            while !current.is_null() {
+                let node = unsafe { &mut *current };
+                let node_addr = current as usize;
+                let adjacent_before = node_addr + node.size == merged_addr;
+                let adjacent_after = merged_addr + merged_size == node_addr;
+
+                if adjacent_before || adjacent_after {
+                    if adjacent_before {
+                        merged_addr = node_addr;
+                    }
+                    merged_size += node.size;
+
+                    if !prev.is_null() {
+                        unsafe { (*prev).next = node.next.take(); }
+                    } else {
+                        self.head = node.next.take().map_or(core::ptr::null_mut(), |n| n);
+                    }
+
+                    merged = true;
+                    break;
+                }
+
+                prev = current;
+                current = node.next.as_deref_mut().map_or(core::ptr::null_mut(), |n| n as *mut _);
+            }
+
+            if !merged {
+                break;
+            }
+        }
+
+        let node = merged_addr as *mut ListNode;
         unsafe {
             node.write(ListNode {
-                size,
+                size: merged_size,
                 next: self.head.as_mut()
             });
         }

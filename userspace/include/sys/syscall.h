@@ -45,7 +45,10 @@ enum syscall_t {
     SYSCALL_CHDIR,
     SYSCALL_GETCWD,
     SYSCALL_ISSUE_SIGNAL,
-    SYSCALL_SHUTDOWN
+    SYSCALL_SHUTDOWN,
+    SYSCALL_INTF_REQUEST,
+    SYSCALL_TERMINATE_PROCESS,
+    SYSCALL_TERMINATE_THREAD
 };
 
 typedef enum {
@@ -155,6 +158,43 @@ typedef struct {
     exit_info_t exit_info;
 } thread_info_t;
 
+typedef enum {
+    INTF_SYSTEM_KLOG = 0
+} intf_system_req_type_t;
+
+typedef struct {
+    uint32_t type;
+    void *buffer;
+    size_t bytes_needed;
+    size_t bytes_written;
+} intf_system_request_t;
+
+typedef enum {
+    INTF_PROCESS_GENERAL_INFO = 0,
+    INTF_PROCESS_COMMAND_LINE = 1
+} intf_process_req_type_t;
+
+typedef enum {
+    PROC_STATUS_READY = 0,
+    PROC_STATUS_SUSPENDED = 1,
+    PROC_STATUS_TERMINATED = 2
+} intf_process_status_t;
+
+typedef struct {
+    uint32_t type;
+    uint64_t pid;
+    void *buffer;
+    size_t bytes_needed;
+    size_t bytes_written;
+} intf_process_request_t;
+
+typedef struct {
+    uint64_t pid;
+    uint64_t ppid;
+    uint64_t num_threads;
+    uint8_t status;
+} intf_process_info_t;
+
 syscall_status_t sys_exit(ssize_t exit_code);
 syscall_status_t sys_close(handle_t handle);
 handle_t         sys_open(const char *type, const char *name, uint64_t flags);
@@ -203,3 +243,6 @@ syscall_status_t sys_chdir(const char *path);
 syscall_status_t sys_getcwd(char *buf, size_t buf_len, size_t *bytes_written);
 syscall_status_t sys_issue_signal(int64_t target, uint8_t signal);
 syscall_status_t sys_shutdown(boolean_t restart);
+syscall_status_t sys_intf_request(const char *intf_name, void *request);
+syscall_status_t sys_terminate_process(int64_t pid, int64_t exit_code);
+syscall_status_t sys_terminate_thread(int64_t tid, int64_t exit_code);

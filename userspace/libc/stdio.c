@@ -9,11 +9,25 @@ static void out_char(char *buf, size_t size, size_t *pos, char c) {
     (*pos)++;
 }
 
-static void out_str(char *buf, size_t size, size_t *pos, const char *s) {
+static void out_str_raw(char *buf, size_t size, size_t *pos, const char *s) {
     while (*s) out_char(buf, size, pos, *s++);
 }
 
-static void out_uint(char *buf, size_t size, size_t *pos, uint64_t val, int base, int upper, int width, int zero_pad) {
+// %s never zero-pads (that's a C standard rule), only space-pads either side.
+static void out_str(char *buf, size_t size, size_t *pos, const char *s, int width, int left_justify) {
+    int len = (int)strlen(s);
+    int pad = width - len;
+
+    if (pad > 0 && !left_justify) {
+        while (pad-- > 0) out_char(buf, size, pos, ' ');
+    }
+    out_str_raw(buf, size, pos, s);
+    if (pad > 0 && left_justify) {
+        while (pad-- > 0) out_char(buf, size, pos, ' ');
+    }
+}
+
+static void out_uint(char *buf, size_t size, size_t *pos, uint64_t val, int base, int upper, int width, int zero_pad, int left_justify) {
     char tmp[32];
     int i = 0;
     const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
@@ -27,16 +41,22 @@ static void out_uint(char *buf, size_t size, size_t *pos, uint64_t val, int base
     }
 
     int pad = width - i;
-    while (pad-- > 0) out_char(buf, size, pos, zero_pad ? '0' : ' ');
+    if (pad > 0 && !left_justify) {
+        while (pad-- > 0) out_char(buf, size, pos, zero_pad ? '0' : ' ');
+    }
     while (i--) out_char(buf, size, pos, tmp[i]);
+    if (pad > 0 && left_justify) {
+        // Left-justified fields are always space-padded, never zero-padded.
+        while (pad-- > 0) out_char(buf, size, pos, ' ');
+    }
 }
 
-static void out_int(char *buf, size_t size, size_t *pos, int64_t val, int width, int zero_pad) {
+static void out_int(char *buf, size_t size, size_t *pos, int64_t val, int width, int zero_pad, int left_justify) {
     if (val < 0) {
         out_char(buf, size, pos, '-');
-        out_uint(buf, size, pos, (uint64_t)(-val), 10, 0, width > 0 ? width - 1 : 0, zero_pad);
+        out_uint(buf, size, pos, (uint64_t)(-val), 10, 0, width > 0 ? width - 1 : 0, zero_pad, left_justify);
     } else {
-        out_uint(buf, size, pos, (uint64_t)val, 10, 0, width, zero_pad);
+        out_uint(buf, size, pos, (uint64_t)val, 10, 0, width, zero_pad, left_justify);
     }
 }
 
@@ -52,39 +72,52 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
         fmt++;
 
         int zero_pad = 0;
+        int left_justify = 0;
+        for (;;) {
+            if (*fmt == '0') { zero_pad = 1; fmt++; }
+            else if (*fmt == '-') { left_justify = 1; fmt++; }
+            else break;
+        }
+        if (left_justify) zero_pad = 0; // '-' takes precedence over '0', per C rules
+
         int width = 0;
-        if (*fmt == '0') { zero_pad = 1; fmt++; }
         while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
 
+        // Length modifiers: only the ones we actually need. 'z' (size_t) is
+        // treated the same as 'l' since size_t and uint64_t/int64_t are the
+        // same width on this target.
         int is_long = 0;
         if (*fmt == 'l') {
             is_long = 1;
             fmt++;
             if (*fmt == 'l') fmt++;
+        } else if (*fmt == 'z') {
+            is_long = 1;
+            fmt++;
         }
 
         switch (*fmt) {
             case 'd':
             case 'i': {
                 int64_t val = is_long ? va_arg(ap, int64_t) : va_arg(ap, int);
-                out_int(buf, size, &pos, val, width, zero_pad);
+                out_int(buf, size, &pos, val, width, zero_pad, left_justify);
                 break;
             }
             case 'u': {
                 uint64_t val = is_long ? va_arg(ap, uint64_t) : va_arg(ap, unsigned int);
-                out_uint(buf, size, &pos, val, 10, 0, width, zero_pad);
+                out_uint(buf, size, &pos, val, 10, 0, width, zero_pad, left_justify);
                 break;
             }
             case 'x':
             case 'X': {
                 uint64_t val = is_long ? va_arg(ap, uint64_t) : va_arg(ap, unsigned int);
-                out_uint(buf, size, &pos, val, 16, *fmt == 'X', width, zero_pad);
+                out_uint(buf, size, &pos, val, 16, *fmt == 'X', width, zero_pad, left_justify);
                 break;
             }
             case 'p': {
                 uintptr_t val = (uintptr_t)va_arg(ap, void *);
-                out_str(buf, size, &pos, "0x");
-                out_uint(buf, size, &pos, val, 16, 0, 16, 1);
+                out_str_raw(buf, size, &pos, "0x");
+                out_uint(buf, size, &pos, val, 16, 0, 16, 1, 0);
                 break;
             }
             case 'c': {
@@ -94,7 +127,7 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
             }
             case 's': {
                 const char *s = va_arg(ap, const char *);
-                out_str(buf, size, &pos, s ? s : "(null)");
+                out_str(buf, size, &pos, s ? s : "(null)", width, left_justify);
                 break;
             }
             case '%': {
