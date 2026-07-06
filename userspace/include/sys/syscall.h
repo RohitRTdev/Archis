@@ -34,10 +34,10 @@ enum syscall_t {
     SYSCALL_SEEK,
     SYSCALL_FSTAT,
     SYSCALL_READDIR,
-    SYSCALL_DELETE_FILE,
+    SYSCALL_DELETE,
     SYSCALL_RENAME_FILE,
     SYSCALL_MKDIR,
-    SYSCALL_RMDIR,
+    SYSCALL_STAT,
     SYSCALL_CREATE_FILE,
     SYSCALL_CREATE_SYMLINK,
     SYSCALL_READLINK,
@@ -82,7 +82,12 @@ typedef enum {
 #define PROCESS_SUSPEND_FLAG    ((uint64_t)1 << 0)
 #define OPEN_INHERITABLE_FLAG   ((uint64_t)1 << 0)
 #define CREATE_FILE_EXIST_FLAG  ((uint64_t)1 << 1)
+// Same bit as CREATE_FILE_EXIST_FLAG but read by sys_open("fs", ...) instead of
+// sys_create_file, with the opposite meaning: set = always truncate/create-fresh.
+#define OPEN_CREATE_FLAG        ((uint64_t)1 << 1)
 #define OPEN_WRITE_FLAG         ((uint64_t)1 << 2)
+// Read by sys_stat: set = follow a trailing symlink (like stat()), clear = don't (like lstat()).
+#define STAT_FOLLOW_FLAG        ((uint64_t)1 << 0)
 
 #define PATH_MAX (256)
 
@@ -183,10 +188,10 @@ syscall_status_t sys_get_thread_info(handle_t handle, thread_info_t *out);
 syscall_status_t sys_device_control(handle_t handle, size_t minor_code, void* command);
 handle_t         sys_create_file(const char *path, uint64_t flags);
 syscall_status_t sys_create_symlink(const char *path, const char *target);
-syscall_status_t sys_delete_file(const char *path);
+syscall_status_t sys_delete(const char *path);
 syscall_status_t sys_rename_file(const char *from, const char *to);
 syscall_status_t sys_mkdir(const char *path);
-syscall_status_t sys_rmdir(const char *path);
+syscall_status_t sys_stat(const char *path, uint64_t flags, file_stat_t *out);
 ssize_t          sys_seek(handle_t handle, ssize_t offset, seek_whence_t whence);
 syscall_status_t sys_fstat(handle_t handle, file_stat_t *out);
 syscall_status_t sys_readdir(handle_t handle, size_t offset, char *buf, size_t buf_len, size_t *bytes_written);

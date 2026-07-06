@@ -67,6 +67,8 @@ void exec_job(sh_ctx_t *ctx, job_t *job) {
             job_pgid = stage_pids[0];
         }
         else {
+            // Remaining spawned processes in this job must 
+            // be attached to the newly created process group
             sys_set_pgrp(h, job_pgid);
         }
 
@@ -140,6 +142,7 @@ void exec_job(sh_ctx_t *ctx, job_t *job) {
 
     for (int i = 0; i < total; i++) sys_wait(stage_handles[i], -1);
 
+    // Restore foreground process group back to our own process group
     sys_device_control(ctx->tty, SET_FOREGROUND_PGRP, (void *)ctx->shell_pid);
     sys_device_control(ctx->tty, SET_TTY_MODE, (void *)(size_t)(TTY_MODE_ECHO | TTY_MODE_CANON));
 

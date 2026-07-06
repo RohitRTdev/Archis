@@ -335,6 +335,7 @@ impl Process {
 
         // If this process is already a session leader or process group leader
         // we cannot allow it to create a new session
+        
         if self.session.lock().leader == Some(self.id) || 
         self.pgroup.lock().pgid == self.id {
             return false;

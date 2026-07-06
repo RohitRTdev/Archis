@@ -145,6 +145,25 @@ int printf(const char *fmt, ...) {
     return ret;
 }
 
+int vfprintf(FILE *stream, const char *fmt, va_list ap) {
+    char buf[512];
+    int ret = vsnprintf(buf, sizeof(buf), fmt, ap);
+    if (ret > 0 && stream && stream->fd >= 0) {
+        size_t bw = 0;
+        size_t len = (ret < (int)sizeof(buf)) ? (size_t)ret : sizeof(buf) - 1;
+        sys_write(stream->fd, buf, len, &bw);
+    }
+    return ret;
+}
+
+int fprintf(FILE *stream, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int ret = vfprintf(stream, fmt, ap);
+    va_end(ap);
+    return ret;
+}
+
 unsigned int sleep(unsigned int seconds) {
     uint64_t old = 0, now = 0;
     sys_get_time_ms(CLOCK_MONOTONIC, &old);
@@ -288,17 +307,17 @@ FILE *fopen(const char *path, const char *mode) {
 
     handle_t h;
     if (want_truncate) {
-        // file_exist_only=false: deletes+recreates, giving us truncation.
-        h = sys_create_file(path, 0);
+        // OPEN_CREATE_FLAG set: sys_open's "fs" handler always deletes+recreates.
+        h = sys_open("fs", path, OPEN_CREATE_FLAG);
     } else if (want_append) {
         // Open without truncating if the file already exists (preserve its
         // contents for appending); only fall back to create-fresh if it's missing.
-        h = sys_create_file(path, CREATE_FILE_EXIST_FLAG);
+        h = sys_open("fs", path, 0);
         if (h < 0) {
-            h = sys_create_file(path, 0);
+            h = sys_open("fs", path, OPEN_CREATE_FLAG);
         }
     } else {
-        h = sys_create_file(path, CREATE_FILE_EXIST_FLAG);
+        h = sys_open("fs", path, 0);
     }
     if (h < 0) return NULL;
 
@@ -428,5 +447,5 @@ void rewind(FILE *stream) {
 }
 
 int remove(const char *path) {
-    return sys_delete_file(path) == E_SUCCESS ? 0 : -1;
+    return sys_delete(path) == E_SUCCESS ? 0 : -1;
 }

@@ -64,9 +64,18 @@ impl FileInst {
             Backing::Memory { node, .. } => {
                 let g = node.lock();
                 let mut attrs = g.attrs;
-                if let NodeKind::File { data, .. } = &g.kind {
-                    attrs.size = data.len() as u64;
-                }
+                attrs.size = match &g.kind {
+                    NodeKind::File {data, .. } => {
+                        data.len() as u64
+                    },
+                    NodeKind::Dir {children, .. } => {
+                        children.len() as u64
+                    },
+                    NodeKind::Symlink { target } => {
+                        target.len() as u64
+                    }
+                };
+
                 attrs
             }
             Backing::Module { .. } => {

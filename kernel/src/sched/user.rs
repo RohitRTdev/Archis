@@ -26,6 +26,7 @@ const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 const OPEN_INHERITABLE_FLAG: u64 = 1 << 0;
 pub const OPEN_CREATE_FLAG: u64 = 1 << 1;
 pub const OPEN_WRITE_FLAG: u64 = 1 << 2;
+const STAT_FOLLOW_FLAG: u64 = 1 << 0;
 
 const SYNC_TYPE_SEMAPHORE: u64 = 0;
 const SYNC_TYPE_EVENT: u64 = 1;
@@ -67,10 +68,10 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_seek_handler,
     sys_fstat_handler,
     sys_readdir_handler,
-    sys_delete_file_handler,
+    sys_delete_handler,
     sys_rename_file_handler,
     sys_mkdir_handler,
-    sys_rmdir_handler,
+    sys_stat_handler,
     sys_create_file_handler,
     sys_create_symlink_handler,
     sys_readlink_handler,
@@ -1145,7 +1146,7 @@ fn sys_readdir_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 }
 
 // arg0 = path ptr
-fn sys_delete_file_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+fn sys_delete_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let path = match read_user_string(args[0] as usize) {
         Some(s) if !s.is_empty() => s,
         Some(_) => return E_INVALID,
@@ -1188,17 +1189,30 @@ fn sys_mkdir_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     }
 }
 
-// arg0 = path ptr
-fn sys_rmdir_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+// arg0 = path ptr, arg1 = flags, arg2 = ptr to file_stat_t
+fn sys_stat_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let path = match read_user_string(args[0] as usize) {
         Some(s) if !s.is_empty() => s,
         Some(_) => return E_INVALID,
         None => return E_INVALID_MEMORY_RANGE
     };
-    match crate::fs::delete(&path) {
-        Ok(()) => E_SUCCESS,
-        Err(e) => e.into()
+    let follow = args[1] & STAT_FOLLOW_FLAG != 0;
+    let attrs = if follow {
+        match crate::fs::stat(&path) {
+            Ok(a) => a,
+            Err(e) => return e.into()
+        }
+    } else {
+        match crate::fs::lstat(&path) {
+            Ok((a, _)) => a,
+            Err(e) => return e.into()
+        }
+    };
+    let stat = FileStat { size: attrs.size, mode: attrs.mode, handle_type: HandleStatType::File };
+    if mem::copy_to_user(args[2] as usize, &stat as *const FileStat as *const u8, size_of::<FileStat>()).is_err() {
+        return E_INVALID_MEMORY_RANGE;
     }
+    E_SUCCESS
 }
 
 // arg0 = path ptr, arg1 = flags 

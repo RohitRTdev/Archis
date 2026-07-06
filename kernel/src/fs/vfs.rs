@@ -241,7 +241,11 @@ impl Vfs {
         if comps.is_empty() {
             let g = cur.lock();
             let mut attrs = g.attrs;
-            if let NodeKind::File { data, .. } = &g.kind { attrs.size = data.len() as u64; }
+            match &g.kind {
+                NodeKind::File { data, .. } => attrs.size = data.len() as u64,
+                NodeKind::Dir { children, .. } => attrs.size = children.len() as u64,
+                NodeKind::Symlink { target } => attrs.size = target.len() as u64
+            }
             return Ok(ProbeStep::Found { attrs, symlink_target: None });
         }
 
@@ -281,8 +285,8 @@ impl Vfs {
                 let mut attrs = g.attrs;
                 let symlink_target = match &g.kind {
                     NodeKind::File { data, .. } => { attrs.size = data.len() as u64; None }
-                    NodeKind::Dir { .. } => None,
-                    NodeKind::Symlink { target } => Some(target.clone())
+                    NodeKind::Dir { children, .. } => { attrs.size = children.len() as u64; None }
+                    NodeKind::Symlink { target } => { attrs.size = target.len() as u64; Some(target.clone()) }
                 };
                 return Ok(ProbeStep::Found { attrs, symlink_target });
             }

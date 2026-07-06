@@ -46,6 +46,7 @@ impl Drop for OpenDeviceHandleInner {
             },
             _ => {}
         }
+        kernel_intf::debug!("Issuing close request");
         let _ = io_request_sync(&self.dev, IrpMajor::Close, IrpMinor::None, EMPTY_REGION, 0, None, false);
     }
 }

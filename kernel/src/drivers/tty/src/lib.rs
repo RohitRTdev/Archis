@@ -43,6 +43,7 @@ struct TtyCtx {
     input_ring:  RingBuffer<u8, INPUT_BUF_SIZE>,
     pending:     [PendingEntry; MAX_PENDING],
     pending_len: usize,
+    open_count:  usize,
     enabled:     bool,
     mode:        u8,
     job:         TtyJobInfo
@@ -58,6 +59,7 @@ impl TtyCtx {
             input_ring:  RingBuffer::new(0u8),
             pending:     [PendingEntry { irp: null_mut(), requested: 0 }; MAX_PENDING],
             pending_len: 0,
+            open_count:  0,
             enabled:     false,
             mode:        TTY_MODE_CANON | TTY_MODE_ECHO,
             job:         TtyJobInfo { session: 0, pgrp: 0 }
@@ -200,12 +202,11 @@ fn dispatch_open(device: &DeviceObject, request: &mut Irp) -> Status {
     if !device.ctx.is_null() {
         let ctx = unsafe { &mut *(device.ctx as *mut TtyCtx) };
         acquire_spinlock(&mut ctx.lock);
-        let already_enabled = ctx.enabled;
-        if !already_enabled {
-            ctx.enabled = true;
-        }
-        if !already_enabled {
+        let enable = ctx.open_count == 0;
+        ctx.open_count += 1;
+        if enable {
             enable_tty_mode();
+            ctx.enabled = true;
         }
         release_spinlock(&mut ctx.lock);
     }
@@ -218,12 +219,11 @@ fn dispatch_close(device: &DeviceObject, request: &mut Irp) -> Status {
     if !device.ctx.is_null() {
         let ctx = unsafe { &mut *(device.ctx as *mut TtyCtx) };
         acquire_spinlock(&mut ctx.lock);
-        let was_enabled = ctx.enabled;
-        if was_enabled {
-            ctx.enabled = false;
-        }
-        if was_enabled {
+        let disable = ctx.open_count == 1;
+        ctx.open_count -= 1;
+        if disable {
             disable_tty_mode();
+            ctx.enabled = false;
         }
         release_spinlock(&mut ctx.lock);
     }
@@ -383,36 +383,25 @@ fn dispatch_control(device: &DeviceObject, request: &mut Irp) -> Status {
 
     match request.minor_code {
         IrpMinor::SetForegroundPgrp => {
-            let cur_session = ctx.job.session;
+            let cur_pgrp = ctx.job.pgrp;
 
-            // Only the session leader of the controlling tty can set the foreground process group
-            // We check if the session is active since it could be case that all processes from old session are dead
-            // In this case, tty allows a new session leader to set the foreground process group
-            if cur_session != 0 {
-                if proc_is_session_active(cur_session) {
-                    if !proc_is_session_leader(cur_pid, cur_session) {
-                        info!("Process that is not session leader tried to set foreground process group!");
-                        release_spinlock(&mut ctx.lock);
-                        request.complete_irp(Status::Failed);
-                        return Status::Failed;
-                    }
-                } 
-                else {
-                    // We don't have a session that owns this tty yet, so fail the request
-                    info!("No session owns tty yet. Try issuing CTTY request first");
-                    release_spinlock(&mut ctx.lock);
-                    request.complete_irp(Status::Failed);
-                    return Status::Failed;
-                }
+            // Only a process from the current active foreground process group may set
+            // the new foreground process group 
+            if cur_pgrp != 0 && 
+            proc_is_pgrp_active(cur_pgrp) && 
+            !proc_is_foreground_pgrp(cur_pid, cur_pgrp) {
+                info!("Process that is not within foreground process group tried to set foreground process group!");
+                release_spinlock(&mut ctx.lock);
+                request.complete_irp(Status::Failed);
+                return Status::Failed;
             }
 
             // Get the process group for the process that the caller requested
             let new_pgrp = if info.pid != 0 { proc_get_pgrp(info.pid) } else { 0 };
-            let old_pgrp = ctx.job.pgrp;
             ctx.job.pgrp = new_pgrp;
 
-            if old_pgrp != 0 {
-                proc_drop_pgrp(old_pgrp);
+            if cur_pgrp != 0 {
+                proc_drop_pgrp(cur_pgrp);
             }
         },
         IrpMinor::SetControllingTty => {
@@ -440,7 +429,7 @@ fn dispatch_control(device: &DeviceObject, request: &mut Irp) -> Status {
                 request.complete_irp(Status::Failed);
                 return Status::Failed;
             }
-        }
+        },
         IrpMinor::SetTtyMode => {
             // Only the foreground process group may change the tty's mode
             let fgrp = ctx.job.pgrp;

@@ -122,8 +122,8 @@ syscall_status_t sys_create_symlink(const char *path, const char *target) {
     return do_syscall(SYSCALL_CREATE_SYMLINK, (uint64_t)path, (uint64_t)target, 0, 0, 0, 0);
 }
 
-syscall_status_t sys_delete_file(const char *path) {
-    return do_syscall(SYSCALL_DELETE_FILE, (uint64_t)path, 0, 0, 0, 0, 0);
+syscall_status_t sys_delete(const char *path) {
+    return do_syscall(SYSCALL_DELETE, (uint64_t)path, 0, 0, 0, 0, 0);
 }
 
 syscall_status_t sys_rename_file(const char *from, const char *to) {
@@ -134,8 +134,8 @@ syscall_status_t sys_mkdir(const char *path) {
     return do_syscall(SYSCALL_MKDIR, (uint64_t)path, 0, 0, 0, 0, 0);
 }
 
-syscall_status_t sys_rmdir(const char *path) {
-    return do_syscall(SYSCALL_RMDIR, (uint64_t)path, 0, 0, 0, 0, 0);
+syscall_status_t sys_stat(const char *path, uint64_t flags, file_stat_t *out) {
+    return do_syscall(SYSCALL_STAT, (uint64_t)path, flags, (uint64_t)out, 0, 0, 0);
 }
 
 ssize_t sys_seek(handle_t handle, ssize_t offset, seek_whence_t whence) {

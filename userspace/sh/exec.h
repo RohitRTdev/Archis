@@ -5,6 +5,7 @@
 typedef struct {
     handle_t tty;
     size_t shell_pid;
+    int is_session_leader;
     bg_job_t bg_jobs[SH_MAX_BG_JOBS];
 } sh_ctx_t;
 

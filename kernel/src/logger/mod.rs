@@ -78,14 +78,14 @@ extern "C" fn tty_print_ffi(s: *const u8, len: usize) {
 pub extern "C" fn enable_tty_mode_ffi() {
     if PANIC_MODE.load(Ordering::Acquire) { return; }
     IS_TTY_MODE.store(true, Ordering::Release);
-    //FRAMEBUFFER_LOGGER.lock().clear_screen();
+    FRAMEBUFFER_LOGGER.lock().clear_screen();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn disable_tty_mode_ffi() {
     if PANIC_MODE.load(Ordering::Acquire) { return; }
     IS_TTY_MODE.store(false, Ordering::Release);
-    //FRAMEBUFFER_LOGGER.lock().clear_screen();
+    FRAMEBUFFER_LOGGER.lock().clear_screen();
 }
 
 pub fn init() {

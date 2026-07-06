@@ -29,7 +29,7 @@ static void run_job(sh_ctx_t *ctx, job_t *job) {
 
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
-    printf("Starting shell process!\n");
+    printf("sh: Starting shell process!\n");
 
     sh_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -42,19 +42,28 @@ int main(int argc, char *argv[]) {
 
     ctx.shell_pid = (size_t)sys_get_pid();
 
-    if (sys_set_session_leader(-1) < 0) {
-        printf("sh: Unable to create new session!\n");
-        return -1;
-    }
+    // Only the first/top-level sh (the one init spawns) should try to become a
+    // session leader and take over the controlling tty. A nested sh launched
+    // from an interactive prompt is already a process-group leader for its own
+    // job by the time it gets here
+    int is_session_leader = sys_create_sync_object(SYNC_EVENT, 0, 0, 0, 0, "sh.session_leader") >= 0;
+    ctx.is_session_leader = is_session_leader;
 
-    if (sys_device_control(ctx.tty, SET_CTTY, (void *)ctx.shell_pid) < 0) {
-        printf("sh: Unable to set controlling tty for this session!\n");
-        return -1;
-    }
+    if (is_session_leader) {
+        if (sys_set_session_leader(-1) < 0) {
+            printf("sh: Unable to create new session!\n");
+            return -1;
+        }
 
-    if (sys_device_control(ctx.tty, SET_FOREGROUND_PGRP, (void *)ctx.shell_pid) < 0) {
-        printf("sh: Unable to set sh as foreground process!\n");
-        return -1;
+        if (sys_device_control(ctx.tty, SET_CTTY, (void *)ctx.shell_pid) < 0) {
+            printf("sh: Unable to set controlling tty for this session!\n");
+            return -1;
+        }
+
+        if (sys_device_control(ctx.tty, SET_FOREGROUND_PGRP, (void *)ctx.shell_pid) < 0) {
+            printf("sh: Unable to set sh as foreground process!\n");
+            return -1;
+        }
     }
 
     set_signal_handler(SIGINT, sigint_handler, 0);
