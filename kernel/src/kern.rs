@@ -261,7 +261,7 @@ fn run_cancel_tests() {
     sched::delay_ms(2000, false);
     let tid = killer_target.lock().get_id();
     info!("cancel test (a): killing thread {}", tid);
-    sched::kill_thread(tid, ExitInfo::normal(0));
+    sched::kill_thread(tid, ExitInfo::normal(0), false);
     sched::delay_ms(500, false);
 
     // per-handle self-cancellation

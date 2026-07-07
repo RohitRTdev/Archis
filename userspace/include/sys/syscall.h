@@ -191,6 +191,8 @@ typedef struct {
 typedef struct {
     uint64_t pid;
     uint64_t ppid;
+    uint64_t pgid;
+    uint64_t sid;
     uint64_t num_threads;
     uint8_t status;
 } intf_process_info_t;

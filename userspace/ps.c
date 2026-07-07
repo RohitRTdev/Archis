@@ -41,7 +41,7 @@ int main(void) {
         return 1;
     }
 
-    printf("PID   PPID  THR STAT CMD\n");
+    printf("PID   PPID  PGID  SID  THR STAT CMD\n");
     if (req.bytes_needed == 0) {
         return 0;
     }
@@ -61,8 +61,9 @@ int main(void) {
 
     size_t count = req.bytes_written / sizeof(intf_process_info_t);
     for (size_t i = 0; i < count; i++) {
-        printf("%-5llu %-5llu %-3llu %-4s ",
+        printf("%-5llu %-5llu %-5llu %-5llu %-3llu %-4s ",
             (unsigned long long)procs[i].pid, (unsigned long long)procs[i].ppid,
+            (unsigned long long)procs[i].pgid, (unsigned long long)procs[i].sid,
             (unsigned long long)procs[i].num_threads, status_str(procs[i].status));
         print_cmdline(procs[i].pid);
         printf("\n");

@@ -479,7 +479,7 @@ pub fn io_request_sync(
             &mut result as *mut IrpResult,
             None,
             core::ptr::null_mut()
-        )
+        )?
     };
 
     if let Some(info) = req_info {
@@ -532,7 +532,7 @@ pub fn io_request_async(
             core::ptr::null_mut(),
             Some(routine),
             ctx
-        )
+        )?
     };
 
     if let Some(info) = req_info {

@@ -132,6 +132,8 @@ pub struct Task {
     arg_context: *mut c_void,
     exit_reason: AtomicU8,
     exit_code: AtomicIsize,
+    pending_kill: bool,
+    is_safe_to_kill: bool,
     pending_signals: u8,
     completed_signals: u8,
     signal_frame_pending: [Option<SignalFrame>; MAX_SIGNALS], 
@@ -182,6 +184,8 @@ impl Task {
             arg_context: null_mut(),
             exit_reason: AtomicU8::new(ExitReason::Normal as u8),
             exit_code: AtomicIsize::new(0),
+            pending_kill: false,
+            is_safe_to_kill: false,
             pending_signals: 0,
             completed_signals: 0,
             signal_frame_pending: [None; MAX_SIGNALS],
@@ -289,6 +293,17 @@ impl Task {
         else {
             let sig_frame = self.signal_frame_pending[signal as usize].as_ref().expect("Failed to get sig_frame despite pending signal set");
             sig_frame.is_in_syscall
+        }
+    }
+
+    fn effective_kernel_mode(&self) -> bool {
+        let signal = get_highest_set_bit(self.pending_signals);
+        if signal == -1 {
+            self.is_kernel_mode
+        }
+        else {
+            let sig_frame = self.signal_frame_pending[signal as usize].as_ref().expect("Failed to get sig_frame despite pending signal set");
+            sig_frame.is_kernel_mode
         }
     }
 
@@ -585,7 +600,13 @@ pub fn add_cur_task_to_wait_queue(wait_semaphore: KSemInnerType, timeout: Option
     if task.status == TaskStatus::Terminated {
         return Some(SignalCause::Normal);
     }
-    
+
+    // This task is marked to die — refuse to let it block on a new wait so it keeps
+    // unwinding toward a point the scheduler can safely finalize the kill at.
+    if is_interruptible && task.pending_kill {
+        return Some(SignalCause::Interruption);
+    }
+
     // If a task goes back to interruptible wait state
     // before we started executing the signal handler
     // then interrupt that too
@@ -706,14 +727,13 @@ fn remove_timer_from_task_queue(sched_cb: &mut TaskQueue, id: usize) {
 // Note that there is no stack unwinding destructor calls to avoid this problem within the kernel
 // Doing stack unwinding for every process/task destruction is not practical and can cause lot
 // of bookkeeping and performance issues
-pub fn kill_thread(task_id: usize, exit_info: ExitInfo) {
-    let mut yield_flag = false;
-    let mut drop_task  = false;
-    let mut skip_notify  = false;
-
-
+//
+// forced_kill=false routes a user thread through safe_kill_thread() instead of the immediate
+// logic below: it only marks the task for death. 
+// The scheduler finalizes the kill once the task's context is provably back in user mode.
+pub fn kill_thread(task_id: usize, exit_info: ExitInfo, forced_kill: bool) {
     let this_task = get_task_info(task_id);
-    
+
     #[cfg(not(feature = "kunit-test"))]
     {
         let target_proc = this_task
@@ -727,15 +747,27 @@ pub fn kill_thread(task_id: usize, exit_info: ExitInfo) {
             .get_id();
 
         assert!(target_proc_id != 0, "Attempted to kill system thread!");
-    } 
+    }
 
     if this_task.is_none() {
         return;
     }
 
     let this_task  = this_task.unwrap();
+
+    let is_user = this_task.lock().get_process()
+        .map_or(false, |p| p.lock().get_user_flag());
+
+    if !forced_kill && is_user {
+        safe_kill_thread(this_task, exit_info, task_id);
+        return;
+    }
+
+    let mut yield_flag = false;
+    let mut drop_task  = false;
+    let mut skip_notify  = false;
     let core = this_task.lock().core;
-    
+
     disable_preemption();
     let sweep_irps;
     {
@@ -848,6 +880,67 @@ pub fn kill_thread(task_id: usize, exit_info: ExitInfo) {
     }
 }
 
+// Marks a user thread for death but defers finalization to a safe point
+fn safe_kill_thread(this_task: KThread, exit_info: ExitInfo, task_id: usize) {
+    let wait_semaphore = {
+        let mut task = this_task.lock();
+
+        // Already dying via some other path — nothing further to do
+        if task.status == TaskStatus::Terminated || task.pending_kill {
+            return;
+        }
+
+        task.exit_reason.store(exit_info.reason as u8, Ordering::Relaxed);
+        task.exit_code.store(exit_info.code, Ordering::Relaxed);
+
+        // Mark the thread as dying
+        task.pending_kill = true;
+
+        if task.status == TaskStatus::WaitingInterruptible {
+            Some((**task.wait_semaphores.first()
+                .expect("WaitingInterruptible task has no wait semaphore!")).clone())
+        } else {
+            None
+        }
+        // Active, Running, Waiting, Suspended: pending_kill is already set above and that's
+        // all that's needed — the scheduler catches it next time it examines this task.
+    };
+
+    kill_sweep_irps(&this_task);
+
+    if let Some(sem) = wait_semaphore {
+        KSem::from(sem).signal_task_interrupted(task_id);
+    }
+}
+
+// Called right before syscall_dispatcher returns to userspace.
+// The syscall that just ran has already fully returned — its whole Rust call stack, and
+// anything that was on it, already unwound normally — so if this thread has a pending kill,
+// this is a safe point to finalize it regardless of what the CPU's privilege mode literally
+// says. Marks Task::is_safe_to_kill and yields immediately (this call does not return in that
+// case) so the very next scheduler pass finalizes the kill, rather than waiting for a periodic
+// tick that a tight syscall-polling loop could keep sampling mid-syscall indefinitely.
+pub fn check_pending_kill_at_syscall_exit() {
+    let task = match get_current_task() {
+        Some(t) => t,
+        None => return,
+    };
+
+    let has_pending_kill = {
+        let mut guard = task.lock();
+        if guard.pending_kill {
+            guard.is_safe_to_kill = true;
+            true
+        } else {
+            false
+        }
+    };
+
+    if has_pending_kill {
+        yield_cpu();
+    }
+}
+
 extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
     disable_preemption();
     let status = unsafe { (*irp).status };
@@ -906,9 +999,14 @@ pub fn allocate_irp(
     completion_result_ptr: *mut IrpResult,
     user_completion_routine: Option<extern "C" fn(*const IrpResult, *mut c_void)>,
     user_completion_ctx: *mut c_void
-) -> IrpPtr {
+) -> Result<IrpPtr, KError> {
     disable_preemption();
     let cur_thread = get_current_task().expect("Called allocate_irp() from idle task!");
+    let mut guard = cur_thread.lock();
+    if guard.status == TaskStatus::Terminated || guard.pending_kill {
+        enable_preemption();
+        return Err(KError::ThreadTerminated);
+    }
 
     // Create the context and irp
     let actx = Box::into_raw_with_allocator(Box::new_in(
@@ -941,7 +1039,7 @@ pub fn allocate_irp(
     let device_field = ptr as usize;
 
     let mut irp_box = Box::new_in(
-        Irp::new(major, buffer, offset, io_complete, actx as *mut c_void, device_field, cur_thread.lock().get_id()),
+        Irp::new(major, buffer, offset, io_complete, actx as *mut c_void, device_field, guard.get_id()),
         PoolAllocatorGlobal
     );
     irp_box.minor_code = minor;
@@ -951,10 +1049,10 @@ pub fn allocate_irp(
     device.get_pending_irps().lock().add_node(irp_raw)
         .expect("Failed to register IRP with device pending list");
 
-    cur_thread.lock().register_irp(IssuedIrp { irp: irp_raw, device });
+    guard.register_irp(IssuedIrp { irp: irp_raw, device });
     enable_preemption();
 
-    irp_raw
+    Ok(irp_raw)
 }
  
 pub fn cancel_irp(irp_ptr: IrpPtr, dev: &DeviceObjectK) {
@@ -992,7 +1090,7 @@ pub fn exit_thread(exit_info: ExitInfo) -> ! {
 
     assert!(is_preemption_enabled(), "exit_thread() called with preemption disabled!");
 
-    kill_thread(thread_id, exit_info);
+    kill_thread(thread_id, exit_info, true);
 
     panic!("exit_thread() unreachable reached!!");
 }
@@ -1536,10 +1634,36 @@ fn check_and_execute_signal_handler(task: &mut Task, new_schedule: bool) -> bool
 }
 
 
+// Pops the next viable candidate off active_tasks, reaping (into terminated_tasks) any whose
+// pending kill can now be safely finalized — i.e. its saved context is already user-mode, so
+// nothing kernel-side can be live on its stack — along the way. None of these candidates are
+// currently executing anywhere, so no leftover_stack/flip_flop handling is needed here; that's
+// only required for the currently-running task on this core (handled directly in schedule()).
+// Their IRPs were already swept by safe_kill_thread when pending_kill was first set, so there's
+// nothing further to clean up here beyond the list bookkeeping.
+fn pop_next_active_task(sched_cb: &mut TaskQueue) -> Option<NonNull<ListNode<KThread>>> {
+    loop {
+        let candidate = sched_cb.active_tasks.first().map(NonNull::from)?;
+
+        let mut candidate_info = unsafe { candidate.as_ref().lock() };
+        if candidate_info.pending_kill && (candidate_info.is_safe_to_kill || !candidate_info.effective_kernel_mode()) {
+            candidate_info.status = TaskStatus::Terminated;
+            crate::sched_log!("Reaping task {} from active_tasks (pending kill, now safe)", candidate_info.id);
+            drop(candidate_info);
+
+            let node = unsafe { ListNode::into_inner(sched_cb.active_tasks.remove_node(candidate)) };
+            sched_cb.terminated_tasks.insert_node_at_tail(node);
+            continue;
+        }
+
+        return Some(candidate);
+    }
+}
+
 // Main scheduler loop
 pub fn schedule() {
     let (
-        notifier_list, 
+        notifier_list,
         timer_notifier_list,
         cleanup_work_list
     ) = {
@@ -1565,16 +1689,15 @@ pub fn schedule() {
 
                 task_info.quanta = task_info.quanta.saturating_sub(1);
                 let old_vcb = task_info.vcb.expect("VCB is none");
-                
+
+                let pending_kill_ready = task_info.pending_kill && (task_info.is_safe_to_kill || !task_info.effective_kernel_mode());
+
                 // Switch to new task
-                if task_info.status == TaskStatus::Waiting || task_info.status == TaskStatus::WaitingInterruptible || 
-                task_info.status == TaskStatus::Terminated || task_info.status == TaskStatus::Suspended || 
-                task_info.quanta == 0 {
-                    // First choose new task
-                    // We create NonNull here so that the node can later be removed
-                    let head_task = sched_cb.active_tasks.first().and_then(|item| {
-                        Some(NonNull::from(item))
-                    });
+                if task_info.status == TaskStatus::Waiting || task_info.status == TaskStatus::WaitingInterruptible ||
+                task_info.status == TaskStatus::Terminated || task_info.status == TaskStatus::Suspended ||
+                task_info.quanta == 0 || pending_kill_ready {
+                    // First choose new task (reaping any pending-kill candidates along the way)
+                    let head_task = pop_next_active_task(&mut sched_cb);
 
                     // We have a new task to switch to
                     if head_task.is_some() {
@@ -1606,7 +1729,16 @@ pub fn schedule() {
                             ListNode::into_inner(sched_cb.active_tasks.remove_node(head_task.unwrap()))
                         };
 
-                        if task_info.status == TaskStatus::Waiting || task_info.status == TaskStatus::WaitingInterruptible {
+                        if pending_kill_ready {
+                            task_info.status = TaskStatus::Terminated;
+                            crate::sched_log!("Adding task {} to terminated list (pending kill, now safe)", task_info.id);
+                            // This stack is what the CPU is executing on right now — defer its reclaim
+                            let stack = take(task_info.stack.as_mut().unwrap());
+                            sched_cb.leftover_stack.add_node(stack).expect("Unable to add stack node to leftover_stack list!");
+                            sched_cb.flip_flop = true;
+                            sched_cb.terminated_tasks.insert_node_at_tail(current_task);
+                        }
+                        else if task_info.status == TaskStatus::Waiting || task_info.status == TaskStatus::WaitingInterruptible {
                             sched_cb.waiting_tasks.insert_node_at_tail(current_task);
                         }
                         else if task_info.status == TaskStatus::Terminated {
@@ -1635,17 +1767,25 @@ pub fn schedule() {
                     }
                     else {
                         // No more tasks left. Check if we can continue running same task
-                        if task_info.status != TaskStatus::Running {
+                        if task_info.status != TaskStatus::Running || pending_kill_ready {
                             if !check_and_save_signal_handler(&mut *task_info) {
                                 task_info.context = fetch_context();
-                                
-                                #[cfg(target_arch = "x86_64")] 
+
+                                #[cfg(target_arch = "x86_64")]
                                 {
                                     task_info.per_cpu_base = get_per_cpu_base();
                                 }
                             }
 
-                            if task_info.status == TaskStatus::Waiting || task_info.status == TaskStatus::WaitingInterruptible {
+                            if pending_kill_ready {
+                                task_info.status = TaskStatus::Terminated;
+                                crate::sched_log!("Adding task {} to terminated list (pending kill, now safe)", task_info.id);
+                                let stack = take(task_info.stack.as_mut().unwrap());
+                                sched_cb.leftover_stack.add_node(stack).expect("Unable to add stack node to leftover_stack list!");
+                                sched_cb.flip_flop = true;
+                                sched_cb.terminated_tasks.insert_node_at_tail(current_task);
+                            }
+                            else if task_info.status == TaskStatus::Waiting || task_info.status == TaskStatus::WaitingInterruptible {
                                 sched_cb.waiting_tasks.insert_node_at_tail(current_task);
                             }
                             else if task_info.status == TaskStatus::Terminated {
@@ -1673,9 +1813,8 @@ pub fn schedule() {
             }
             else {
                 // This means we're in idle task. Check and run any active tasks
-                let head_task = sched_cb.active_tasks.first().and_then(|item| {
-                    Some(NonNull::from(item))
-                });
+                // (reaping any pending-kill candidates along the way)
+                let head_task = pop_next_active_task(&mut sched_cb);
 
                 if head_task.is_some() {
                     let mut head_task_info = unsafe {
@@ -2002,7 +2141,7 @@ pub fn issue_signal_to_thread(tid: usize, signal: u8) {
         drop(task);
         drop(proc);
         enable_preemption();
-        kill_process(pid, ExitInfo::signal(signal));
+        kill_process(pid, ExitInfo::signal(signal), false);
     }
     else {
         let SignalHandler { user_ctx, handler } = handler_opt.unwrap();
@@ -2071,7 +2210,7 @@ pub fn issue_signal(pid: usize, signal: u8) {
         drop(_guard);
         drop(sig_guard);
         enable_preemption();
-        kill_process(pid, ExitInfo::signal(signal));
+        kill_process(pid, ExitInfo::signal(signal), false);
     }
     else {
         // We have found an eligible thread to issue the signal to
@@ -2146,7 +2285,7 @@ pub fn complete_signal() -> ! {
     drop(this_proc);
     enable_preemption();
     if let Some(sig) = kill_signal {
-        kill_process(pid, ExitInfo::signal(sig));
+        kill_process(pid, ExitInfo::signal(sig), false);
     }
 
     yield_cpu();
@@ -2382,7 +2521,7 @@ extern "C" fn sched_exit_thread_ffi(exit_info: ExitInfo) -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn sched_kill_thread_ffi(thread_id: usize, exit_info: ExitInfo) {
-    kill_thread(thread_id, exit_info)
+    kill_thread(thread_id, exit_info, false)
 }
 
 // Do not call this function from interrupt context

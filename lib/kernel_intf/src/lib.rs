@@ -88,6 +88,7 @@ pub enum KError {
     OutOfMemory,
     ProcessTerminated,
     ProcessInitFailed,
+    ThreadTerminated,
     WaitFailed,
     WaitTimedOut,
     WaitInterrupted,
@@ -137,6 +138,7 @@ pub const E_NO_DIR_ENTRIES: i64 = -21;
 pub const E_IS_SYMLINK: i64     = -22;
 pub const E_DEVICE_MOUNTED: i64     = -23;
 pub const E_FS_STOPPED: i64         = -24;
+pub const E_THREAD_TERMINATED: i64  = -25;
 
 impl<T> From<Result<T, KError>> for KError {
     fn from(e: Result<T, KError>) -> Self {
@@ -155,6 +157,7 @@ impl From<KError> for i64 {
             KError::DeviceRemoved => E_DEV_REMOVED,
             KError::DeviceStarted => E_DEV_STARTED,
             KError::ProcessTerminated => E_PROCESS_TERMINATED,
+            KError::ThreadTerminated => E_THREAD_TERMINATED,
             KError::WaitInterrupted => E_WAIT_INTERRUPTED,
             KError::WaitTimedOut => E_TIMEOUT,
             KError::WaitFailed | KError::CircularDependency | KError::DriverLoadFailed |
@@ -186,6 +189,7 @@ impl From<i64> for KError {
             E_DEV_REMOVED => KError::DeviceRemoved,
             E_DEV_STARTED => KError::DeviceStarted,
             E_PROCESS_TERMINATED => KError::ProcessTerminated,
+            E_THREAD_TERMINATED => KError::ThreadTerminated,
             E_WAIT_INTERRUPTED => KError::WaitInterrupted,
             E_TIMEOUT => KError::WaitTimedOut,
             E_NOT_FOUND => KError::NotFound,
@@ -212,6 +216,7 @@ impl fmt::Display for KError {
             KError::InvalidArgument => "Invalid argument",
             KError::OutOfMemory => "Out of memory",
             KError::ProcessTerminated => "Process terminated",
+            KError::ThreadTerminated => "Thread terminated",
             KError::ProcessInitFailed => "Process init failed",
             KError::WaitFailed => "Wait failed",
             KError::WaitTimedOut => "Wait timed out",
@@ -377,6 +382,7 @@ unsafe extern "C" {
     fn proc_drop_session_ffi(val: SessionType);
     fn proc_is_session_active_ffi(val: SessionType) -> bool;
     fn proc_is_session_leader_ffi(pid: usize, val: SessionType) -> bool;
+    fn proc_is_in_session_ffi(pid: usize, val: SessionType) -> bool;
     fn proc_get_pgrp_ffi(pid: usize) -> ProcessGroupType;
     fn proc_drop_pgrp_ffi(val: ProcessGroupType);
     fn proc_is_pgrp_active_ffi(val: ProcessGroupType) -> bool;
@@ -595,6 +601,10 @@ pub fn proc_is_session_active(val: SessionType) -> bool {
 
 pub fn proc_is_session_leader(pid: usize, val: SessionType) -> bool {
     unsafe { proc_is_session_leader_ffi(pid, val) }
+}
+
+pub fn proc_is_in_session(pid: usize, val: SessionType) -> bool {
+    unsafe { proc_is_in_session_ffi(pid, val) }
 }
 
 pub fn proc_get_pgrp(pid: usize) -> ProcessGroupType {

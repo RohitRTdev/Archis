@@ -20,6 +20,8 @@ struct IntfProcessRequest {
 struct IntfProcessInfo {
     pid: u64,
     ppid: u64,
+    pgid: u64,
+    sid: u64,
     num_threads: u64,
     status: u8
 }
@@ -52,6 +54,8 @@ fn handle_general_info(req: &mut IntfProcessRequest) -> Result<(), KError> {
     let entries: Vec<IntfProcessInfo> = snapshot.iter().map(|s| IntfProcessInfo {
         pid: s.id as u64,
         ppid: s.ppid as u64,
+        pgid: s.pgid as u64,
+        sid: s.sid as u64,
         num_threads: s.num_threads as u64,
         status: match s.status {
             ProcessStatus::Ready => 0,

@@ -298,15 +298,22 @@ pub extern "C" fn user_thread_init_handler() -> ! {
 pub fn syscall_dispatcher(syscall_number: u64, syscall_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     if syscall_number as usize >= MAX_SYSCALLS {
         return E_INVALID;
-    } 
+    }
 
-    SYSCALL_TABLE[syscall_number as usize](syscall_args)
+    let result = SYSCALL_TABLE[syscall_number as usize](syscall_args);
+
+    // The syscall we just ran has fully returned — a safe point to finalize a pending kill
+    // immediately if one is set, rather than waiting for the scheduler to eventually catch
+    // this thread in user mode on its own 
+    check_pending_kill_at_syscall_exit();
+
+    result
 }
 
 fn sys_exit_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let id = get_current_process_id().expect("Called sys_exit_handler from idle task!");
 
-    kill_process(id, ExitInfo::normal(args[0] as isize));
+    kill_process(id, ExitInfo::normal(args[0] as isize), true);
 
     E_SUCCESS
 }
@@ -314,7 +321,7 @@ fn sys_exit_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 fn sys_thread_exit_handler(_args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     let id = get_current_task_id().expect("Called sys_thread_exit_handler from idle task!");
 
-    kill_thread(id, ExitInfo::normal(0));
+    kill_thread(id, ExitInfo::normal(0), true);
 
     E_SUCCESS
 }
@@ -793,7 +800,7 @@ fn sys_terminate_process_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
     if proc::get_process_info(pid).is_none() {
         return E_NOT_FOUND;
     }
-    kill_process(pid, ExitInfo::normal(args[1] as i64 as isize));
+    kill_process(pid, ExitInfo::normal(args[1] as i64 as isize), false);
     E_SUCCESS
 }
 
@@ -816,7 +823,7 @@ fn sys_terminate_thread_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
         // Do not allow userspace to kill process 0 
         return E_NOPERM;
     }
-    kill_thread(tid, ExitInfo::normal(args[1] as i64 as isize));
+    kill_thread(tid, ExitInfo::normal(args[1] as i64 as isize), false);
     E_SUCCESS
 }
 

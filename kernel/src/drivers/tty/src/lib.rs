@@ -6,7 +6,7 @@ use core::ptr::null_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_intf::{
-    Lock, ProcessGroupType, RemoveLock, SIGINT, SIGTTIN, SessionType, acquire_spinlock, create_spinlock, disable_tty_mode, enable_tty_mode, info, io_complete_irp, io_set_cancel_routine, io_start_processing, proc_drop_pgrp, proc_drop_session, proc_get_pgrp, proc_get_session, proc_is_foreground_pgrp, proc_is_pgrp_active, proc_is_session_active, proc_is_session_leader, proc_issue_pgrp, release_spinlock, sched_get_current_pid, tty_print
+    Lock, ProcessGroupType, RemoveLock, SIGINT, SIGTTIN, SessionType, acquire_spinlock, create_spinlock, disable_tty_mode, enable_tty_mode, info, io_complete_irp, io_set_cancel_routine, io_start_processing, proc_drop_pgrp, proc_drop_session, proc_get_pgrp, proc_get_session, proc_is_foreground_pgrp, proc_is_in_session, proc_is_pgrp_active, proc_is_session_active, proc_is_session_leader, proc_issue_pgrp, release_spinlock, sched_get_current_pid, tty_print
 };
 use kernel_intf::ds::RingBuffer;
 use kernel_intf::driver::{
@@ -382,13 +382,12 @@ fn dispatch_control(device: &DeviceObject, request: &mut Irp) -> Status {
     match request.minor_code {
         IrpMinor::SetForegroundPgrp => {
             let cur_pgrp = ctx.job.pgrp;
+            let cur_session = ctx.job.session;
 
-            // Only a process from the current active foreground process group may set
-            // the new foreground process group 
-            if cur_pgrp != 0 && 
-            proc_is_pgrp_active(cur_pgrp) && 
-            !proc_is_foreground_pgrp(cur_pid, cur_pgrp) {
-                info!("Process that is not within foreground process group tried to set foreground process group!");
+            // Only a process belonging to this tty's controlling session (which must
+            // still be active) may change the foreground process group 
+            if cur_session == 0 || !proc_is_session_active(cur_session) || !proc_is_in_session(cur_pid, cur_session) {
+                info!("Process that is not within the controlling session tried to set foreground process group!");
                 release_spinlock(&mut ctx.lock);
                 request.complete_irp(Status::Failed);
                 return Status::Failed;
@@ -494,10 +493,10 @@ fn tty_input(bytes: *const u8, count: usize) {
             ctx.input_ring = RingBuffer::new(0u8);
             let pgrp = ctx.job.pgrp;
             release_spinlock(&mut ctx.lock);
+            release_tty_ctx(ctx_ptr);
             if pgrp != 0 && proc_is_pgrp_active(pgrp) {
                 proc_issue_pgrp(pgrp, SIGINT, false);
             }
-            release_tty_ctx(ctx_ptr);
             return;
         }
 

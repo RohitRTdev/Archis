@@ -187,7 +187,29 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // Combined form: -9, -KILL, -SIGKILL, etc.
+        // kill accepts at most one signal spec -- once we already have one
+        // (from -s/-n or an earlier combined form), any further "-..." token
+        // can only be the start of the (possibly negative) pid/pgid target
+        if (have_signal_spec) {
+            break;
+        }
+
+        // Combined form: -9, -KILL, -SIGKILL, etc. A purely numeric token
+        // that isn't a valid signal index is instead a negative pid (a
+        // process-group target, e.g. "kill -9 -123") -- stop option parsing
+        // and let the target loop below pick it up.
+        char *end;
+        long v = strtol(arg + 1, &end, 10);
+        if (*end == '\0' && end != arg + 1) {
+            if (v < 0 || (size_t)v >= SIGNAL_TABLE_LEN) {
+                break;
+            }
+            signal_num = (int)v;
+            have_signal_spec = 1;
+            argi++;
+            continue;
+        }
+
         if (resolve_signal(arg + 1, &signal_num) != 0) {
             fprintf(stderr, "kill: %s: invalid signal specification\n", arg);
             return 1;

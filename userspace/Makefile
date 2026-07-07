@@ -30,7 +30,9 @@ COMMON_CFLAGS := -target $(TARGET) -ffreestanding -fPIC -nostdinc -Wall -Wextra 
 CRT_SRCS := crt/*.c crt/$(ARCH)/*
 
 # Mention the binaries to be compiled in this list
-BINARIES := signal_test init sh producer producer2 producer3 consumer stdio_test envtest cat echo ls ln readlink mkdir rmdir rm shutdown fs_stress sleep dmesg ps kill
+BINARIES := signal_test init sh producer producer2 producer3 consumer \
+stdio_test envtest cat echo ls ln readlink mkdir rmdir rm shutdown \
+fs_stress sleep dmesg ps kill suspend_test
 
 # Shared libraries (dynamically loaded) and static libraries(.a archives) are to be mentioned here
 SHARED_LIBS := c
@@ -106,6 +108,9 @@ ps_LIBS := c
 
 kill_SRCS := kill.c
 kill_LIBS := c
+
+suspend_test_SRCS := suspend_test.c
+suspend_test_LIBS := c
 
 c_SRCS := libc/*.c libc/*.s libc/$(ARCH)/*
 

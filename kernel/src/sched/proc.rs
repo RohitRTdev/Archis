@@ -533,6 +533,8 @@ pub fn get_process_info(proc_id: usize) -> Option<KProcess> {
 pub struct ProcessSnapshot {
     pub id: usize,
     pub ppid: usize,
+    pub pgid: usize,
+    pub sid: usize,
     pub num_threads: usize,
     pub status: ProcessStatus
 }
@@ -543,6 +545,8 @@ pub fn snapshot_all_processes() -> Vec<ProcessSnapshot> {
         ProcessSnapshot {
             id: guard.get_id(),
             ppid: guard.pid,
+            pgid: guard.pgroup.lock().pgid,
+            sid: guard.session.lock().sid,
             num_threads: guard.get_num_threads(),
             status: guard.get_status()
         }
@@ -723,7 +727,7 @@ pub fn create_process<T: AsRef<str>>(args: &[T], envp: &[T], context_ptr: *mut c
     Ok(process)
 }
 
-pub fn kill_process(proc_id: usize, exit_info: ExitInfo) {
+pub fn kill_process(proc_id: usize, exit_info: ExitInfo, forced_kill: bool) {
     let proc = get_process_info(proc_id);
     if proc.is_none() {
         return;
@@ -765,7 +769,10 @@ pub fn kill_process(proc_id: usize, exit_info: ExitInfo) {
         // This happens if the current process is killing itself (exit)
         if is_idle_task || **thread_id != cur_task_id {
             crate::sched_log!("Issuing kill to thread {}", **thread_id);
-            sched::kill_thread(**thread_id, exit_info);
+            // Sibling threads are never the one voluntarily exiting, regardless of whether
+            // this kill_process call itself is forced — always give them the chance to
+            // unwind safely if they're user threads.
+            sched::kill_thread(**thread_id, exit_info, false);
         }
         else {
             is_exit = true;
@@ -776,7 +783,7 @@ pub fn kill_process(proc_id: usize, exit_info: ExitInfo) {
 
     // Kill the current thread last
     if is_exit {
-        sched::kill_thread(cur_task_id, exit_info);
+        sched::kill_thread(cur_task_id, exit_info, forced_kill);
     }
 }
 
@@ -785,7 +792,7 @@ pub fn exit_process(exit_info: ExitInfo) -> ! {
     assert!(super::is_preemption_enabled());
     let proc_id = get_current_process_id().expect("Attempted to kill idle process!!");
 
-    kill_process(proc_id, exit_info);
+    kill_process(proc_id, exit_info, true);
 
     // We could land here. Suppose two thread of a process call exit_process.
     // Only one of them succeeds in acquiring lock and setting status to terminate.
@@ -983,7 +990,7 @@ extern "C" fn sched_wait_process_ffi(proc_id: usize) {
 
 #[unsafe(no_mangle)]
 extern "C" fn sched_kill_process_ffi(proc_id: usize, exit_info: ExitInfo) {
-    kill_process(proc_id, exit_info);
+    kill_process(proc_id, exit_info, false);
 }
 
 pub fn issue_pgrp(pgrp: KProcessGroup, signal: u8, consume: bool) {
@@ -1027,6 +1034,12 @@ extern "C" fn proc_is_session_active_ffi(val: usize) -> bool {
 extern "C" fn proc_is_session_leader_ffi(pid: usize, val: usize) -> bool {
     let arc = ManuallyDrop::new(unsafe { Arc::from_raw_in(val as *const Spinlock<Session>, PoolAllocatorGlobal) });
     arc.lock().leader == Some(pid)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn proc_is_in_session_ffi(pid: usize, val: usize) -> bool {
+    let arc = ManuallyDrop::new(unsafe { Arc::from_raw_in(val as *const Spinlock<Session>, PoolAllocatorGlobal) });
+    arc.lock().processes.iter().any(|p| **p == pid)
 }
 
 #[unsafe(no_mangle)]
