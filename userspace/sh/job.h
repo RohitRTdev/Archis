@@ -11,7 +11,8 @@
 typedef enum {
     REDIR_TRUNC,  // >
     REDIR_APPEND, // >>
-    REDIR_DUP_FD  // N>&M, e.g. 2>&1
+    REDIR_READ,   // <
+    REDIR_DUP_FD  // N>&M, e.g. 2>&1, or N<&M
 } redir_kind_t;
 
 typedef struct {

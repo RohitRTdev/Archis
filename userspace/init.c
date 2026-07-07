@@ -7,7 +7,6 @@ int main(int argc, const char* argv[]) {
         sys_exit(-1);
     }
 
-    sys_duplicate_handle(-1, tty, STDIN_FILENO, TRUE);
     sys_duplicate_handle(-1, tty, STDOUT_FILENO, TRUE);
     sys_duplicate_handle(-1, tty, STDERR_FILENO, TRUE);
     stdio_init_std_handles();

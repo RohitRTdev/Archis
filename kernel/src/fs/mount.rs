@@ -5,7 +5,6 @@ use alloc::vec::Vec;
 use kernel_intf::KError;
 use kernel_intf::driver::{DeviceObject, DeviceType};
 use kernel_intf::mem::PoolAllocatorGlobal;
-use crate::fs::MountSource::Device;
 use crate::fs::mount::MountBackend::Module;
 use crate::io::DeviceHandleK;
 use crate::sync::Spinlock;
@@ -58,7 +57,7 @@ fn validate_mount_point_and_source(path: &str, source: &MountSource) -> Result<(
         return Err(KError::NotADirectory);
     }
 
-    if let Device(dev) = source {
+    if let MountSource::Device(dev) = source {
         if MOUNTS.lock().iter().any(|m| {
             if let Module(mount_dev) = &m.backend {
                 return mount_dev.dev_ptr() == dev.device_ptr();

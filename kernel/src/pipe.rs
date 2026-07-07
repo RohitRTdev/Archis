@@ -12,7 +12,7 @@ use crate::{fs::FileBuffer, sync::KEvent};
 
 pub type PipeRef = Arc<Pipe, PoolAllocatorGlobal>;
 type WeakPipeRef = Weak<Pipe, PoolAllocatorGlobal>;
-const MAX_STREAM_CAPACITY: usize = 128;
+const MAX_STREAM_CAPACITY: usize = 512;
 
 static NAMED_PIPE_OBJECTS: Spinlock<BTreeMap<String, WeakPipeRef>> = Spinlock::new(BTreeMap::new());
 
@@ -33,6 +33,7 @@ impl PipeType {
     pub fn new(pipe: PipeRef, is_reader: bool) -> Self {
         if !is_reader {
             pipe.writer_count.fetch_add(1, Ordering::AcqRel);
+            crate::pipe_log!("New Writer count: {}", pipe.writer_count.load(Ordering::Acquire));
         }
 
         Self {
@@ -58,6 +59,7 @@ impl Clone for PipeType {
         // Increment writer count
         if !self.is_reader {
             self.inner.writer_count.fetch_add(1, Ordering::AcqRel);
+            crate::pipe_log!("Clone Writer count: {}", self.inner.writer_count.load(Ordering::Acquire));
         }
 
         Self {
@@ -72,6 +74,7 @@ impl Drop for PipeType {
         if !self.is_reader {
             let old = self.inner.writer_count.fetch_sub(1, Ordering::AcqRel);
             assert!(old != 0, "pipe writer count update is wrong!");
+            crate::pipe_log!("Drop Writer count: {}", self.inner.writer_count.load(Ordering::Acquire));
             // Wake any blocked readers so they can observe EOF
             if old == 1 {
                 crate::pipe_log!("pipe: last writer closed, signalling readers");

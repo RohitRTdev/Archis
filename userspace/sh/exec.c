@@ -57,7 +57,10 @@ static void spawn_stages(
     *job_pgid = 0;
 
     for (int i = 0; i < total - 1; i++) {
-        if (sys_create_pipe(&pipe_r[i], &pipe_w[i], NULL, TRUE) < 0) {
+        // Must stay non-inheritable
+        // The writer process must not get the read handle 
+        // and reader process must not get the write handle
+        if (sys_create_pipe(&pipe_r[i], &pipe_w[i], NULL, FALSE) < 0) {
             printf("sh: failed to create pipe\n");
             for (int j = 0; j < i; j++) { sys_close(pipe_r[j]); sys_close(pipe_w[j]); }
             *aborted = 1;

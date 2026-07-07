@@ -10,6 +10,7 @@ handle_t sh_create_process_path_search(char *const argv[], int argc, char *const
 
 // Resolves one redirect's target handle:
 //  REDIR_TRUNC/REDIR_APPEND -> opens/creates redirect->path (append seeks to end)
+//  REDIR_READ               -> opens redirect->path for reading (must already exist)
 //  REDIR_DUP_FD             -> returns `current[redirect->dup_target_fd]`
 // `current` holds the fd 0/1/2 handles resolved so far for this stage, so a
 // DUP_FD redirect picks up whatever the referenced fd currently resolves to

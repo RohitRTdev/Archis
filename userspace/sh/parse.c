@@ -31,7 +31,7 @@ char *sh_strdup(const char *s) {
 }
 
 static int is_word_end(char c) {
-    return c == '\0' || isspace((unsigned char)c) || c == '|' || c == '>' || c == '&';
+    return c == '\0' || isspace((unsigned char)c) || c == '|' || c == '>' || c == '<' || c == '&';
 }
 
 // Scans one $VAR/${VAR}-expanding word starting at *pp, writes the expanded
@@ -127,6 +127,34 @@ static int tokenize(const char *line, token_t *toks, int max_toks) {
                 // else: no digits after '&' -- fall back to a plain file
                 // redirect, identical to `>target` without the `&`
                 // (kind stays REDIR_TRUNC, dup_target stays unused).
+            }
+
+            t->type = TOK_REDIR;
+            t->fd = fd;
+            t->kind = kind;
+            t->dup_target_fd = dup_target;
+            ntoks++;
+            continue;
+        }
+
+        if (*p == '<') {
+            int fd = digits ? atoi(save) : 0;
+            p++;
+            redir_kind_t kind = REDIR_READ;
+            int dup_target = -1;
+
+            if (*p == '&') {
+                p++;
+                const char *dstart = p;
+                int ddig = 0;
+                while (isdigit((unsigned char)*p)) { p++; ddig++; }
+                if (ddig > 0) {
+                    dup_target = atoi(dstart);
+                    kind = REDIR_DUP_FD;
+                }
+                // else: no digits after '&' -- fall back to a plain file
+                // redirect, identical to `<target` without the `&`
+                // (kind stays REDIR_READ, dup_target stays unused).
             }
 
             t->type = TOK_REDIR;

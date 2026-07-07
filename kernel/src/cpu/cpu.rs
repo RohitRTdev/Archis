@@ -12,7 +12,6 @@ pub const INIT_STACK_SIZE: usize  = PAGE_SIZE * 10;
 pub const INIT_BOOT_CPU_STACK_SIZE: usize  = PAGE_SIZE * 11;
 pub const INIT_GUARD_PAGE_SIZE: usize = PAGE_SIZE;
 pub const WORKER_STACK_SIZE: usize = 5 * PAGE_SIZE;
-pub const TOTAL_STACK_SIZE: usize = INIT_STACK_SIZE + INIT_GUARD_PAGE_SIZE;
 pub const TOTAL_BOOT_STACK_SIZE: usize = INIT_BOOT_CPU_STACK_SIZE + INIT_GUARD_PAGE_SIZE;
 
 static TOTAL_CPUS: AtomicUsize = AtomicUsize::new(1);

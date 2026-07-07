@@ -62,6 +62,9 @@ handle_t sh_resolve_redirect(const redirect_t *redirect, handle_t current[3]) {
         if (h < 0) h = sys_create_file(redirect->path, 0);
         if (h >= 0) sys_seek(h, 0, SEEK_END);
     }
+    else if (redirect->kind == REDIR_READ) {
+        h = sys_open("fs", redirect->path, 0);
+    }
     else {
         h = sys_create_file(redirect->path, 0);
     }

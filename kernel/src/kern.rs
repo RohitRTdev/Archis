@@ -22,7 +22,7 @@ mod intf;
 #[cfg(feature = "acpi")]
 mod acpica;
 
-use crate::io::{open_device_handle, pnp_post};
+use crate::sched::get_current_process;
 
 #[cfg(feature = "kunit-test")] 
 use {
@@ -167,7 +167,7 @@ fn run_proc_thread_tests() {
 
     // Wait for every thread to signal it has finished.
     for _ in 0..THREAD_COUNT {
-        THREAD_DONE_SEM.get().unwrap().wait(false);
+        let _ = THREAD_DONE_SEM.get().unwrap().wait(false);
     }
     info!("proc/thread test 3: all {} threads completed", THREAD_COUNT);
     drop(threads);
@@ -702,7 +702,7 @@ fn run_sync_tests() {
         T8_EV.call_once(|| ev.clone());
 
         extern "C" fn t8_waiter() -> ! {
-            T8_EV.get().unwrap().wait(false);
+            let _ = T8_EV.get().unwrap().wait(false);
             SYNC_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
             SYNC_TEST_DONE.get().unwrap().signal();
             sched::exit_thread(ExitInfo::normal(0));
@@ -1456,6 +1456,8 @@ fn kern_main() -> ! {
     //fs::load_root_fs();
 
     kernel_intf::run_tests!();
+    let threads = get_current_process().expect("Failed").lock().get_num_threads();
+    info!("Num system threads: {}", threads);
 
     info!("Launching init...");
     let init_proc = sched::create_process(
@@ -1483,7 +1485,6 @@ fn kern_main() -> ! {
 #[cfg(feature = "kunit-test")]
 use { 
     core::sync::atomic::AtomicI64,
-    kernel_intf::SIGKILL,
     crate::sync::KEvent
 };
 

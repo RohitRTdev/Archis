@@ -98,7 +98,7 @@ fn dequeue_work(q: &mut DynList<WorkItem>) -> Option<ListNodeGuard<WorkItem, Poo
 extern "C" fn work_queue_worker() -> ! {
     let wq = WORK_QUEUE.get().expect("ACPICA work queue not initialised");
     loop {
-        wq.signal.wait(false);
+        let _ = wq.signal.wait(false);
         // Drain everything currently visible. With auto-reset we only get
         // one wake per signal, but ACPICA may submit several items before
         // we get scheduled — drain to empty before sleeping again.
@@ -509,7 +509,7 @@ extern "C" fn AcpiOsWaitEventsComplete() {
         return;
     }
     wq.signal.signal();
-    event.wait(false);
+    let _ = event.wait(false);
 }
 
 #[unsafe(no_mangle)]

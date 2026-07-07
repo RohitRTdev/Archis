@@ -542,16 +542,16 @@ impl Vfs {
                 let (name, child) = children.iter().nth(offset - 2)
                     .ok_or(KError::NoMoreEntries)?;
                 let cg = child.lock();
-                let (kind, symlink_target, size) = match &cg.kind {
+                let (_kind, _symlink_target, size) = match &cg.kind {
                     NodeKind::File { data, .. } => (EntryType::File, None, data.len() as u64),
                     NodeKind::Dir { children, .. } => (EntryType::Dir, None, children.len() as u64),
                     NodeKind::Symlink { target } => (EntryType::Symlink, Some(target.clone()), target.len() as u64)
                 };
                 Ok(DirEntry {
                     name: name.clone(),
-                    kind,
-                    attrs: FileAttrs { mode: cg.attrs.mode, size },
-                    symlink_target
+                    _kind,
+                    _attrs: FileAttrs { mode: cg.attrs.mode, size },
+                    _symlink_target
                 })
             }
             _ => Err(KError::NotADirectory)
@@ -567,9 +567,9 @@ fn dot_entry(name: &str, node: &VfsNodeRef) -> DirEntry {
     };
     DirEntry {
         name: name.to_string(),
-        kind: EntryType::Dir,
-        attrs: FileAttrs { mode: g.attrs.mode, size },
-        symlink_target: None
+        _kind: EntryType::Dir,
+        _attrs: FileAttrs { mode: g.attrs.mode, size },
+        _symlink_target: None
     }
 }
 
@@ -582,9 +582,9 @@ pub enum EntryType {
 
 pub struct DirEntry {
     pub name: String,
-    pub kind: EntryType,
-    pub attrs: FileAttrs,
-    pub symlink_target: Option<String>
+    pub _kind: EntryType,
+    pub _attrs: FileAttrs,
+    pub _symlink_target: Option<String>
 }
 
 fn check_not_busy(node: &VfsNodeRef) -> Result<(), KError> {

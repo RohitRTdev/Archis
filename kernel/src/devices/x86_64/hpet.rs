@@ -17,7 +17,7 @@ const TIMER0_CONF_OFFSET: usize = 0x100;
 pub struct Hpet {
     timer_block_base: usize,
     pub clk_period: usize, // femtoseconds
-    num_timers: usize
+    _num_timers: usize
 }
 
 impl Hpet {
@@ -26,7 +26,7 @@ impl Hpet {
     }
 }
 
-pub static HPET: Spinlock<Hpet> = Spinlock::new(Hpet { timer_block_base: 0, clk_period: 0, num_timers: 0});
+pub static HPET: Spinlock<Hpet> = Spinlock::new(Hpet { timer_block_base: 0, clk_period: 0, _num_timers: 0});
 
 fn read_timer_reg(base: usize, offset: usize) -> u64 {
     unsafe {
@@ -80,5 +80,5 @@ pub fn init() {
         flags: PageDescriptor::MMIO 
     }).unwrap();
     
-    *HPET.lock() = Hpet {timer_block_base, clk_period, num_timers};
+    *HPET.lock() = Hpet {timer_block_base, clk_period, _num_timers: num_timers};
 }

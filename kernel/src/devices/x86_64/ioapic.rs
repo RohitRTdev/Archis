@@ -24,7 +24,7 @@ static NUM_INT_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy)]
 struct Ioapic {
-    id: usize,
+    _id: usize,
     base_address: usize,
     gsi: usize
 }
@@ -37,7 +37,7 @@ struct IntOverride {
     is_edge_triggered: bool
 }
 
-static IOAPIC_LIST: Spinlock<[Ioapic; MAX_IOAPIC]> = Spinlock::new([Ioapic { id: 0, base_address: 0, gsi: 0}; MAX_IOAPIC]);
+static IOAPIC_LIST: Spinlock<[Ioapic; MAX_IOAPIC]> = Spinlock::new([Ioapic { _id: 0, base_address: 0, gsi: 0}; MAX_IOAPIC]);
 static OVERRIDE_LIST: Spinlock<[IntOverride; MAX_INT_OVERRIDE]> = Spinlock::new([IntOverride { irq: 0, gsi: 0, is_edge_triggered: true, is_active_high: true}; MAX_INT_OVERRIDE]);
 
 // Register legacy type IRQ with IOAPIC
@@ -148,7 +148,7 @@ fn parse_madt(madt: &AcpiTableMadt) {
                     &*(ptr as *const IoapicEntry)
                 };
                 IOAPIC_LIST.lock()[NUM_IOAPIC.fetch_add(1, Ordering::Acquire)] = Ioapic {
-                    id: entry.id as usize,
+                    _id: entry.id as usize,
                     base_address: entry.addr as usize,
                     gsi: entry.gsi as usize
                 };

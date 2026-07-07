@@ -266,23 +266,23 @@ impl ModuleBackedFs {
             return Err(KError::from(code));
         }
         let name = String::from_utf8_lossy(&fs_entry.name[..fs_entry.name_len]).into_owned();
-        let kind = if fs_entry.kind == FS_ENTRY_DIR {
+        let _kind = if fs_entry.kind == FS_ENTRY_DIR {
             EntryType::Dir
         } else if fs_entry.kind == FS_ENTRY_SYMLINK {
             EntryType::Symlink
         } else {
             EntryType::File
         };
-        let symlink_target = if fs_entry.kind == FS_ENTRY_SYMLINK {
+        let _symlink_target = if fs_entry.kind == FS_ENTRY_SYMLINK {
             Some(String::from_utf8_lossy(&fs_entry.target[..fs_entry.target_len]).into_owned())
         } else {
             None
         };
         Ok(DirEntry {
             name,
-            kind,
-            attrs: FileAttrs { mode: fs_entry.mode, size: fs_entry.size },
-            symlink_target
+            _kind,
+            _attrs: FileAttrs { mode: fs_entry.mode, size: fs_entry.size },
+            _symlink_target
         })
     }
 }
