@@ -2,10 +2,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <pthread.h>
 
 #include "exec.h"
 #include "redir.h"
 #include "parse.h"
+#include "builtins.h"
 
 extern char **environ;
 
@@ -220,4 +222,166 @@ void sh_reap_background_jobs(sh_ctx_t *ctx) {
         }
         bg->in_use = 0;
     }
+}
+
+// Runs one job (builtin or external), returning its exit status (0 = success)
+// for use by run_job_list's `&&` short-circuiting.
+static int run_job(sh_ctx_t *ctx, job_t *job, int grab_fg) {
+    // Builtins only handle the simple "single stage, no redirects" case —
+    // they run directly in the shell and never go through exec_job_fg's fd
+    // wiring, so a redirected/piped builtin falls through to path search
+    // instead of silently ignoring the redirect.
+    if (job->stage_count == 1 && job->stages[0].redirect_count == 0) {
+        int should_exit = 0, status = 0;
+        if (sh_run_builtin(ctx, job->stages[0].argv, job->stages[0].argc, &should_exit, &status)) {
+            return status;
+        }
+    }
+    return exec_job_fg(ctx, job, grab_fg);
+}
+
+typedef struct {
+    sh_ctx_t *ctx;
+    job_list_t list;
+} bg_chain_ctx_t;
+
+// Entry point for a backgrounded `&&` chain (job_count > 1). Runs every
+// segment to completion in this dedicated thread -- never grabbing the tty's
+// foreground pgrp -- short-circuiting on the first nonzero status, then
+// reports completion and frees its own heap-owned copy of the chain.
+static void *run_bg_chain(void *arg) {
+    bg_chain_ctx_t *bc = (bg_chain_ctx_t *)arg;
+
+    for (int i = 0; i < bc->list.job_count; i++) {
+        if (run_job(bc->ctx, &bc->list.jobs[i], 0) != 0) break;
+    }
+
+    printf("[bg]+ Done\n");
+    job_list_free(&bc->list);
+    free(bc);
+    return NULL;
+}
+
+// Dispatches a parsed job list, returning the exit status of the last
+// foreground job run (0 for any backgrounded-launch path, matching a real
+// shell reporting success immediately on `&` without waiting for it).
+static int run_job_list(sh_ctx_t *ctx, job_list_t *list) {
+    if (list->job_count == 1) {
+        // Unchanged from before `&&` existed: a lone job either backgrounds
+        // itself the traditional way (registered in ctx->bg_jobs) or runs
+        // in the foreground; there's nothing to short-circuit against.
+        if (list->background) {
+            exec_job_bg(ctx, &list->jobs[0]);
+            return 0;
+        }
+        return run_job(ctx, &list->jobs[0], 1);
+    }
+
+    if (!list->background) {
+        int status = 0;
+        for (int i = 0; i < list->job_count; i++) {
+            status = run_job(ctx, &list->jobs[i], 1);
+            if (status != 0) break;
+        }
+        return status;
+    }
+
+    // Backgrounded chain: hand ownership of the parsed jobs to a detached
+    // thread so the interactive prompt is never blocked waiting on it.
+    bg_chain_ctx_t *bc = malloc(sizeof(bg_chain_ctx_t));
+    if (!bc) {
+        printf("sh: out of memory, running chain in foreground\n");
+        int status = 0;
+        for (int i = 0; i < list->job_count; i++) {
+            status = run_job(ctx, &list->jobs[i], 1);
+            if (status != 0) break;
+        }
+        return status;
+    }
+    bc->ctx = ctx;
+    bc->list = *list;
+    list->job_count = 0; // ownership moved to bc; caller's job_list_free is now a no-op
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, run_bg_chain, bc) != 0) {
+        printf("sh: failed to background chain, running in foreground\n");
+        int status = 0;
+        for (int i = 0; i < bc->list.job_count; i++) {
+            status = run_job(ctx, &bc->list.jobs[i], 1);
+            if (status != 0) break;
+        }
+        job_list_free(&bc->list);
+        free(bc);
+        return status;
+    }
+    pthread_detach(tid);
+    printf("[bg] chain started\n");
+    return 0;
+}
+
+int sh_run_line(sh_ctx_t *ctx, char *line) {
+    job_list_t list;
+    int status = 0;
+    int rc = parse_line(line, &list);
+    if (rc == 0) {
+        status = run_job_list(ctx, &list);
+        job_list_free(&list);
+    } else if (rc < 0) {
+        printf("sh: syntax error\n");
+        status = 1;
+    }
+
+    sh_reap_background_jobs(ctx);
+    return status;
+}
+
+// Reads one line (without the newline) into a malloc'd, NUL-terminated
+// buffer. Returns 1 with *out_buf/*out_len set, 0 on clean EOF (nothing
+// read), -1 on allocation failure. Mirrors the FILE*-based line reader
+// already duplicated in cat.c/head.c.
+static int read_script_line(FILE *f, char **out_buf, size_t *out_len) {
+    size_t cap = 128, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) return -1;
+
+    int c;
+    int any = 0;
+    while ((c = fgetc(f)) != EOF) {
+        any = 1;
+        if (c == '\n') break;
+        if (len + 1 >= cap) {
+            cap *= 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); return -1; }
+            buf = nb;
+        }
+        buf[len++] = (char)c;
+    }
+
+    if (!any) { free(buf); return 0; }
+
+    buf[len] = '\0';
+    *out_buf = buf;
+    *out_len = len;
+    return 1;
+}
+
+int sh_run_script(sh_ctx_t *ctx, const char *path, int *out_status) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    int status = 0;
+    for (;;) {
+        char *line;
+        size_t len;
+        int rc = read_script_line(f, &line, &len);
+        if (rc <= 0) break;
+        (void)len;
+        status = sh_run_line(ctx, line);
+        free(line);
+    }
+
+    fclose(f);
+    *out_status = status;
+    return 0;
 }

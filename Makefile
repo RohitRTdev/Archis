@@ -131,6 +131,8 @@ build_userspace: $(OUTPUT_DIR)
 	@echo "Building userspace programs..."
 	@mkdir -p target/userspace
 	@cd userspace && $(MAKE) $(USERSPACE_FLAGS) all
+	@mkdir -p $(OUTPUT_DIR)/conf
+	@cp config/init_sh $(OUTPUT_DIR)/conf/
 
 run_unit_test: build_kernel_test
 	@cargo test --manifest-path=boot/blr/Cargo.toml -- --nocapture

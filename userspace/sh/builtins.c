@@ -34,6 +34,19 @@ static void builtin_export(char *const argv[], int argc) {
     }
 }
 
+static int builtin_source(sh_ctx_t *ctx, char *const argv[], int argc) {
+    if (argc < 2) {
+        printf("sh: source: missing file operand\n");
+        return 1;
+    }
+    int status = 0;
+    if (sh_run_script(ctx, argv[1], &status) < 0) {
+        printf("sh: source: %s: No such file or directory\n", argv[1]);
+        return 1;
+    }
+    return status;
+}
+
 // Kills every pid across every still-tracked background job individually
 // (not via a single pgrp broadcast), so it's correct even if a pipeline's
 // join-into-group step ever failed for one of its stages.
@@ -56,6 +69,7 @@ int sh_run_builtin(sh_ctx_t *ctx, char *const argv[], int argc, int *should_exit
     if (strcmp(argv[0], "cd") == 0) { *status = builtin_cd(argv, argc); return 1; }
     if (strcmp(argv[0], "pwd") == 0) { builtin_pwd(); return 1; }
     if (strcmp(argv[0], "export") == 0) { builtin_export(argv, argc); return 1; }
+    if (strcmp(argv[0], "source") == 0) { *status = builtin_source(ctx, argv, argc); return 1; }
     if (strcmp(argv[0], "exit") == 0) { *should_exit = 1; builtin_exit(ctx); return 1; }
 
     return 0;

@@ -32,7 +32,7 @@ CRT_SRCS := crt/*.c crt/$(ARCH)/*
 # Mention the binaries to be compiled in this list
 BINARIES := signal_test init sh producer producer2 producer3 consumer \
 stdio_test envtest cat echo ls ln readlink mkdir rmdir rm shutdown \
-fs_stress sleep dmesg ps kill suspend_test head tail wc
+fs_stress sleep dmesg ps kill suspend_test head tail wc cp mv
 
 # Shared libraries (dynamically loaded) and static libraries(.a archives) are to be mentioned here
 SHARED_LIBS := c
@@ -120,6 +120,12 @@ tail_LIBS := c
 
 wc_SRCS := wc.c
 wc_LIBS := c
+
+cp_SRCS := cp.c
+cp_LIBS := c
+
+mv_SRCS := mv.c
+mv_LIBS := c
 
 c_SRCS := libc/*.c libc/*.s libc/$(ARCH)/*
 
