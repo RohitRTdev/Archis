@@ -4,6 +4,7 @@ use uefi::{boot, Identify};
 use uefi::boot::ScopedProtocol;
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat::*};
     
+// Right now, we support upto Full HD
 const MAX_VIDEO_RESOLUTION: usize = 1920 * 1080;
 
 fn set_best_mode(gpu: &mut ScopedProtocol<GraphicsOutput>) {
@@ -13,7 +14,9 @@ fn set_best_mode(gpu: &mut ScopedProtocol<GraphicsOutput>) {
     for mode in gpu.modes() {
         let (width, height) = mode.info().resolution();
         let res = width * height;
-        if res <= MAX_VIDEO_RESOLUTION {
+        // QEMU/Bochs has a quirk where for non 8 byte aligned framebuffer width
+        // it doesn't report the stride correctly. So we just avoid them 
+        if width % 8 == 0 && res <= MAX_VIDEO_RESOLUTION {
             if high_res_mode.is_none() {
                 num_pixels = res;
                 high_res_mode = Some(mode);

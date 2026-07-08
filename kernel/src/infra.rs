@@ -7,7 +7,7 @@ use common::StrRef;
 use common::elf::*;
 use rustc_demangle::demangle;
 use crate::{cpu, logger};
-use kernel_intf::println;
+use kernel_intf::{println, release_screen_ownership};
 use crate::sync::Spinlock;
 use crate::hal::{self, IPIRequestType, notify_core};
 use crate::loader::{KERNEL_MODULES, module::*};
@@ -41,6 +41,18 @@ impl<'a> PanicCommon<'a> {
 
 #[allow(dead_code)]
 fn common_panic_handler(mod_name: &str, info: PanicCommon) -> ! {
+    // Stop bootanim and, unless it's the one panicking (which would make us
+    // spin on ourselves), wait for it to release the screen before we disable
+    // interrupts or shut down other cores 
+    if !IS_NESTED.load(Ordering::Acquire) {
+        let is_wait = mod_name != crate::BOOTANIM_MODULE_NAME;  
+        crate::stop_boot_animation(is_wait);
+        if !is_wait {
+            // bootanim itself has failed. Explicitly release the ownership
+            release_screen_ownership();
+        }
+    }
+
     hal::disable_interrupts();
     let core = hal::get_core();
 
@@ -104,7 +116,7 @@ pub fn start_unwind(mod_name: &str, stack_base: usize) {
         let (actual_depth, cur_base) = hal::unwind_stack(STACK_UNWIND_DEPTH, stack_base, unwind_list.as_mut_slice());
         let start_depth = if mod_name == env!("CARGO_PKG_NAME") { 3 } else { 4 };
 
-        if actual_depth <= start_depth + 1 {
+        if actual_depth <= start_depth {
             println!("(Empty) => Current stack base: {:#X}, Current stack top: {:#X}", cur_base, stack_base);
         }
 

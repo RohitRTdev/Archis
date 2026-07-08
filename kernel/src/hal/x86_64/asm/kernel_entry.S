@@ -6,7 +6,7 @@
 .balign 4096
 
 KERNEL_STACK:
-    .skip 4096 * 5
+    .skip 4096 * 10
 KERNEL_STACK_TOP:
 
 #include "asm_macros.inc"

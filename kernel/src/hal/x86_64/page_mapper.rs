@@ -504,7 +504,7 @@ impl PageMapper {
 
         let addr = if entry & 1 == 0 {
             let addr = self.allocate_page_table(level);
-            
+
             // Map the physical address to the upper level table
             unsafe {
                 core::ptr::write_volatile(
@@ -532,7 +532,7 @@ impl PageMapper {
                     panic!("get_or_alloc_table() called with level: PML4");
                 }
             } as usize;
-            
+
             // If we had just mapped that memory, need to invalidate this region to make it visible
             if addr.is_some() {
                 unsafe {

@@ -58,7 +58,7 @@ impl ModuleBackedFs {
         let dev_ptr = dev.device_ptr();
 
         for path in FS_MODULE_PATHS {
-            let image = match load_image(path, false) {
+            let image = match load_image(path, false, true) {
                 Ok(i) => i,
                 Err(e) => { crate::fs_log!("identify_and_open: load_image({}) failed: {:?}", path, e); continue; }
             };

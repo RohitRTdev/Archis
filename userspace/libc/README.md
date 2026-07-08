@@ -1,5 +1,4 @@
 # Libc
-Most of this library was written by claude. 
 So far the functionality includes...
 
 ## `<string.h>` — Memory & String primitives

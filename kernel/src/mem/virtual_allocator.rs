@@ -1111,7 +1111,7 @@ pub fn virtual_allocator_init() {
     kernel_addr_space.map_memory(
         stack_raw_phys.addr(), 
         stack_base.addr(), 
-        cpu::INIT_STACK_SIZE, 
+        cpu::INIT_BOOT_CPU_STACK_SIZE, 
         0, 
         true)
     .expect("Failed to map boot cpu stack to kernel virtual address space!");

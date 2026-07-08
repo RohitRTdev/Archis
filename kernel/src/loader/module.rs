@@ -233,7 +233,6 @@ pub fn complete_handoff() {
     let boot_info = BOOT_INFO.get().unwrap();
     let koffset = KERNEL_OFFSET.load(Ordering::Acquire);
     
-    // This is the old unmapped kernel address
     let load_base = mod_cb.kernel().info.base;
 
     let info = |bitmap: u64| {
@@ -241,10 +240,6 @@ pub fn complete_handoff() {
     };
 
     if let Some(rlc_shn) = &mod_cb.kernel().info.rlc_shn {
-        // Usually we separate between plt and rlc relocations.
-        // However, kernel is known to have lot of relocations, so the reloc section
-        // will definitely exist and if it does, it will also contain the JUMP_SLOT plt entries
-        // We process them both from the same table unlike other parts within the kernel and blr
         let num_rel_entries = rlc_shn.size / core::mem::size_of::<Elf64Rela>();
         let entries = unsafe {
             core::slice::from_raw_parts(rlc_shn.start as *const Elf64Rela, num_rel_entries)
@@ -253,7 +248,7 @@ pub fn complete_handoff() {
         for entry in entries {
             let address = load_base + entry.r_offset as usize;
             match info(entry.r_info) {
-                R_X86_64_RELATIVE | R_X86_64_64 | 
+                R_X86_64_RELATIVE | R_X86_64_64 |
                 R_GLOB_DAT | R_JUMP_SLOT => {
                     // This is not normal relocation. We might have made changes
                     // to various relocation pointers at runtime.
@@ -263,11 +258,11 @@ pub fn complete_handoff() {
                         *(address as *mut u64) = (koffset + cur_address as isize) as u64;
                     };
                 },
-                _ => {} 
+                _ => {}
             }
         }
     }
-    
+
     // The module name needs to be patched up to new address
     let name_len = mod_cb.kernel().name.len();
     let name_ptr = mem::get_virtual_address(mod_cb.kernel().name.as_ptr() as usize, 0,  MapFetchType::Kernel)
@@ -286,7 +281,7 @@ pub fn complete_handoff() {
     crate::INIT_FS.call_once(|| {
         let boot_info = BOOT_INFO.get().unwrap();
         let fs_entries = unsafe {
-            core::slice::from_raw_parts(boot_info.init_fs.start as *const FileDescriptor, boot_info.init_fs.size / boot_info.init_fs.entry_size) 
+            core::slice::from_raw_parts(boot_info.init_fs.start as *const FileDescriptor, boot_info.init_fs.size / boot_info.init_fs.entry_size)
         };
 
         let mut map = BTreeMap::new();

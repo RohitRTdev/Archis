@@ -59,7 +59,7 @@ fn bootstrap_test_disk() -> LoadedImage {
     // The disk driver creates + starts disk0p0 as a side effect of AddPartition.
     let part = io::open_device_handle("disk0p0").expect("load_root_fs: disk0p0 device not found after AddPartition");
 
-    let image = load_image(FAT32_MODULE_PATH, false).expect("load_root_fs: failed to load fat32 module");
+    let image = load_image(FAT32_MODULE_PATH, false, true).expect("load_root_fs: failed to load fat32 module");
     let format_addr = image.lock().load_symbol("format").expect("load_root_fs: fat32 module has no 'format' export");
     let format_fn: extern "C" fn(*const kernel_intf::driver::DeviceObject) -> i64 = unsafe { core::mem::transmute(format_addr) };
     assert!(!mount::is_device_mounted(part.device_ptr()), "load_root_fs: refusing to format an already-mounted device");

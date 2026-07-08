@@ -333,6 +333,8 @@ unsafe extern "C" {
     fn tty_print_ffi(s: *const u8, len: usize);
     fn enable_tty_mode_ffi();
     fn disable_tty_mode_ffi();
+    fn acquire_screen_ownership_ffi(out: *mut common::FBInfo) -> bool;
+    fn release_screen_ownership_ffi();
 
     fn io_complete_irp_ffi(irp: *mut driver::Irp, status: driver::Status);
     pub fn io_get_driver_id(device: *const driver::DeviceObject) -> usize;
@@ -400,24 +402,22 @@ unsafe extern "C" {
     fn sync_destroy_semaphore_ffi(handle: usize);
 }
 
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct KSyncHandle(pub usize);
+pub type KSyncHandle = usize;
 
 pub fn sync_create_semaphore(initial: isize, max: isize) -> KSyncHandle {
-    KSyncHandle(unsafe { sync_create_semaphore_ffi(initial, max) })
+    unsafe { sync_create_semaphore_ffi(initial, max) }
 }
 
 pub fn sync_wait_semaphore(handle: KSyncHandle) {
-    unsafe { sync_wait_semaphore_ffi(handle.0) }
+    unsafe { sync_wait_semaphore_ffi(handle) }
 }
 
 pub fn sync_signal_semaphore(handle: KSyncHandle) {
-    unsafe { sync_signal_semaphore_ffi(handle.0) }
+    unsafe { sync_signal_semaphore_ffi(handle) }
 }
 
 pub fn sync_destroy_semaphore(handle: KSyncHandle) {
-    unsafe { sync_destroy_semaphore_ffi(handle.0) }
+    unsafe { sync_destroy_semaphore_ffi(handle) }
 }
 
 pub fn io_create_driver_worker(
@@ -585,6 +585,29 @@ pub fn disable_tty_mode() {
 
 pub fn tty_print(s: &str) {
     unsafe { tty_print_ffi(s.as_ptr(), s.len()); }
+}
+
+// Takes exclusive control of the raw framebuffer, suppressing the normal
+// logger's and tty's screen output (serial/kring logging is unaffected) until
+// release_screen_ownership() is called. Returns None if the kernel is
+// panicking or the screen is already owned by another caller.
+pub fn acquire_screen_ownership() -> Option<common::FBInfo> {
+    let mut info = common::FBInfo {
+        fb: common::MemoryRegion { base_address: 0, size: 0 },
+        height: 0,
+        width: 0,
+        stride: 0,
+        pixel_mask: common::PixelMask { red_mask: 0, blue_mask: 0, green_mask: 0, alpha_mask: 0 }
+    };
+    if unsafe { acquire_screen_ownership_ffi(&mut info) } {
+        Some(info)
+    } else {
+        None
+    }
+}
+
+pub fn release_screen_ownership() {
+    unsafe { release_screen_ownership_ffi(); }
 }
 
 pub fn proc_get_session(pid: usize) -> SessionType {

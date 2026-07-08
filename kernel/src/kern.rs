@@ -22,8 +22,6 @@ mod intf;
 #[cfg(feature = "acpi")]
 mod acpica;
 
-use crate::sched::get_current_process;
-
 #[cfg(feature = "kunit-test")] 
 use {
     core::sync::atomic::{AtomicUsize, AtomicBool, Ordering},
@@ -33,7 +31,7 @@ use {
 
 use kernel_intf::{info, debug, ExitInfo};
 use common::*;
-use loader::module;
+use loader::{module, LoadedImage};
 
 extern crate alloc;
 use alloc::collections::BTreeMap;
@@ -1440,6 +1438,61 @@ fn run_fs_correctness_tests() {
     info!("=== run_fs_correctness_tests: PASSED ===");
 }
 
+const BOOTANIM_PATH: &str = "/sys/libbootanim.so";
+const BOOTANIM_MODULE_NAME: &str = "bootanim";
+
+static BOOTANIM_HANDLE: Spinlock<Option<LoadedImage>> = Spinlock::new(None);
+
+fn start_boot_animation() {
+    let process = match sched::create_process(&[BOOTANIM_PATH, "run"], &[], core::ptr::null_mut(), false, false) {
+        Ok(p) => p,
+        Err(e) => {
+            info!("bootanim: failed to start boot animation process: {:?}", e);
+            return;
+        }
+    };
+
+    let image_opt = process.lock().get_image();
+    let image = match image_opt {
+        Some(image) => image,
+        None => {
+            info!("bootanim: boot animation process has no image set");
+            return;
+        }
+    };
+
+    *BOOTANIM_HANDLE.lock() = Some(image);
+}
+
+// Signals the boot animation process to stop. When wait is true, busy-waits
+// for it to acknowledge that it has released the screen and will not touch
+// the framebuffer again.
+pub fn stop_boot_animation(wait: bool) {
+    let Some(image) = BOOTANIM_HANDLE.lock().take() else { return; };
+
+    match image.lock().load_symbol("stop_boot_animation") {
+        Some(addr) => {
+            let stop_fn: extern "C" fn() = unsafe { core::mem::transmute(addr) };
+            stop_fn();
+        },
+        None => info!("bootanim: module has no 'stop_boot_animation' export")
+    }
+
+    if !wait {
+        return;
+    }
+
+    match image.lock().load_symbol("is_boot_animation_stopped") {
+        Some(addr) => {
+            let is_stopped: extern "C" fn() -> bool = unsafe { core::mem::transmute(addr) };
+            while !is_stopped() {
+                core::hint::spin_loop();
+            }
+        },
+        None => info!("bootanim: module has no 'is_boot_animation_stopped' export")
+    }
+}
+
 fn kern_main() -> ! {
     info!("Starting main kernel init");
 
@@ -1450,26 +1503,39 @@ fn kern_main() -> ! {
     sched::init();
     fs::init();
     loader::init();
+
+    #[cfg(all(not(feature = "kunit-test"),feature = "boot-anim"))]
+    start_boot_animation();
+
     io::init();
     intf::init();
-    //#[cfg(feature = "kunit-test")]
-    //fs::load_root_fs();
-
+    #[cfg(feature = "kunit-test")]
+    fs::load_root_fs();
+    
     kernel_intf::run_tests!();
-    let threads = get_current_process().expect("Failed").lock().get_num_threads();
-    info!("Num system threads: {}", threads);
+    
+    #[cfg(all(not(feature = "kunit-test"),feature = "boot-anim"))]
+    {
+        sched::delay_ms(5000, false);
+        stop_boot_animation(true);
+    }
 
-    info!("Launching init...");
-    let init_proc = sched::create_process(
-        &["/bin/init"],
-        &[],
-        core::ptr::null_mut(),
-        true,
-        false
-    ).expect("Failed to create init process!");
+    #[cfg(not(feature = "kunit-test"))] 
+    {
+        info!("Launching init...");
+        let init_proc = sched::create_process(
+            &["/bin/init"],
+            &[],
+            core::ptr::null_mut(),
+            true,
+            false
+        ).expect("Failed to create init process!");
 
-    init_proc.wait(false);
-    panic!("init process returned!");
+        init_proc.wait(false);
+        panic!("init process returned!");
+    }
+
+    hal::sleep();
 }
 
 // === Driver worker (DPC) tests ===

@@ -123,7 +123,7 @@ pub fn init() {
     disable_preloader_phase();
 }
 
-pub fn load_image(path: &str, is_user: bool) -> Result<LoadedImage, KError> {
+pub fn load_image(path: &str, is_user: bool, run_init: bool) -> Result<LoadedImage, KError> {
     crate::loader_log!("Start load_image for {}", path);
 
     // User modules go through the user loader, which has its own lock and
@@ -136,13 +136,14 @@ pub fn load_image(path: &str, is_user: bool) -> Result<LoadedImage, KError> {
     let _guard = semaphore_guard(LOAD_LOCK.get().expect("loader::init() not called before load_image()"));
 
     let mut in_progress: Vec<String> = Vec::new();
-    load_image_inner(path, &mut in_progress, &[])
+    load_image_inner(path, &mut in_progress, &[], run_init)
 }
 
 
 fn do_load_image_inner(
     path: &str,
-    in_progress: &mut Vec<String>
+    in_progress: &mut Vec<String>,
+    run_init: bool
 ) -> Result<LoadedImage, KError> {
     if let Some(cached) = find_loaded_module(path) {
         crate::loader_log!("Loading image {} from cache", path);
@@ -156,7 +157,8 @@ fn do_load_image_inner(
 
     let result = load_image_uncached(
         path,
-        in_progress
+        in_progress,
+        run_init
     );
 
     in_progress.pop();
@@ -166,18 +168,19 @@ fn do_load_image_inner(
 fn load_image_inner(
     path: &str,
     in_progress: &mut Vec<String>,
-    extra_dirs: &[String]
+    extra_dirs: &[String],
+    run_init: bool
 ) -> Result<LoadedImage, KError> {
     // This is an absolute path
     if path.starts_with("/") {
-        return do_load_image_inner(path, in_progress);
+        return do_load_image_inner(path, in_progress, run_init);
     }
     else {
         // Check for the file in all the predefined directories, then any
         // caller-supplied extra directories
         for prefix in PREDEFINED_DIRECTORIES.iter().copied().chain(extra_dirs.iter().map(|s| s.as_str())) {
             let filename = format!("{}/{}", prefix, path);
-            let res = do_load_image_inner(filename.as_str(), in_progress);
+            let res = do_load_image_inner(filename.as_str(), in_progress, run_init);
 
             match res {
                 Err(KError::NotFound) | Err(InvalidArgument) => {
@@ -194,7 +197,7 @@ fn load_image_inner(
 
         // Check with cwd too
         let filename = fs::make_absolute(&crate::sched::get_cwd(), path);
-        let res = do_load_image_inner(filename.as_str(), in_progress);
+        let res = do_load_image_inner(filename.as_str(), in_progress, run_init);
 
         match res {
             Ok(img) => {
@@ -209,7 +212,8 @@ fn load_image_inner(
 
 fn load_image_uncached(
     path: &str,
-    in_progress: &mut Vec<String>
+    in_progress: &mut Vec<String>,
+    run_init: bool
 ) -> Result<LoadedImage, KError> {
     crate::loader_log!("Loading image {} from disk", path);
     let file = open(path)?;
@@ -262,7 +266,9 @@ fn load_image_uncached(
 
     crate::loader_log!("Loaded image '{}' with name={}", path, module_name);
 
-    invoke_init(&arc);
+    if run_init {
+        invoke_init(&arc);
+    }
 
     Ok(arc)
 }
@@ -667,7 +673,8 @@ fn load_dependencies(
         let res = load_image_inner(
             name,
             in_progress,
-            &extra_dirs
+            &extra_dirs,
+            true
         )?;
 
         deps.push(res);

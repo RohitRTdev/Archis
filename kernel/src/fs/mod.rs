@@ -9,6 +9,7 @@ pub use file::FileInstance;
 pub use mount::MountSource;
 pub use utils::FileBuffer;
 pub use vfs::{FileAttrs, FileStat, HandleStatType, make_absolute, normalize_path, MODE_FILE, MODE_DIR, MODE_SYMLINK};
+pub use root::load_root_fs;
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloc::string::String;

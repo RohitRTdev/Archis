@@ -591,7 +591,7 @@ fn create_root_device() -> DeviceHandleK {
 }
 
 fn load_driver(path: &str) -> Result<DriverHandle, KError> {
-    let image = load_image(path, false)?;
+    let image = load_image(path, false, true)?;
     let id = NEXT_DRIVER_ID.fetch_add(1, Ordering::Relaxed);
 
     let (name, entry_addr) = {

@@ -43,6 +43,7 @@ pub struct FramebufferLogger {
     fb_base: *mut u8,
     width: usize,
     height: usize,
+    usable_height: usize,
     stride: usize,
     current_x: usize,
     current_y: usize,
@@ -54,7 +55,8 @@ pub struct FramebufferLogger {
     is_cursor_disabled: bool,
     
     // Should be between 0-1
-    cursor_height: f64
+    cursor_height: f64,
+    is_enabled: bool
 }
 
 unsafe impl Send for FramebufferLogger {}
@@ -63,6 +65,7 @@ pub static FRAMEBUFFER_LOGGER: Spinlock<FramebufferLogger> = Spinlock::new(Frame
     fb_base: core::ptr::null_mut(),
     width: 0,
     height: 0,
+    usable_height: 0,
     stride: 0,
     current_x: 0,
     current_y: 0,
@@ -81,7 +84,8 @@ pub static FRAMEBUFFER_LOGGER: Spinlock<FramebufferLogger> = Spinlock::new(Frame
     dirty_max_y: 0,
     display_start_row: 0,
     is_cursor_disabled: false,
-    cursor_height: CURSOR_HEIGHT
+    cursor_height: CURSOR_HEIGHT,
+    is_enabled: false
 });
 
 impl FramebufferLogger {
@@ -94,7 +98,12 @@ impl FramebufferLogger {
         self.height = fb_info.height;
         self.stride = fb_info.stride;
 
+        self.is_enabled = true;
         self.load_font();
+
+        let font_h = self.font_header.height as usize;
+        self.usable_height = (self.height / font_h) * font_h;
+
         self.clear_screen();
     }
 
@@ -194,7 +203,7 @@ impl FramebufferLogger {
         if self.current_x >= self.width {
             self.current_x = 0;
             self.current_y += self.font_header.height as usize;
-            if self.current_y >= self.height {
+            if self.current_y >= self.usable_height {
                 self.scroll_screen();
             }
         }
@@ -208,7 +217,7 @@ impl FramebufferLogger {
             '\n' => {
                 self.current_x = 0;
                 self.current_y += self.font_header.height as usize;
-                if self.current_y >= self.height {
+                if self.current_y >= self.usable_height {
                     self.scroll_screen();
                 }
             },
@@ -245,16 +254,16 @@ impl FramebufferLogger {
         let font_width  = self.font_header.width  as usize;
         let font_height = self.font_header.height as usize;
 
-        if start_x >= self.width || start_y >= self.height {
+        if start_x >= self.width || start_y >= self.usable_height {
             return;
         }
         let draw_width  = font_width.min(self.width  - start_x);
-        let draw_height = font_height.min(self.height - start_y);
+        let draw_height = font_height.min(self.usable_height - start_y);
         let start_height = (draw_height as f64 * (1.0 - self.cursor_height)) as usize;
         self.mark_dirty(start_y, start_y + font_height);
 
         let logical_row = start_y / font_height;
-        let max_rows    = self.height / font_height;
+        let max_rows    = self.usable_height / font_height;
         let phys_row    = (self.display_start_row + logical_row) % max_rows;
         let phys_top    = phys_row * font_height;
         
@@ -293,16 +302,16 @@ impl FramebufferLogger {
         let font_height = self.font_header.height as usize;
         let bytes_per_row = ceil_div(self.font_header.width, 8) as usize;
 
-        if start_x >= self.width || start_y >= self.height {
+        if start_x >= self.width || start_y >= self.usable_height {
             return;
         }
         let draw_width  = font_width.min(self.width  - start_x);
-        let draw_height = font_height.min(self.height - start_y);
+        let draw_height = font_height.min(self.usable_height - start_y);
 
         self.mark_dirty(start_y, start_y + font_height);
 
         let logical_row = start_y / font_height;
-        let max_rows    = self.height / font_height;
+        let max_rows    = self.usable_height / font_height;
         let phys_row    = (self.display_start_row + logical_row) % max_rows;
         // Physical Y of the topmost scanline of this character in the scratch buffer
         let phys_top    = phys_row * font_height;
@@ -342,8 +351,24 @@ impl FramebufferLogger {
         }
     }
     
+    pub fn disable(&mut self) {
+        self.is_enabled = false;
+    }
+
+    pub fn enable(&mut self) {
+        self.is_enabled = true;
+    }
+    
     pub fn disable_cursor(&mut self) {
         self.is_cursor_disabled = true;
+    }
+
+    pub fn enable_cursor(&mut self) {
+        self.is_cursor_disabled = false;
+    }
+
+    pub fn screen_info(&self) -> (*mut u8, usize, usize, usize) {
+        (self.fb_base, self.width, self.height, self.stride)
     }
 
     // Expand the dirty logical-scanline range to cover [y_start, y_end).
@@ -354,7 +379,7 @@ impl FramebufferLogger {
 
     fn scroll_screen(&mut self) {
         let font_height = self.font_header.height as usize;
-        let max_rows = self.height / font_height;
+        let max_rows = self.usable_height / font_height;
         let row_bytes = font_height * self.stride * 4;
 
         // Advance ring-buffer head 
@@ -369,13 +394,17 @@ impl FramebufferLogger {
                 .write_bytes(0, row_bytes);
         }
 
-        // Mark entire screen dirty 
-        self.mark_dirty(0, self.height);
+        // Mark entire screen dirty
+        self.mark_dirty(0, self.usable_height);
 
         self.current_y -= font_height;
     }
 
     pub fn write(&mut self, s: &str) {
+        if !self.is_enabled {
+            return;
+        }
+
         for (idx, c) in s.chars().enumerate() {
             let is_first = idx == 0;
             let is_last = idx == s.len() - 1;
@@ -393,7 +422,7 @@ impl core::fmt::Write for FramebufferLogger {
 
 pub fn flush_log() {
     let mut l = FRAMEBUFFER_LOGGER.lock();
-    if l.dirty_max_y <= l.dirty_min_y {
+    if !l.is_enabled || l.dirty_max_y <= l.dirty_min_y {
         return; // nothing to flush
     }
 

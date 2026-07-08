@@ -9,7 +9,7 @@ use kernel_intf::{KError, ExitInfo, ExitReason, info, debug};
 use kernel_intf::list::{List, DynList};
 use kernel_intf::mem::PoolAllocatorGlobal;
 use crate::fs::FileInstance;
-use crate::loader::{LoadedImage, LoadedImageWeak, load_image};
+use crate::loader::{LoadedImage, LoadedImageWeak, load_image, invoke_init};
 use crate::pipe::PipeType;
 use crate::{KERNEL_PATH, hal};
 use crate::mem::{self, PageDescriptor, VCB, VirtMemConBlk, get_physical_address};
@@ -176,6 +176,10 @@ impl Process {
 
     pub fn set_image(&mut self, img: LoadedImage) {
         self.image = Some(img);
+    }
+
+    pub fn get_image(&self) -> Option<LoadedImage> {
+        self.image.clone()
     }
 
     pub fn get_exit_info(&self) -> ExitInfo {
@@ -598,21 +602,27 @@ extern "C" fn kernel_init_handler() -> ! {
         guard.args[0].clone()
     };
 
-    let img = match load_image(&path, false) {
+    let img = match load_image(&path, false, false) {
         Ok(img) => img,
         Err(e) => {
             info!("kernel_init_handler: failed to load image '{}': {:?}", path, e);
+            // The parent is blocked on init_notify — unblock it before dying.
+            get_current_process().unwrap().lock().complete_init(false);
             exit_process(ExitInfo::normal(-1));
         }
     };
 
-    let entry = img.lock().kernel().info.entry;
-    get_current_process().unwrap().lock().set_image(img);
+    let img_for_init = img.clone();
 
-    let entry_fn: DispatchRoutine = unsafe { core::mem::transmute(entry) };
-    
-    // Call the user entry function
-    entry_fn()
+    {
+        let proc = get_current_process().unwrap();
+        proc.lock().set_image(img);
+        proc.lock().complete_init(true);
+    }
+
+    invoke_init(&img_for_init);
+
+    exit_process(ExitInfo::normal(-1));
 }
 
 pub fn get_current_process_args() -> *const Vec<String> {
@@ -717,11 +727,10 @@ pub fn create_process<T: AsRef<str>>(args: &[T], envp: &[T], context_ptr: *mut c
 
     enable_preemption();
 
-    if is_user {
-        let _ = init_notify_sem.wait(false);
-        if !process.lock().init_status {
-            return Err(KError::ProcessInitFailed);
-        }
+    // Wait for init thread to finish initialization
+    let _ = init_notify_sem.wait(false);
+    if !process.lock().init_status {
+        return Err(KError::ProcessInitFailed);
     }
 
     Ok(process)

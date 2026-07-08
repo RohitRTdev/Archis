@@ -63,12 +63,12 @@ pub struct ModuleInfo {
 }
 
 #[repr(C)]
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum MemType {
     Free,
     Allocated,
     Identity,
-    BootloaderData,
+    BootloaderData
 }
 
 #[repr(C)]

@@ -23,6 +23,7 @@ debug-acpica-logs = []
 debug-pipe-logs = []
 debug-fs-logs = []
 kunit-test = ["kernel_intf/kunit-test"]
+boot-anim = []
 
 [dependencies]
 kernel_intf = {workspace = true, features = ["link-kernel"]}

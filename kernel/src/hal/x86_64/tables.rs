@@ -154,7 +154,7 @@ pub extern "C" fn kern_addr_space_start() -> ! {
     info!("Switched to new address space");
     crate::cpu::set_panic_base(cpu::get_current_stack_base());
     crate::module::complete_handoff();
-
+    
     info!("CPU-0 stack address:{:#X}", cpu::get_current_stack_base());
     init_tables();
     lapic::init();
