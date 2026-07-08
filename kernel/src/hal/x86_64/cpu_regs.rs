@@ -78,6 +78,7 @@ impl Reg for EFER {
 
 impl CR0 {
     pub const PE: u64 = 1 << 0;
+    pub const EM: u64 = 1 << 2;
     pub const ET: u64 = 1 << 4;
     pub const NE: u64 = 1 << 5;
     pub const WP: u64 = 1 << 16;
@@ -124,11 +125,30 @@ pub fn init() {
     let features = *features::CPU_FEATURES.get().unwrap().lock();
     
     unsafe {
-        CPUReg::<CR0>::init(CR0::PE | CR0::ET | CR0::NE | CR0::PG | CR0::WP);
-        CPUReg::<CR4>::init(CR4::PAE | en_flag!(features.pge, CR4::PGE) | CR4::PCE | en_flag!(features.umip, CR4::UMIP) 
+        // CR0::PE - protected mode 
+        // CR0::EM - emulation: traps any x87/MMX/SSE instruction with #UD
+        // CR0::ET - extension type, always 1 on modern CPUs (387 math coprocessor present)
+        // CR0::NE - native exception reporting for FPU errors via #MF instead of legacy IRQ13
+        // CR0::PG - paging enabled
+        // CR0::WP - write-protect enforced
+        CPUReg::<CR0>::init(CR0::PE | CR0::EM | CR0::ET | CR0::NE | CR0::PG | CR0::WP);
+
+        // CR4::PAE  - physical address extension, required for long mode
+        // CR4::PGE  - global pages, skips TLB flush on CR3 reload for global-tagged entries
+        // CR4::PCE  - allows rdpmc from user mode (ring 3)
+        // CR4::UMIP - blocks user mode from executing sgdt/sidt/sldt/etc
+        // CR4::SMEP - faults if supervisor mode ever executes code from a user-mapped page
+        // CR4::SMAP - faults if supervisor mode accesses user-mapped data without explicit override
+        CPUReg::<CR4>::init(CR4::PAE | en_flag!(features.pge, CR4::PGE) | CR4::PCE | en_flag!(features.umip, CR4::UMIP)
         | en_flag!(features.smep, CR4::SMEP) | en_flag!(features.smap, CR4::SMAP));
 
+        // EFER::SCE - enables syscall/sysret instructions
+        // EFER::LME - long mode enable
+        // EFER::LMA - long mode active
         CPUReg::<EFER>::init(EFER::SCE | EFER::LME | EFER::LMA);
+
+        // RFLAGS::IOPL - clear I/O privilege level so ring 3 can't do direct port I/O
+        // RFLAGS::AC   - clear alignment check, we don't want unaligned access faults
         CPUReg::<RFLAGS>::clear(RFLAGS::IOPL | RFLAGS::AC);
 
         if features.pat {

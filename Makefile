@@ -62,7 +62,6 @@ build_blr: $(OUTPUT_DIR)
 	@echo "Building bootloader..." 
 	@(cd $(BLR_CRATE_PATH) && \
 		cargo build $(BUILD_OPTIONS) $(BLR_OPTIONS) \
-		-Z build-std=core,alloc \
 		--target $(BLR_TARGET) \
 	)
 	@cp $(BLR_EXE) $(BLR_TARGET_EXE) 
@@ -130,6 +129,13 @@ build_modules: build_kernel
 build_userspace: $(OUTPUT_DIR)
 	@echo "Building userspace programs..."
 	@mkdir -p target/userspace
+	@if { [ ! -f "target/userspace/release_placeholder.txt" ] && [ "$(CONFIG)" = "release" ]; } \
+	|| { [ -f "target/userspace/release_placeholder.txt" ] && [ "$(CONFIG)" = "debug" ]; }; then \
+		rm -rf target/userspace/*; \
+	fi
+	@if [ "$(CONFIG)" = "release" ]; then \
+		echo -e "Automatically generated file..\nDo not remove manually.." > target/userspace/release_placeholder.txt; \
+	fi
 	@cd userspace && $(MAKE) $(USERSPACE_FLAGS) all
 	@mkdir -p $(OUTPUT_DIR)/conf
 	@cp config/init_sh $(OUTPUT_DIR)/conf/
@@ -140,7 +146,7 @@ run_unit_test: build_kernel_test
 
 test:
 	@echo "Starting simulator..."
-	@qemu-system-x86_64 $(QEMU_CPU_ARGS_WITH_ACCEL) \
+	@qemu-system-x86_64 $(QEMU_CPU_ARGS_WITHOUT_ACCEL) \
 	-device pcie-root-port,id=rp1,chassis=1,slot=1 \
     -device pcie-root-port,id=rp2,chassis=2,slot=2 \
     -device pcie-root-port,id=rp3,chassis=3,slot=3 \
@@ -165,6 +171,7 @@ test:
 clean:
 	@echo "Cleaning all builds..."
 	@cd userspace && $(MAKE) clean $(USERSPACE_FLAGS)
+	@rm -rf target/userspace
 	@cargo clean
 	@rm -rf $(OUTPUT_DIR)
 

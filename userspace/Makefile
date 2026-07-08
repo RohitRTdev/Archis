@@ -14,17 +14,19 @@ ifndef OUTDIR
 $(error OUTDIR must be supplied)
 endif
 
+USER_OPT_FLAGS ?= -O0
+
 CC := clang
 AR := llvm-ar
 
 TARGET := $(ARCH_TARGET)
 
 RUST_HOST := $(shell rustc -vV | grep '^host:' | cut -d' ' -f2)
-RUST_LLD := $(shell rustc --print sysroot)/lib/rustlib/$(RUST_HOST)/bin/rust-lld
+RUST_LLD := $(shell rustc --print sysroot | sed 's/\\/\//g')/lib/rustlib/$(RUST_HOST)/bin/rust-lld
 
 LINKER_SCRIPT := $(USER_LINKER_SCRIPT)
 USER_LLD_FLAGS := -flavor gnu --hash-style=sysv -T $(LINKER_SCRIPT) -rpath /bin
-COMMON_CFLAGS := -target $(TARGET) -ffreestanding -fPIC -nostdinc -Wall -Wextra -MMD -MP -I$(CURDIR)/include
+COMMON_CFLAGS := -target $(TARGET) -ffreestanding -fPIC -nostdinc -Wall -Wextra -MMD -MP -mno-sse -mno-sse2 -mno-mmx -msoft-float $(USER_OPT_FLAGS) -I$(CURDIR)/include
 
 # crt object files will be compiled into every binary that is generated
 CRT_SRCS := crt/*.c crt/$(ARCH)/*
@@ -196,7 +198,7 @@ define DEFINE_SHARED_LIBRARY
 $(OUTDIR)/lib$1.so: $(foreach s,$(call expand-srcs,$($1_SRCS)),$(call src-to-obj,$(s)))
 	@mkdir -p $$(@D)
 	@echo Building shared library $$(@F)
-	@$(RUST_LLD) $(USER_LLD_FLAGS) --shared --soname=lib$1.so -o $$@  $$^
+	@MSYS2_ARG_CONV_EXCL=* $(RUST_LLD) $(USER_LLD_FLAGS) --shared --soname=lib$1.so -o $$@  $$^
 
 ALL_TARGETS += $(OUTDIR)/lib$1.so
 
@@ -228,7 +230,7 @@ $(call SHARED_DEP_PATHS,$1)
 
 	@mkdir -p $$(@D)
 	@echo Linking binary $$(@F)
-	@$(RUST_LLD) \
+	@MSYS2_ARG_CONV_EXCL=* $(RUST_LLD) \
 		$(USER_LLD_FLAGS) -pie \
 		-o $$@ \
 		$(CRT_OBJECTS) \

@@ -17,9 +17,6 @@ use blobs::BlobAnimation;
 const FRAME_INTERVAL_MS: usize = 16;
 
 static STOP: AtomicBool = AtomicBool::new(false);
-// Set right after release_screen_ownership() returns, just before the
-// animation thread exits — the guarantee point that no more framebuffer
-// writes will happen. Polled by kern.rs's stop_boot_animation(wait: true).
 static STOPPED: AtomicBool = AtomicBool::new(false);
 
 #[kmod::init]
