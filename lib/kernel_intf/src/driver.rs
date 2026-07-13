@@ -5,6 +5,8 @@ use super::{Lock, StrRef};
 
 pub const EMPTY_REGION: MemoryRegion = MemoryRegion { base_address: 0, size: 0 };
 pub const MAX_RESOURCE_ENTRIES: usize = 16;
+pub const IRP_BUFFER_ALIGN: usize = core::mem::align_of::<usize>();
+pub const IRP_BUFFER_HEAP_THRESHOLD: usize = 512;
 
 #[repr(usize)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -262,7 +264,8 @@ pub struct Irp {
     pub cancel_routine: Option<extern "C" fn(*const DeviceObject, *mut Irp)>,
     pub cancel_lock: Lock,
     pub thread_id: usize,
-    pub is_completed: bool
+    pub is_completed: bool,
+    pub caller_buffer: MemoryRegion
 }
 
 #[repr(C)]
@@ -295,6 +298,7 @@ impl Irp {
     pub fn new(
         major_code: IrpMajor,
         buffer: MemoryRegion,
+        caller_buffer: MemoryRegion,
         offset: usize,
         completion_routine: extern "C" fn(*mut Irp, *mut c_void),
         completion_ctx: *mut c_void,
@@ -318,7 +322,8 @@ impl Irp {
             cancel_routine: None,
             cancel_lock,
             thread_id,
-            is_completed: false
+            is_completed: false,
+            caller_buffer
         }
     }
 
@@ -326,7 +331,7 @@ impl Irp {
         IrpResult {
             major_code: self.major_code,
             minor_code: self.minor_code,
-            buffer: self.buffer,
+            buffer: if self.caller_buffer.size != 0 { self.caller_buffer } else { self.buffer },
             offset: self.offset,
             status: self.status,
             bytes_completed: self.bytes_completed,

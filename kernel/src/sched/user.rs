@@ -139,7 +139,7 @@ pub fn create_user_thread(user_fn_addr: usize, context: *mut c_void) -> Result<K
 // physical range to the process. Returns the stack top (VA)
 fn setup_user_stack() -> usize {
     let stack = Stack::new_user_stack().expect("Failed to create user stack!");
-    debug!("Created new user stack with base:{:#X}", stack.get_stack_base());
+    crate::sched_log!("Created new user stack with base:{:#X}", stack.get_stack_base());
     let stack_base = stack.get_stack_base();
     add_user_stack_to_cur_task(stack);
     
@@ -263,7 +263,7 @@ pub extern "C" fn user_init_handler() -> ! {
         sched::suspend_process();
     }
 
-    debug!("Transferring control to user module entry:{:#X} with stack:{:#X}", entry, rsp);
+    crate::sched_log!("Transferring control to user module entry:{:#X} with stack:{:#X}", entry, rsp);
     transfer_control_to_user(entry, rsp);
 
     panic!("Should not reach user_init_handler end!");
@@ -563,7 +563,7 @@ fn sys_delay_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
 
 // arg1 = user VA of the thread function (extern "C" fn() -> !), arg2 = context pointer
 fn sys_create_thread_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
-    info!("Creating new user thread..");
+    crate::sched_log!("Creating new user thread..");
     let res = create_user_thread(args[0] as usize, args[1] as *mut c_void);
     match res {
         Ok(user_thread) => {

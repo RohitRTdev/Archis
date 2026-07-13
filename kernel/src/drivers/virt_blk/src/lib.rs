@@ -5,6 +5,7 @@ use core::ffi::c_void;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use common::PAGE_SIZE;
 use kernel_intf::{
     KError, KInterruptHandle, Lock, RemoveLock,
     acquire_spinlock, create_spinlock, release_spinlock,
@@ -320,7 +321,7 @@ fn read_bar_base(bus: u8, device: u8, function: u8, bar_idx: u8) -> u64 {
 }
 
 fn mmio_len(len: u32) -> usize {
-    (len as usize).max(1).next_multiple_of(4096)
+    (len as usize).max(1).next_multiple_of(PAGE_SIZE)
 }
 
 fn map_cap(bus: u8, device: u8, function: u8, cap: &VirtioPciCap) -> Result<*mut u8, KError> {

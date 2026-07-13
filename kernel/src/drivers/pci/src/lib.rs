@@ -332,7 +332,7 @@ fn do_resources(device: &DeviceObject, req: &mut Irp) -> Status {
             };
             if found {
                 info!("PCI {:02X}:{:02X}.{} pin=INT{} gsi={}",
-                    ctx.bus, ctx.device, ctx.function, b'A' + pin, irq_info.gsi);
+                    ctx.bus, ctx.device, ctx.function, pin, irq_info.gsi);
                 entries[count] = ResEntry {
                     res_type: ResType::Interrupt,
                     desc: ResTypeDesc { interrupt: IntDesc {

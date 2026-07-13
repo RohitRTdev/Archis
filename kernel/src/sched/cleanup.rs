@@ -85,7 +85,7 @@ extern "C" fn cleanup_worker() -> ! {
 
             // Deallocate every physical memory region.
             for range in guard.memory_list.iter() {
-                kernel_intf::debug!(
+                crate::sched_log!(
                     "cleanup worker: deallocating base={:#X} size={}",
                     range.base_address, range.size
                 );

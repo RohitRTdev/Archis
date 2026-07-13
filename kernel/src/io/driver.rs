@@ -6,9 +6,10 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use common::{MemoryRegion, StrRef};
+use common::{MemoryRegion, PAGE_SIZE, StrRef};
+use core::alloc::Layout;
 use kernel_intf::driver::{
-    DeviceObject, DeviceType, DriverObject, EMPTY_REGION, Irp, IrpMajor, IrpMinor, IrpResult, ReqInfo, ResList, Status
+    DeviceObject, DeviceType, DriverObject, EMPTY_REGION, IRP_BUFFER_ALIGN, IRP_BUFFER_HEAP_THRESHOLD, Irp, IrpMajor, IrpMinor, IrpResult, ReqInfo, ResList, Status
 };
 use kernel_intf::{acquire_spinlock, io_complete_irp, release_spinlock};
 use kernel_intf::list::{DynList, List};
@@ -17,6 +18,7 @@ use kernel_intf::{KError, info};
 
 use crate::io::stack::deallocate_device_resources;
 use crate::loader::{LoadedImage, load_image};
+use crate::mem::{PageDescriptor, deallocate_memory};
 use crate::sched::{self, cancel_irp, AsyncCtx, allocate_irp, disable_preemption, enable_preemption};
 use crate::sync::{ConfigGuard, KEvent, KSem, Once, Spinlock, semaphore_guard};
 use super::stack::{self, DeviceStack, LevelState};
@@ -1053,6 +1055,19 @@ extern "C" fn io_set_cancel_routine_ffi(
 pub fn deallocate_irp(irp: *mut Irp, ctx: *mut AsyncCtx) {
     crate::io_log!("Deallocating irp {:#X} by thread: {}", irp.addr(), unsafe{(*irp).thread_id});
     disable_preemption();
+    unsafe {
+        if (*irp).caller_buffer.size != 0 {
+            let size = (*irp).buffer.size;
+            if size >= IRP_BUFFER_HEAP_THRESHOLD {
+                let layout = Layout::from_size_align(size, PAGE_SIZE).unwrap();
+                let _ = deallocate_memory((*irp).buffer.base_address as *mut u8, layout, PageDescriptor::VIRTUAL);
+            }
+            else {
+                let layout = Layout::from_size_align(size, IRP_BUFFER_ALIGN).unwrap();
+                alloc::alloc::dealloc((*irp).buffer.base_address as *mut u8, layout);
+            }
+        }
+    }
     drop(unsafe { Box::from_raw_in(irp, PoolAllocatorGlobal) });
     drop(unsafe { Box::from_raw_in(ctx, PoolAllocatorGlobal) });
     enable_preemption();

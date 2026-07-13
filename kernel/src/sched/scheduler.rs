@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use common::{MemoryRegion, PAGE_SIZE, align_down, get_highest_set_bit};
 use core::ptr::{null_mut, NonNull};
 use core::mem::take;
+use core::alloc::Layout;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicIsize, AtomicUsize, Ordering};
 use core::ffi::c_void;
 use super::{DispatchRoutine, KProcess, ProcessStatus, get_current_process, get_process_info};
@@ -17,7 +18,7 @@ use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
 use crate::io::{DeviceHandleK, DeviceObjectK, DeviceState, IrpPtr, deallocate_irp};
 use kernel_intf::mem::{PoolAllocator, PoolAllocatorGlobal};
 use kernel_intf::list::{DynList, List, ListNode, ListNodeGuard};
-use kernel_intf::driver::{Irp, IrpMajor, IrpMinor, IrpResult, Status};
+use kernel_intf::driver::{Irp, IrpMajor, IrpMinor, IrpResult, Status, IRP_BUFFER_ALIGN, IRP_BUFFER_HEAP_THRESHOLD};
 use kernel_intf::{acquire_spinlock, release_spinlock};
 use kernel_intf::{KError, ExitInfo, ExitReason, debug, info};
 
@@ -963,6 +964,20 @@ extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
         dev.pending_irps_drained_event().signal();
     }
 
+    // Copy the IRP-owned scratch buffer's contents back to the caller's own buffer
+    if status != Status::Cancelled {
+        let irp_ref = unsafe { &*irp };
+        if irp_ref.caller_buffer.size != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    irp_ref.buffer.base_address as *const u8,
+                    irp_ref.caller_buffer.base_address as *mut u8,
+                    irp_ref.caller_buffer.size
+                );
+            }
+        }
+    }
+
     // Run the completion routines.
     match &mut ctx.comp_type {
         CompletionCtxType::Sync((event, result_ptr)) => {
@@ -992,7 +1007,7 @@ extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
 pub fn allocate_irp(
     major: IrpMajor,
     minor: IrpMinor,
-    buffer: MemoryRegion,
+    caller_buffer: MemoryRegion,
     offset: usize,
     device: DeviceHandleK,
     complete_event: Option<KEvent>,
@@ -1007,6 +1022,35 @@ pub fn allocate_irp(
         enable_preemption();
         return Err(KError::ThreadTerminated);
     }
+
+    let buffer = if caller_buffer.size != 0 {
+        let base = if caller_buffer.size >= IRP_BUFFER_HEAP_THRESHOLD {
+            let layout = Layout::from_size_align(caller_buffer.size, PAGE_SIZE).unwrap();
+            match allocate_memory(layout, PageDescriptor::VIRTUAL) {
+                Ok(p) => p,
+                Err(_) => {
+                    enable_preemption();
+                    return Err(KError::OutOfMemory);
+                }
+            }
+        }
+        else {
+            let layout = Layout::from_size_align(caller_buffer.size, IRP_BUFFER_ALIGN).unwrap();
+            let p = unsafe { alloc::alloc::alloc(layout) };
+            if p.is_null() {
+                enable_preemption();
+                return Err(KError::OutOfMemory);
+            }
+            p
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(caller_buffer.base_address as *const u8, base, caller_buffer.size);
+        }
+        MemoryRegion { base_address: base as usize, size: caller_buffer.size }
+    }
+    else {
+        MemoryRegion { base_address: 0, size: 0 }
+    };
 
     // Create the context and irp
     let actx = Box::into_raw_with_allocator(Box::new_in(
@@ -1039,7 +1083,7 @@ pub fn allocate_irp(
     let device_field = ptr as usize;
 
     let mut irp_box = Box::new_in(
-        Irp::new(major, buffer, offset, io_complete, actx as *mut c_void, device_field, guard.get_id()),
+        Irp::new(major, buffer, caller_buffer, offset, io_complete, actx as *mut c_void, device_field, guard.get_id()),
         PoolAllocatorGlobal
     );
     irp_box.minor_code = minor;
