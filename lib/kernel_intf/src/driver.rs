@@ -420,7 +420,8 @@ impl Default for DispatchTable {
 pub enum DeviceType {
     None  = 0,
     Input = 1,
-    Disk  = 2
+    Disk  = 2,
+    Pci   = 3
 }
 
 impl DeviceType {

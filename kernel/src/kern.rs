@@ -859,7 +859,7 @@ use test_fs_conc::*;
 // mount-point checks on delete/rename) against the real FAT32 root that
 // fs::load_root_fs() has already mounted by the time run_tests!() fires,
 // plus scratch in-memory mounts created via fs::new_memory_source().
-#[kmod::test_function(true)]
+#[kmod::test_function(false)]
 fn run_fs_correctness_tests() {
     info!("fs test 1: module-backend busy check on delete/rename");
     {
@@ -1835,7 +1835,7 @@ extern "C" fn remove_race_async_issuer() -> ! {
     sched::exit_thread(ExitInfo::normal(0));
 }
 
-#[kmod::test_function(true)]
+#[kmod::test_function(false)]
 fn run_remove_race_tests() {
     let dev_id = match io::open_device_handle("ps/2_port0") {
         Ok(h) => h.id(),

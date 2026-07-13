@@ -685,6 +685,18 @@ pub fn unload_driver(name: &str) -> Result<(), KError> {
     Ok(())
 }
 
+#[unsafe(no_mangle)]
+extern "C" fn io_get_device_type_ffi(device: *const DeviceObject) -> DeviceType {
+    let res = resolve_device(device);
+    if res.is_none() {
+        return DeviceType::None;
+    }
+
+    let dev = res.unwrap();
+    dev.device_type
+}
+
+
 // Returns null on failure. Failure causes: unknown driver id, or the supplied
 // name is already registered for another device 
 #[unsafe(no_mangle)]

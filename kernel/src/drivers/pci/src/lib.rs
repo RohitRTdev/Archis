@@ -201,7 +201,7 @@ fn scan_bus(
                     PoolAllocatorGlobal
                 );
                 let pdo_ctx_ptr = alloc::boxed::Box::into_raw_with_allocator(pdo_ctx).0 as *mut c_void;
-                let new_pdo = create_device_by_id(driver_id, None, pdo_ctx_ptr, Some(fdo), false, DeviceType::None);
+                let new_pdo = create_device_by_id(driver_id, None, pdo_ctx_ptr, Some(fdo), false, DeviceType::Pci);
                 if new_pdo.is_null() {
                     unsafe { drop(alloc::boxed::Box::from_raw_in(pdo_ctx_ptr as *mut PciCtx, PoolAllocatorGlobal)); }
                     continue;
@@ -356,4 +356,33 @@ fn do_resources(device: &DeviceObject, req: &mut Irp) -> Status {
     req.req_info.res_list.count = fill_count;
     req.complete_irp(Status::Success);
     Status::Success
+}
+
+
+#[kmod::export]
+fn walk_pci_cap_list(
+    pci_dev: *const DeviceObject,
+    match_cap_id: u8,
+    callback: extern "C" fn(bus: u8, device: u8, function: u8, offset: u8, ctx: *mut c_void),
+    ctx: *mut c_void
+) {
+    let pci_ctx = unsafe { &*((*pci_dev).ctx as *const PciCtx) };
+
+    // Check if cap list is present
+    let status = pci_cfg_read16(pci_ctx.bus, pci_ctx.device, pci_ctx.function, 0x6);
+    if status & (1 << 4) == 0 {
+        return;
+    }
+
+    let mut cap: u8 = pci_cfg_read8(pci_ctx.bus, pci_ctx.device, pci_ctx.function, 0x34) & !0x3u8;
+    while cap != 0 {
+        let cap_id: u8 = pci_cfg_read8(pci_ctx.bus, pci_ctx.device, pci_ctx.function, cap);
+        let next: u8 = pci_cfg_read8(pci_ctx.bus, pci_ctx.device, pci_ctx.function, cap + 1);
+
+        if cap_id == match_cap_id {
+            callback(pci_ctx.bus, pci_ctx.device, pci_ctx.function, cap, ctx);
+        }
+
+        cap = next & !0x3u8;
+    }
 }

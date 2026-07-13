@@ -997,6 +997,63 @@ pub fn get_physical_address(virt_addr: usize, flags: u8) -> Option<usize> {
     }
 }
 
+#[unsafe(no_mangle)]
+extern "C" fn map_memory_ffi(phys_addr: usize, virt_addr: usize, size: usize, flags: u8) -> KError {
+    match map_memory(phys_addr, virt_addr, size, flags) {
+        Ok(()) => KError::Success,
+        Err(e) => e
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn unmap_memory_ffi(virt_addr: *mut u8, size: usize, flags: u8) -> KError {
+    match unmap_memory(virt_addr as usize, size, flags) {
+        Ok(()) => KError::Success,
+        Err(e) => e
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn allocate_memory_ffi(size: usize, align: usize, flags: u8, out: *mut *mut u8) -> KError {
+    let layout = match Layout::from_size_align(size, align) {
+        Ok(l) => l,
+        Err(_) => return KError::InvalidArgument
+    };
+    match allocate_memory(layout, flags) {
+        Ok(ptr) => {
+            unsafe { *out = ptr; }
+            KError::Success
+        }
+        Err(e) => {
+            unsafe { *out = null_mut(); }
+            e
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn deallocate_memory_ffi(addr: *mut u8, size: usize, align: usize, flags: u8) -> KError {
+    let layout = match Layout::from_size_align(size, align) {
+        Ok(l) => l,
+        Err(_) => return KError::InvalidArgument
+    };
+    match deallocate_memory(addr, layout, flags) {
+        Ok(()) => KError::Success,
+        Err(e) => e
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn get_physical_address_ffi(virt_addr: usize, flags: u8, out: *mut usize) -> bool {
+    match get_physical_address(virt_addr, flags) {
+        Some(phys) => {
+            unsafe { *out = phys; }
+            true
+        }
+        None => false
+    }
+}
+
 // Unlike get_physical_address, multiple virtual addresses could be mapped to the same physical address
 // fetch type allows user to filter out the particular region they want
 // Following rules are applicable only when there is more than one virtual address for given physical address

@@ -13,10 +13,10 @@ USER_LINKER_SCRIPT := config/x86_64/user_linker.ld
 OUTPUT_IMAGE = $(OUTPUT_DIR)/archis_os.img
 PLATFORM := acpi
 BOOTLOADER := uefi
-KERNEL_OPTIONS := --features acpi,stack_down,boot-anim
+KERNEL_OPTIONS := --features acpi,stack_down
 BLR_OPTIONS := --features acpi
 NO_DOCKER := false
-DRIVER_LIST := acpi pci i8042 input tty ec disk
+DRIVER_LIST := acpi pci i8042 input tty ec disk virt_blk
 
 ifeq ($(OS),Windows_NT)
     RUN_DOCKER_SCRIPT := @./scripts/docker.bat

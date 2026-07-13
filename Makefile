@@ -147,26 +147,10 @@ run_unit_test: build_kernel_test
 test:
 	@echo "Starting simulator..."
 	@qemu-system-x86_64 $(QEMU_CPU_ARGS_WITHOUT_ACCEL) \
-	-device pcie-root-port,id=rp1,chassis=1,slot=1 \
-    -device pcie-root-port,id=rp2,chassis=2,slot=2 \
-    -device pcie-root-port,id=rp3,chassis=3,slot=3 \
-    \
-    -device x3130-upstream,id=up0,bus=rp1 \
-    -device xio3130-downstream,id=ds1,bus=up0,chassis=10 \
-    -device xio3130-downstream,id=ds2,bus=up0,chassis=11 \
-    \
-    -device pci-bridge,id=br0,bus=ds2,chassis_nr=20 \
-    -device pci-bridge,id=br1,bus=br0,chassis_nr=21 \
-    \
-    -device pci-bridge,id=br2,bus=rp2,chassis_nr=22 \
-    \
-    -device e1000,bus=rp3 \
-    -device e1000,bus=ds1 \
-    -device e1000,bus=br0 \
-    -device e1000,bus=br1 \
-    -device e1000,bus=br2 \
 	-drive if=pflash,format=raw,readonly=on,file=scripts/OVMF.fd \
-	-drive file=$(OUTPUT_DIR)/archis_os.img,format=raw,if=ide -m 512M -serial stdio | tee >(sed 's/\x1b\[[0-9;=]*[A-Za-z]//g' > $(OUTPUT_DIR)/con_log.txt)
+	-drive file=$(OUTPUT_DIR)/archis_os.img,format=raw,if=none,id=drv0 \
+	-device virtio-blk-pci,drive=drv0,disable-legacy=on \
+	-m 512M -serial stdio | tee >(sed 's/\x1b\[[0-9;=]*[A-Za-z]//g' > $(OUTPUT_DIR)/con_log.txt)
 
 clean:
 	@echo "Cleaning all builds..."

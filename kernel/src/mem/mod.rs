@@ -12,23 +12,10 @@ pub use virtual_allocator::*;
 pub const KERNEL_HALF_OFFSET: usize = 0xffff800000000000;
 const KERNEL_HALF_OFFSET_RAW: usize = 0x0000800000000000;
 
-#[derive(Debug, Clone)]
-pub struct PageDescriptor {
-    num_pages: usize,
-    start_phy_address: usize,
-    start_virt_address: usize,
-    flags: u8,
-    is_mapped: bool
-}
-
-
-impl PageDescriptor {
-    pub const VIRTUAL: u8 = 1;
-    pub const USER: u8 = 1 << 1;
-    pub const NO_ALLOC: u8 = 1 << 2;
-    pub const MMIO: u8 = 1 << 3;
-    pub const WC: u8 = 1 << 4;
-}
+// Canonical definition lives in kernel_intf so drivers (which allocate/map
+// MMIO and DMA memory through the kernel_intf FFI) share the exact same
+// flags the kernel's own allocator uses internally.
+pub use kernel_intf::mem::PageDescriptor;
 
 pub fn init() {
     frame_allocator_init();

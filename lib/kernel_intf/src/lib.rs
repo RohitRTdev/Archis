@@ -19,6 +19,8 @@ use core::{ffi::c_void, fmt};
 use common::StrRef;
 use alloc::vec::Vec;
 
+use crate::driver::{DeviceObject, DeviceType};
+
 pub type InterruptRoutine = extern "C" fn(*mut core::ffi::c_void) -> bool;
 pub type SessionType      = usize;
 pub type ProcessGroupType = usize;
@@ -300,10 +302,11 @@ unsafe extern "C" {
     pub fn read_timestamp() -> usize;
     pub fn get_core_ffi() -> usize;
     pub fn serial_print_ffi(s: *const u8, len: usize);
-    pub fn map_memory_ffi(phys_addr: usize, phys_addr: usize, size: usize, flags: u8) -> KError;
-    pub fn unmap_memory_ffi(virt_addr: *mut u8, size: usize) -> KError; 
-    pub fn allocate_memory_ffi(size: usize, align: usize, flags: u8) -> KError;
+    pub fn map_memory_ffi(phys_addr: usize, virt_addr: usize, size: usize, flags: u8) -> KError;
+    pub fn unmap_memory_ffi(virt_addr: *mut u8, size: usize, flags: u8) -> KError;
+    pub fn allocate_memory_ffi(size: usize, align: usize, flags: u8, out: *mut *mut u8) -> KError;
     pub fn deallocate_memory_ffi(addr: *mut u8, size: usize, align: usize, flags: u8) -> KError;
+    pub fn get_physical_address_ffi(virt_addr: usize, flags: u8, out: *mut usize) -> bool;
     pub fn pool_alloc_ffi(size: usize, align: usize, out: *mut *mut u8) -> KError;
     pub fn pool_dealloc_ffi(ptr: *mut u8, size: usize, align: usize) -> KError;
     pub fn heap_alloc_ffi(size: usize, align: usize, out: *mut *mut u8) -> KError;
@@ -359,6 +362,7 @@ unsafe extern "C" {
     ) -> KInterruptHandle;
 
     fn io_remove_interrupt_handler_ffi(handle: KInterruptHandle);
+    fn io_get_device_type_ffi(device: *const DeviceObject) -> DeviceType;
     fn sched_exit_process_ffi(exit_info: ExitInfo) -> !;
     fn sched_get_num_process_args_ffi() -> usize;
     fn sched_get_cur_process_arg_ffi(num: usize) -> StrRef;
@@ -441,6 +445,10 @@ pub fn io_start_processing(irp: *mut driver::Irp) -> bool {
 
 pub fn io_complete_irp(irp: *mut driver::Irp, status: driver::Status) {
     unsafe { io_complete_irp_ffi(irp, status) }
+}
+
+pub fn io_get_device_type(device: &DeviceObject) -> DeviceType {
+    unsafe { io_get_device_type_ffi(device as *const _) }
 }
 
 pub fn io_install_interrupt_handler(
