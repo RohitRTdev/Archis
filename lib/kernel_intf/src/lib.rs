@@ -348,7 +348,7 @@ unsafe extern "C" {
     fn io_set_cancel_routine_ffi(
         irp: *mut driver::Irp,
         routine: extern "C" fn(*const driver::DeviceObject, *mut driver::Irp)
-    ); 
+    ) -> bool;
     fn io_start_processing_ffi(irp: *mut driver::Irp) -> bool;
 
     fn sched_delay_ms_ffi(value: usize);
@@ -466,11 +466,12 @@ pub fn io_remove_interrupt_handler(handle: KInterruptHandle) {
     unsafe { io_remove_interrupt_handler_ffi(handle); }
 }
 
+#[must_use]
 pub fn io_set_cancel_routine(
     irp: &mut driver::Irp,
     routine: extern "C" fn(*const driver::DeviceObject, *mut driver::Irp)
-) {
-    unsafe { io_set_cancel_routine_ffi(irp, routine); }
+) -> bool {
+    unsafe { io_set_cancel_routine_ffi(irp, routine) }
 }
 
 pub fn sched_exit_process(exit_info: ExitInfo) -> ! {

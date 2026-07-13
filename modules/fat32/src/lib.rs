@@ -242,9 +242,7 @@ fn fs_read(dev: *const DeviceObject, handle: usize, buf: MemoryRegion, file_offs
     };
 
     // Read the file's current cluster/size out of the shared, refcounted
-    // state every handle to this file points at -- always up to date, since
-    // a concurrent write from another handle updates this same struct, not
-    // a private per-handle copy.
+    // state every handle to this file points at 
     let file_sem = unsafe { (*shared).sem };
     sync_wait_semaphore(file_sem);
     let first_cluster = unsafe { (*shared).first_cluster };

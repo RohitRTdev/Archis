@@ -69,12 +69,6 @@ struct RemapEntry {
 
 const KERNEL_PATH: &'static str = "/sys/aris";
 
-// "9ffd2959-915c-479f-8787-1f9f701e1034"
-pub const ROOT_UUID: [u8; 16] = [
-    0x9f, 0xfd, 0x29, 0x59, 0x91, 0x5c, 0x47, 0x9f,
-    0x87, 0x87, 0x1f, 0x9f, 0x70, 0x1e, 0x10, 0x34
-];
-
 struct InitFS {
     fs: BTreeMap<&'static str, &'static [u8]>,
     symlinks: BTreeMap<&'static str, &'static str>
@@ -1509,9 +1503,8 @@ fn kern_main() -> ! {
 
     io::init();
     intf::init();
-    #[cfg(feature = "kunit-test")]
     fs::load_root_fs();
-    
+
     kernel_intf::run_tests!();
     
     #[cfg(all(not(feature = "kunit-test"),feature = "boot-anim"))]
@@ -1910,6 +1903,242 @@ fn run_remove_race_tests() {
 
     assert!(io::get_device(dev_id).is_none(), "device must be gone from the registry after remove_device");
     info!("run_remove_race_tests: PASSED");
+}
+
+// virt_blk (virtio-blk) read/write tests.
+#[cfg(feature = "kunit-test")]
+const VBLK_SECTOR_SIZE: usize = 512;
+#[cfg(feature = "kunit-test")]
+const VBLK_TEST_LBA_SINGLE: u64 = 400_000;
+#[cfg(feature = "kunit-test")]
+const VBLK_TEST_LBA_MULTI: u64 = 400_010;
+#[cfg(feature = "kunit-test")]
+const VBLK_TEST_LBA_THREAD_BASE: u64 = 400_100;
+
+// Fills `buf` with a repeating, position-varying pattern seeded by `seed` --
+// distinctive enough that reading back stale/zeroed disk content wouldn't
+// accidentally match it.
+#[cfg(feature = "kunit-test")]
+fn vblk_fill_pattern(buf: &mut [u8], seed: u8) {
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = seed ^ (i as u8);
+    }
+}
+
+#[cfg(feature = "kunit-test")]
+static VBLK_THREAD_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "kunit-test")]
+fn vblk_worker_body(idx: u8) {
+    let lba = VBLK_TEST_LBA_THREAD_BASE + (idx as u64) * 8;
+    let handle = match io::open_device_handle("vblk0") {
+        Ok(h) => h,
+        Err(_) => {
+            info!("vblk worker {}: device not found", idx);
+            VBLK_THREAD_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    const SECTORS: usize = 2;
+    const SIZE: usize = SECTORS * VBLK_SECTOR_SIZE;
+    let mut backup = [0u8; SIZE];
+    let mut pattern = [0u8; SIZE];
+    let mut readback = [0u8; SIZE];
+    vblk_fill_pattern(&mut pattern, 0xC0 | idx);
+
+    let ok = matches!(handle.read(io::ReadRequest {
+        buffer: MemoryRegion { base_address: backup.as_mut_ptr() as usize, size: SIZE },
+        offset: lba as usize
+    }, false), Ok(Status::Success))
+    && matches!(handle.write(io::ReadRequest {
+        buffer: MemoryRegion { base_address: pattern.as_ptr() as usize, size: SIZE },
+        offset: lba as usize
+    }, false), Ok(Status::Success))
+    && matches!(handle.read(io::ReadRequest {
+        buffer: MemoryRegion { base_address: readback.as_mut_ptr() as usize, size: SIZE },
+        offset: lba as usize
+    }, false), Ok(Status::Success))
+    && readback == pattern
+    && matches!(handle.write(io::ReadRequest {
+        buffer: MemoryRegion { base_address: backup.as_ptr() as usize, size: SIZE },
+        offset: lba as usize
+    }, false), Ok(Status::Success));
+
+    if ok {
+        info!("vblk worker {}: PASSED (lba={})", idx, lba);
+    } else {
+        info!("vblk worker {}: FAILED (lba={})", idx, lba);
+        VBLK_THREAD_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "kunit-test")]
+extern "C" fn vblk_concurrent_worker_0() -> ! { vblk_worker_body(0); sched::exit_thread(ExitInfo::normal(0)) }
+#[cfg(feature = "kunit-test")]
+extern "C" fn vblk_concurrent_worker_1() -> ! { vblk_worker_body(1); sched::exit_thread(ExitInfo::normal(0)) }
+#[cfg(feature = "kunit-test")]
+extern "C" fn vblk_concurrent_worker_2() -> ! { vblk_worker_body(2); sched::exit_thread(ExitInfo::normal(0)) }
+#[cfg(feature = "kunit-test")]
+extern "C" fn vblk_concurrent_worker_3() -> ! { vblk_worker_body(3); sched::exit_thread(ExitInfo::normal(0)) }
+
+#[kmod::test_function(true)]
+fn run_virt_blk_tests() {
+    info!("=== run_virt_blk_tests: BEGIN ===");
+
+    // Wait for PnP to enumerate the PCI device stack and bring vblk0 up.
+    sched::delay_ms(500, false);
+
+    let handle = match io::open_device_handle("vblk0") {
+        Ok(h) => h,
+        Err(_) => {
+            info!("virt_blk test: 'vblk0' device not found, skipping");
+            return;
+        }
+    };
+
+    // Test 1: single-sector write, read back, verify, restore.
+    {
+        let lba = VBLK_TEST_LBA_SINGLE;
+        let mut backup = [0u8; VBLK_SECTOR_SIZE];
+        let mut pattern = [0u8; VBLK_SECTOR_SIZE];
+        let mut readback = [0u8; VBLK_SECTOR_SIZE];
+        vblk_fill_pattern(&mut pattern, 0xA1);
+
+        let res = handle.read(io::ReadRequest {
+            buffer: MemoryRegion { base_address: backup.as_mut_ptr() as usize, size: VBLK_SECTOR_SIZE },
+            offset: lba as usize
+        }, false);
+        assert!(matches!(res, Ok(Status::Success)), "vblk test 1: backup read failed: {:?}", res);
+
+        let res = handle.write(io::ReadRequest {
+            buffer: MemoryRegion { base_address: pattern.as_ptr() as usize, size: VBLK_SECTOR_SIZE },
+            offset: lba as usize
+        }, false);
+        assert!(matches!(res, Ok(Status::Success)), "vblk test 1: write failed: {:?}", res);
+
+        let res = handle.read(io::ReadRequest {
+            buffer: MemoryRegion { base_address: readback.as_mut_ptr() as usize, size: VBLK_SECTOR_SIZE },
+            offset: lba as usize
+        }, false);
+        assert!(matches!(res, Ok(Status::Success)), "vblk test 1: read-back failed: {:?}", res);
+        assert!(readback == pattern, "vblk test 1: read-back mismatch");
+
+        let res = handle.write(io::ReadRequest {
+            buffer: MemoryRegion { base_address: backup.as_ptr() as usize, size: VBLK_SECTOR_SIZE },
+            offset: lba as usize
+        }, false);
+        assert!(matches!(res, Ok(Status::Success)), "vblk test 1: restore failed: {:?}", res);
+
+        info!("vblk test 1: PASSED (single sector, lba={})", lba);
+    }
+
+    // Test 2: multi-sector (8 sectors = 4096 bytes) write/read/verify/restore.
+    {
+        const SECTORS: usize = 8;
+        const SIZE: usize = SECTORS * VBLK_SECTOR_SIZE;
+        let lba = VBLK_TEST_LBA_MULTI;
+        let mut backup = vec![0u8; SIZE];
+        let mut pattern = vec![0u8; SIZE];
+        let mut readback = vec![0u8; SIZE];
+        vblk_fill_pattern(&mut pattern, 0xB2);
+
+        let res = handle.read(io::ReadRequest {
+            buffer: MemoryRegion { base_address: backup.as_mut_ptr() as usize, size: SIZE },
+            offset: lba as usize
+        }, false);
+        assert!(matches!(res, Ok(Status::Success)), "vblk test 2: backup read failed: {:?}", res);
+
+        let res = handle.write(io::ReadRequest {
+            buffer: MemoryRegion { base_address: pattern.as_ptr() as usize, size: SIZE },
+            offset: lba as usize
+        }, false);
+        assert!(matches!(res, Ok(Status::Success)), "vblk test 2: write failed: {:?}", res);
+
+        let res = handle.read(io::ReadRequest {
+            buffer: MemoryRegion { base_address: readback.as_mut_ptr() as usize, size: SIZE },
+            offset: lba as usize
+        }, false);
+        assert!(matches!(res, Ok(Status::Success)), "vblk test 2: read-back failed: {:?}", res);
+        assert!(readback == pattern, "vblk test 2: read-back mismatch");
+
+        let res = handle.write(io::ReadRequest {
+            buffer: MemoryRegion { base_address: backup.as_ptr() as usize, size: SIZE },
+            offset: lba as usize
+        }, false);
+        assert!(matches!(res, Ok(Status::Success)), "vblk test 2: restore failed: {:?}", res);
+
+        info!("vblk test 2: PASSED ({} sectors, lba={})", SECTORS, lba);
+    }
+
+    // Test 2.5: stop the device, verify I/O is rejected, restart it, verify
+    // I/O works again -- proves do_stop/do_start correctly tear down and
+    // rebuild the virtqueue/BAR mappings across a full restart cycle.
+    {
+        let lba = VBLK_TEST_LBA_SINGLE;
+        let mut backup = [0u8; VBLK_SECTOR_SIZE];
+        let mut pattern = [0u8; VBLK_SECTOR_SIZE];
+        let mut readback = [0u8; VBLK_SECTOR_SIZE];
+        vblk_fill_pattern(&mut pattern, 0xC3);
+
+        let res = handle.read(io::ReadRequest {
+            buffer: MemoryRegion { base_address: backup.as_mut_ptr() as usize, size: VBLK_SECTOR_SIZE },
+            offset: lba as usize
+        }, false);
+        assert!(matches!(res, Ok(Status::Success)), "vblk stop/start test: pre-backup read failed: {:?}", res);
+
+        let dev_ptr = handle.device_ptr();
+        let stop_status = kernel_intf::io_stop_device(dev_ptr);
+        assert!(stop_status == Status::Success, "vblk stop/start test: io_stop_device failed: {:?}", stop_status);
+
+        // I/O against a Stopped device must be rejected at admission, not
+        // silently succeed or hang.
+        let res = handle.read(io::ReadRequest {
+            buffer: MemoryRegion { base_address: readback.as_mut_ptr() as usize, size: VBLK_SECTOR_SIZE },
+            offset: lba as usize
+        }, false);
+        assert!(res.is_err(), "vblk stop/start test: read succeeded against a stopped device: {:?}", res);
+
+        let start_status = kernel_intf::io_start_device(dev_ptr);
+        assert!(start_status == Status::Success, "vblk stop/start test: io_start_device failed: {:?}", start_status);
+
+        // Post-restart: virtqueue/BAR state must have been rebuilt correctly.
+        let res = handle.write(io::ReadRequest {
+            buffer: MemoryRegion { base_address: pattern.as_ptr() as usize, size: VBLK_SECTOR_SIZE },
+            offset: lba as usize
+        }, false);
+        assert!(matches!(res, Ok(Status::Success)), "vblk stop/start test: post-restart write failed: {:?}", res);
+
+        let res = handle.read(io::ReadRequest {
+            buffer: MemoryRegion { base_address: readback.as_mut_ptr() as usize, size: VBLK_SECTOR_SIZE },
+            offset: lba as usize
+        }, false);
+        assert!(matches!(res, Ok(Status::Success)), "vblk stop/start test: post-restart read failed: {:?}", res);
+        assert!(readback == pattern, "vblk stop/start test: post-restart read-back mismatch");
+
+        let res = handle.write(io::ReadRequest {
+            buffer: MemoryRegion { base_address: backup.as_ptr() as usize, size: VBLK_SECTOR_SIZE },
+            offset: lba as usize
+        }, false);
+        assert!(matches!(res, Ok(Status::Success)), "vblk stop/start test: restore failed: {:?}", res);
+
+        info!("vblk stop/start test: PASSED (lba={})", lba);
+    }
+
+    // Test 3: concurrent reads/writes from 4 threads, each against its own
+    // non-overlapping LBA range.
+    VBLK_THREAD_FAILURES.store(0, Ordering::Relaxed);
+    let t0 = sched::create_thread(vblk_concurrent_worker_0, core::ptr::null_mut()).expect("vblk: spawn worker 0");
+    let t1 = sched::create_thread(vblk_concurrent_worker_1, core::ptr::null_mut()).expect("vblk: spawn worker 1");
+    let t2 = sched::create_thread(vblk_concurrent_worker_2, core::ptr::null_mut()).expect("vblk: spawn worker 2");
+    let t3 = sched::create_thread(vblk_concurrent_worker_3, core::ptr::null_mut()).expect("vblk: spawn worker 3");
+    t0.wait(false); t1.wait(false); t2.wait(false); t3.wait(false);
+
+    let failures = VBLK_THREAD_FAILURES.load(Ordering::Relaxed);
+    assert!(failures == 0, "vblk test 3: {} concurrent worker(s) failed", failures);
+    info!("vblk test 3: PASSED (4 concurrent readers/writers)");
+
+    info!("=== run_virt_blk_tests: PASSED ===");
 }
 
 // This will be called from the entry point for the corresponding arch

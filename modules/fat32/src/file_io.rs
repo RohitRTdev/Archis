@@ -26,12 +26,18 @@ pub fn read_file(
     let cluster_size = bpb.cluster_size();
     let to_read = (out.len() as u64).min(file_size - offset) as usize;
 
+    let mut cluster_index = offset / cluster_size;
+    let mut cluster = fat::cluster_at_index(dev, bpb, first_cluster, cluster_index, false)?;
+
     let mut done = 0usize;
     let mut cur_offset = offset;
     while done < to_read {
-        let cluster_index = cur_offset / cluster_size;
+        let target_index = cur_offset / cluster_size;
+        if target_index > cluster_index {
+            cluster = fat::cluster_at_index(dev, bpb, cluster, target_index - cluster_index, false)?;
+            cluster_index = target_index;
+        }
         let in_cluster_off = (cur_offset % cluster_size) as usize;
-        let cluster = fat::cluster_at_index(dev, bpb, first_cluster, cluster_index, false)?;
 
         let mut cluster_buf = vec![0u8; cluster_size as usize];
         read_sectors(dev, fat::cluster_to_lba(bpb, cluster), &mut cluster_buf)?;
@@ -63,12 +69,18 @@ pub fn write_file(
     }
     let cluster_size = bpb.cluster_size();
 
+    let mut cluster_index = offset / cluster_size;
+    let mut cluster = fat::cluster_at_index(dev, bpb, *first_cluster, cluster_index, true)?;
+
     let mut written = 0usize;
     let mut cur_offset = offset;
     while written < data.len() {
-        let cluster_index = cur_offset / cluster_size;
+        let target_index = cur_offset / cluster_size;
+        if target_index > cluster_index {
+            cluster = fat::cluster_at_index(dev, bpb, cluster, target_index - cluster_index, true)?;
+            cluster_index = target_index;
+        }
         let in_cluster_off = (cur_offset % cluster_size) as usize;
-        let cluster = fat::cluster_at_index(dev, bpb, *first_cluster, cluster_index, true)?;
 
         let mut cluster_buf = vec![0u8; cluster_size as usize];
         read_sectors(dev, fat::cluster_to_lba(bpb, cluster), &mut cluster_buf)?;

@@ -10,12 +10,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use kernel_intf::{
-    Lock, acquire_spinlock, create_spinlock, info, io_remove_device, io_start_device,
-    io_stop_device, release_spinlock
+    Lock, acquire_spinlock, create_spinlock, info, io_remove_device, io_send_request,
+    io_start_device, io_stop_device, release_spinlock
 };
 use kernel_intf::driver::{
-    CreatePartitionInfo, DeviceObject, DeviceType, DriverObject, Irp, IrpMinor,
-    PartitionInfo, DiskInfo, Status, create_device_by_id
+    CreatePartitionInfo, DeviceObject, DeviceType, DriverObject, Irp, IrpMajor, IrpMinor,
+    IrpResult, PartitionInfo, DiskInfo, ReqInfo, Status, create_device_by_id
 };
 use kernel_intf::mem::PoolAllocatorGlobal;
 
@@ -25,16 +25,10 @@ use gpt::{
     GptHeader, GptPartitionEntry, SECTOR_SIZE, crc32, encode_protective_mbr
 };
 
-// The disk driver owns purely in-memory LBA storage — there's no real
-// nvme/ahci/usb driver underneath it yet. One raw disk is created per Root
-// stack instance (we only wire up one in boot.conf, so this is always disk0).
-const DISK_SIZE_BYTES: usize = 64 * 1024 * 1024;
-const DISK_LBA_COUNT: u64 = (DISK_SIZE_BYTES / SECTOR_SIZE) as u64;
-
 static DISK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-fn last_usable_lba() -> u64 {
-    DISK_LBA_COUNT - 1 - GPT_ENTRIES_SECTORS - 1
+fn last_usable_lba(lba_count: u64) -> u64 {
+    lba_count - 1 - GPT_ENTRIES_SECTORS - 1
 }
 
 struct PartitionHandle {
@@ -48,10 +42,35 @@ unsafe impl Sync for PartitionHandle {}
 
 struct RawDiskCtx {
     lock: Lock,
-    storage: Vec<u8>,
+    // Set while a GPT admin op (start/stop/remove/create-gpt/add-partition)
+    // is running against the child device. These block on the child (real
+    // I/O round-trip), so they must run with the spinlock released -- busy
+    // instead provides mutual exclusion between admin ops, and do_io fails
+    // fast rather than blocking/racing while one is in flight.
+    busy: bool,
+    child_dev: *const DeviceObject,
+    lba_count: u64,
     parts: Vec<PartitionHandle>,
     driver_id: usize,
     disk_index: usize
+}
+
+// Test-and-set the busy flag under the spinlock 
+// Returns false if an admin op is already in flight.
+fn try_enter_busy(ctx: &mut RawDiskCtx) -> bool {
+    acquire_spinlock(&mut ctx.lock);
+    let free = !ctx.busy;
+    if free {
+        ctx.busy = true;
+    }
+    release_spinlock(&mut ctx.lock);
+    free
+}
+
+fn leave_busy(ctx: &mut RawDiskCtx) {
+    acquire_spinlock(&mut ctx.lock);
+    ctx.busy = false;
+    release_spinlock(&mut ctx.lock);
 }
 
 unsafe impl Send for RawDiskCtx {}
@@ -70,21 +89,38 @@ enum DiskDeviceCtx {
     Part(PartCtx)
 }
 
-fn read_bytes(ctx: &RawDiskCtx, byte_off: usize, out: &mut [u8]) {
-    out.copy_from_slice(&ctx.storage[byte_off..byte_off + out.len()]);
+// Synchronous (blocking) forwarding to child_dev -- used only by the GPT
+// metadata paths below, which runs rarely 
+// and can afford to block.
+fn sync_io(ctx: &RawDiskCtx, is_write: bool, lba: u64, buf_addr: usize, buf_len: usize) -> bool {
+    let major = if is_write { IrpMajor::Write } else { IrpMajor::Read };
+    let result = io_send_request(
+        ctx.child_dev, major as usize, IrpMinor::None as usize,
+        buf_addr, buf_len, lba as usize,
+        core::ptr::null(), None, core::ptr::null_mut()
+    );
+    result.status == Status::Success
 }
 
-fn write_bytes(ctx: &mut RawDiskCtx, byte_off: usize, data: &[u8]) {
-    ctx.storage[byte_off..byte_off + data.len()].copy_from_slice(data);
+fn read_bytes(ctx: &RawDiskCtx, byte_off: usize, out: &mut [u8]) -> bool {
+    debug_assert!(byte_off % SECTOR_SIZE == 0);
+    sync_io(ctx, false, (byte_off / SECTOR_SIZE) as u64, out.as_mut_ptr() as usize, out.len())
+}
+
+fn write_bytes(ctx: &RawDiskCtx, byte_off: usize, data: &[u8]) -> bool {
+    debug_assert!(byte_off % SECTOR_SIZE == 0);
+    sync_io(ctx, true, (byte_off / SECTOR_SIZE) as u64, data.as_ptr() as usize, data.len())
 }
 
 // Write a fresh protective MBR + empty primary GPT (header + entry array).
-fn write_fresh_gpt(ctx: &mut RawDiskCtx) {
-    let total_lba = DISK_LBA_COUNT;
+fn write_fresh_gpt(ctx: &mut RawDiskCtx) -> bool {
+    let total_lba = ctx.lba_count;
 
     let mut mbr = [0u8; SECTOR_SIZE];
     encode_protective_mbr(&mut mbr, total_lba);
-    write_bytes(ctx, 0, &mbr);
+    if !write_bytes(ctx, 0, &mbr) {
+        return false;
+    }
 
     let entries_buf = vec![0u8; GPT_ENTRIES_SECTORS as usize * SECTOR_SIZE];
     let entries_crc = crc32(&entries_buf);
@@ -93,7 +129,7 @@ fn write_fresh_gpt(ctx: &mut RawDiskCtx) {
         my_lba: GPT_HEADER_LBA,
         alternate_lba: total_lba - 1,
         first_usable_lba: FIRST_USABLE_LBA,
-        last_usable_lba: last_usable_lba(),
+        last_usable_lba: last_usable_lba(total_lba),
         disk_guid: [0u8; 16],
         partition_entry_lba: GPT_ENTRIES_LBA,
         num_partition_entries: GPT_MAX_ENTRIES as u32,
@@ -102,15 +138,22 @@ fn write_fresh_gpt(ctx: &mut RawDiskCtx) {
     };
     let mut header_buf = [0u8; SECTOR_SIZE];
     header.encode(&mut header_buf);
-    write_bytes(ctx, GPT_HEADER_LBA as usize * SECTOR_SIZE, &header_buf);
-    write_bytes(ctx, GPT_ENTRIES_LBA as usize * SECTOR_SIZE, &entries_buf);
+    if !write_bytes(ctx, GPT_HEADER_LBA as usize * SECTOR_SIZE, &header_buf) {
+        return false;
+    }
+    if !write_bytes(ctx, GPT_ENTRIES_LBA as usize * SECTOR_SIZE, &entries_buf) {
+        return false;
+    }
+    true
 }
 
 // Append a new GPT entry for `info`, persist it, and spawn+start the
 // corresponding partition class device.
 fn add_partition(ctx: &mut RawDiskCtx, info: &CreatePartitionInfo) -> Option<GptPartitionEntry> {
     let mut header_buf = [0u8; SECTOR_SIZE];
-    read_bytes(ctx, GPT_HEADER_LBA as usize * SECTOR_SIZE, &mut header_buf);
+    if !read_bytes(ctx, GPT_HEADER_LBA as usize * SECTOR_SIZE, &mut header_buf) {
+        return None;
+    }
     let header = GptHeader::decode(&header_buf)?;
 
     if info.num_lba == 0 {
@@ -122,7 +165,9 @@ fn add_partition(ctx: &mut RawDiskCtx, info: &CreatePartitionInfo) -> Option<Gpt
     }
 
     let mut entries_buf = vec![0u8; GPT_ENTRIES_SECTORS as usize * SECTOR_SIZE];
-    read_bytes(ctx, header.partition_entry_lba as usize * SECTOR_SIZE, &mut entries_buf);
+    if !read_bytes(ctx, header.partition_entry_lba as usize * SECTOR_SIZE, &mut entries_buf) {
+        return None;
+    }
 
     let mut free_index = None;
     for i in 0..GPT_MAX_ENTRIES {
@@ -145,13 +190,17 @@ fn add_partition(ctx: &mut RawDiskCtx, info: &CreatePartitionInfo) -> Option<Gpt
     entry.encode(&mut entries_buf[idx * GptPartitionEntry::SIZE..(idx + 1) * GptPartitionEntry::SIZE]);
 
     let new_crc = crc32(&entries_buf);
-    write_bytes(ctx, header.partition_entry_lba as usize * SECTOR_SIZE, &entries_buf);
+    if !write_bytes(ctx, header.partition_entry_lba as usize * SECTOR_SIZE, &entries_buf) {
+        return None;
+    }
 
     let mut updated_header = header;
     updated_header.partition_entry_array_crc32 = new_crc;
     let mut header_out = [0u8; SECTOR_SIZE];
     updated_header.encode(&mut header_out);
-    write_bytes(ctx, GPT_HEADER_LBA as usize * SECTOR_SIZE, &header_out);
+    if !write_bytes(ctx, GPT_HEADER_LBA as usize * SECTOR_SIZE, &header_out) {
+        return None;
+    }
 
     let raw_ctx_ptr = ctx as *mut RawDiskCtx;
     let driver_id = ctx.driver_id;
@@ -162,17 +211,23 @@ fn add_partition(ctx: &mut RawDiskCtx, info: &CreatePartitionInfo) -> Option<Gpt
 }
 
 // Scan an existing GPT (if any) and spawn+start a partition device for every
-// in-use entry found. 
+// in-use entry found.
 fn scan_and_create_partitions(ctx: &mut RawDiskCtx) {
     let mut header_buf = [0u8; SECTOR_SIZE];
-    read_bytes(ctx, GPT_HEADER_LBA as usize * SECTOR_SIZE, &mut header_buf);
+    if !read_bytes(ctx, GPT_HEADER_LBA as usize * SECTOR_SIZE, &mut header_buf) {
+        info!("disk: failed to read GPT header from child device");
+        return;
+    }
     let header = match GptHeader::decode(&header_buf) {
         Some(h) => h,
         None => return
     };
 
     let mut entries_buf = vec![0u8; GPT_ENTRIES_SECTORS as usize * SECTOR_SIZE];
-    read_bytes(ctx, header.partition_entry_lba as usize * SECTOR_SIZE, &mut entries_buf);
+    if !read_bytes(ctx, header.partition_entry_lba as usize * SECTOR_SIZE, &mut entries_buf) {
+        info!("disk: failed to read GPT partition entries from child device");
+        return;
+    }
 
     let driver_id = ctx.driver_id;
     let disk_index = ctx.disk_index;
@@ -202,7 +257,7 @@ fn create_partition_device(
     let part_ctx = Box::new_in(DiskDeviceCtx::Part(PartCtx { raw_ctx: raw_ctx_ptr, entry }), PoolAllocatorGlobal);
     let ctx_ptr =  Box::into_raw_with_allocator(part_ctx).0;
 
-    let dev = create_device_by_id(driver_id, Some(name), ctx_ptr as *mut c_void, None, true, DeviceType::Disk);
+    let dev = create_device_by_id(driver_id, Some(name), ctx_ptr as *mut c_void, None, true, DeviceType::Partition);
     if dev.is_null() {
         info!("disk: failed to create partition device '{}'", name);
         unsafe {
@@ -213,7 +268,7 @@ fn create_partition_device(
     }
 
     parts.push(PartitionHandle { dev_ptr: dev, ctx_ptr, name_ptr: name as *const str as *mut str });
-    
+
     io_start_device(dev);
     info!("disk: created + started partition device '{}'", name);
 }
@@ -250,13 +305,14 @@ fn dispatch_add(driver: &DriverObject, pdo: &DeviceObject) -> Status {
     let disk_index = DISK_COUNT.fetch_add(1, Ordering::Relaxed);
     let name: &'static str = Box::leak(format!("disk{}", disk_index).into_boxed_str());
 
-    let storage = vec![0u8; DISK_SIZE_BYTES];
     let mut lock = Lock::new();
     create_spinlock(&mut lock);
 
     let raw_ctx = DiskDeviceCtx::Raw(RawDiskCtx {
         lock,
-        storage,
+        busy: false,
+        child_dev: pdo as *const _,
+        lba_count: 0,   // later queried in do_start
         parts: Vec::new(),
         driver_id: driver.id,
         disk_index
@@ -274,7 +330,7 @@ fn dispatch_add(driver: &DriverObject, pdo: &DeviceObject) -> Status {
         return Status::Failed;
     }
 
-    info!("disk: created raw device '{}' ({} MiB, {}-byte LBA)", name, DISK_SIZE_BYTES / (1024 * 1024), SECTOR_SIZE);
+    info!("disk: created raw device '{}'", name);
     Status::Success
 }
 
@@ -291,9 +347,33 @@ fn dispatch_pnp(device: &DeviceObject, request: &mut Irp) -> Status {
 fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
     let wrapper = unsafe { &mut *(device.ctx as *mut DiskDeviceCtx) };
     if let DiskDeviceCtx::Raw(ctx) = wrapper {
+        // Query the child for its capacity 
+        let req_info = ReqInfo { _unused: [0; 2] };
+        let result = io_send_request(
+            ctx.child_dev, IrpMajor::Control as usize, IrpMinor::DiskGetInfo as usize,
+            0, 0, 0, &req_info as *const ReqInfo, None, core::ptr::null_mut()
+        );
+        if result.status != Status::Success {
+            info!("disk: DiskGetInfo failed against child device for '{}'", device.get_name().unwrap_or("?"));
+            request.complete_irp(Status::Failed);
+            return Status::Failed;
+        }
+        let disk_info = unsafe { result.req_info.disk_info };
+        // Right now we only support 512 byte sector size
+        assert!(disk_info.lba_size == SECTOR_SIZE, "disk: child device sector size mismatch");
+        info!("Disk info -> num_sectors: {}, sector_size: {}", disk_info.lba_count, disk_info.lba_size);
+        if !try_enter_busy(ctx) {
+            request.complete_irp(Status::Failed);
+            return Status::Failed;
+        }
+
         acquire_spinlock(&mut ctx.lock);
-        scan_and_create_partitions(ctx);
+        ctx.lba_count = disk_info.lba_count;
         release_spinlock(&mut ctx.lock);
+
+        scan_and_create_partitions(ctx);
+
+        leave_busy(ctx);
     }
     info!("disk: start '{}'", device.get_name().unwrap_or("?"));
     request.complete_irp(Status::Success);
@@ -303,9 +383,10 @@ fn do_start(device: &DeviceObject, request: &mut Irp) -> Status {
 fn do_stop(device: &DeviceObject, request: &mut Irp) -> Status {
     let wrapper = unsafe { &mut *(device.ctx as *mut DiskDeviceCtx) };
     if let DiskDeviceCtx::Raw(ctx) = wrapper {
-        acquire_spinlock(&mut ctx.lock);
+        assert!(try_enter_busy(ctx));
+
         stop_partitions(ctx);
-        release_spinlock(&mut ctx.lock);
+        leave_busy(ctx);
     }
     info!("disk: stop '{}'", device.get_name().unwrap_or("?"));
     request.complete_irp(Status::Success);
@@ -315,9 +396,9 @@ fn do_stop(device: &DeviceObject, request: &mut Irp) -> Status {
 fn do_remove(device: &DeviceObject, request: &mut Irp) -> Status {
     let wrapper = unsafe { &mut *(device.ctx as *mut DiskDeviceCtx) };
     if let DiskDeviceCtx::Raw(ctx) = wrapper {
-        acquire_spinlock(&mut ctx.lock);
+        assert!(try_enter_busy(ctx));
         teardown_partitions(ctx);
-        release_spinlock(&mut ctx.lock);
+        leave_busy(ctx);
     }
     if let Some(name) = device.get_name() {
         unsafe { drop(Box::from_raw(name as *const str as *mut str)); }
@@ -353,9 +434,14 @@ fn dispatch_control(device: &DeviceObject, request: &mut Irp) -> Status {
 }
 
 fn do_get_info(device: &DeviceObject, request: &mut Irp) -> Status {
-    let wrapper = unsafe { &*(device.ctx as *const DiskDeviceCtx) };
+    let wrapper = unsafe { &mut *(device.ctx as *mut DiskDeviceCtx) };
     let info = match wrapper {
-        DiskDeviceCtx::Raw(_) => DiskInfo { lba_size: SECTOR_SIZE, lba_count: DISK_LBA_COUNT },
+        DiskDeviceCtx::Raw(ctx) => {
+            acquire_spinlock(&mut ctx.lock);
+            let lba_count = ctx.lba_count;
+            release_spinlock(&mut ctx.lock);
+            DiskInfo { lba_size: SECTOR_SIZE, lba_count }
+        }
         DiskDeviceCtx::Part(p) => DiskInfo { lba_size: SECTOR_SIZE, lba_count: p.entry.num_lba() }
     };
     request.req_info.disk_info = info;
@@ -370,10 +456,19 @@ fn do_create_gpt(device: &DeviceObject, request: &mut Irp) -> Status {
         DiskDeviceCtx::Part(_) => return Status::Unsupported
     };
 
-    acquire_spinlock(&mut ctx.lock);
+    if !try_enter_busy(ctx) {
+        info!("Could not satisfy create_gpt request since another admin request is ongoing in disk");
+        request.complete_irp(Status::Failed);
+        return Status::Failed;
+    }
     teardown_partitions(ctx);
-    write_fresh_gpt(ctx);
-    release_spinlock(&mut ctx.lock);
+    let ok = write_fresh_gpt(ctx);
+    leave_busy(ctx);
+    if !ok {
+        info!("disk: failed to write fresh GPT to child device for '{}'", device.get_name().unwrap_or("?"));
+        request.complete_irp(Status::Failed);
+        return Status::Failed;
+    }
     info!("disk: created fresh GPT on '{}'", device.get_name().unwrap_or("?"));
     request.complete_irp(Status::Success);
     Status::Success
@@ -386,16 +481,20 @@ fn do_add_partition(device: &DeviceObject, request: &mut Irp) -> Status {
         DiskDeviceCtx::Part(_) => return Status::Unsupported
     };
     let info = unsafe { request.req_info.create_partition };
-    acquire_spinlock(&mut ctx.lock);
+    if !try_enter_busy(ctx) {
+        info!("Could not satisfy add_partition request since another admin request is ongoing in disk");
+        request.complete_irp(Status::Failed);
+        return Status::Failed;
+    }
     let result = add_partition(ctx, &info);
-    release_spinlock(&mut ctx.lock);
+    leave_busy(ctx);
     match result {
         Some(_) => {
             request.complete_irp(Status::Success);
             Status::Success
         }
         None => {
-            info!("disk: add_partition rejected (bad range or no free entry)");
+            info!("disk: add_partition rejected (bad range, no free entry, or child I/O failure)");
             request.complete_irp(Status::Failed);
             Status::Failed
         }
@@ -418,10 +517,20 @@ fn do_get_partition_info(device: &DeviceObject, request: &mut Irp) -> Status {
     Status::Success
 }
 
+struct DiskPendingCompletion {
+    outer_irp: *mut Irp
+}
+
+extern "C" fn on_child_io_complete(result: *const IrpResult, ctx: *mut c_void) {
+    let pending = unsafe { Box::from_raw(ctx as *mut DiskPendingCompletion) };
+    let outer = unsafe { &mut *pending.outer_irp };
+    let r = unsafe { &*result };
+    outer.bytes_completed = r.bytes_completed;
+    outer.complete_irp(r.status);
+}
+
 // Reads/writes are all-or-nothing: buffer.size must be a multiple of
-// SECTOR_SIZE, `offset` is an LBA number (not a byte offset), and a
-// Status::Success completion always means the full buffer was transferred —
-// there's no partial-completion case
+// SECTOR_SIZE, `offset` is an LBA number (not a byte offset).
 fn do_io(device: &DeviceObject, request: &mut Irp, is_write: bool) -> Status {
     let size = request.buffer.size;
     if size == 0 || size % SECTOR_SIZE != 0 {
@@ -444,26 +553,28 @@ fn do_io(device: &DeviceObject, request: &mut Irp, is_write: bool) -> Status {
 
     let raw_ctx = unsafe { &mut *raw_ctx_ptr };
     acquire_spinlock(&mut raw_ctx.lock);
-    if base_lba + num_lba > DISK_LBA_COUNT {
+    if raw_ctx.busy || base_lba + num_lba > raw_ctx.lba_count {
         release_spinlock(&mut raw_ctx.lock);
         request.complete_irp(Status::Failed);
         return Status::Failed;
     }
-
-    let byte_off = base_lba as usize * SECTOR_SIZE;
-    let buf_ptr = request.buffer.base_address as *mut u8;
-    if is_write {
-        let src = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, size) };
-        raw_ctx.storage[byte_off..byte_off + size].copy_from_slice(src);
-    } else {
-        let dst = unsafe { core::slice::from_raw_parts_mut(buf_ptr, size) };
-        dst.copy_from_slice(&raw_ctx.storage[byte_off..byte_off + size]);
-    }
-    request.bytes_completed = size;
+    let child_dev = raw_ctx.child_dev;
     release_spinlock(&mut raw_ctx.lock);
 
-    request.complete_irp(Status::Success);
-    Status::Success
+    let pending_ptr = Box::into_raw(Box::new(DiskPendingCompletion { outer_irp: request as *mut Irp })) as *mut c_void;
+    let major = if is_write { IrpMajor::Write } else { IrpMajor::Read };
+    let dispatch = io_send_request(
+        child_dev, major as usize, IrpMinor::None as usize,
+        request.buffer.base_address, request.buffer.size, base_lba as usize,
+        core::ptr::null(), Some(on_child_io_complete), pending_ptr
+    );
+    if dispatch.status == Status::Failed {
+        // Since dispatch failed, reclaim the completion context
+        unsafe { drop(Box::from_raw(pending_ptr as *mut DiskPendingCompletion)); }
+        request.complete_irp(Status::Failed);
+        return Status::Failed;
+    }
+    Status::Pending
 }
 
 #[kmod::dispatch_handler]

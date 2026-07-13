@@ -177,3 +177,15 @@ pub fn free_dma_memory(virt_addr: *mut u8, size: usize, align: usize) -> Result<
         e => Err(e)
     }
 }
+
+// PageDescriptor::VIRTUAL for kernel memory, or
+// PageDescriptor::VIRTUAL | PageDescriptor::USER for memory in the calling
+// process's address space.
+pub fn get_physical_address(virt_addr: usize, flags: u8) -> Result<usize, KError> {
+    let mut phys: usize = 0;
+    if unsafe { get_physical_address_ffi(virt_addr, flags, &mut phys) } {
+        Ok(phys)
+    } else {
+        Err(KError::InvalidArgument)
+    }
+}

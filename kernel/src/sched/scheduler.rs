@@ -15,7 +15,7 @@ use crate::hal::{self, *};
 use crate::mem::*;
 use crate::sched::{ProcessCleanupWork, SignalHandler, enqueue_cleanup, exit_process, kill_process};
 use crate::sync::{KEvent, KSem, KSemInnerType, Spinlock};
-use crate::io::{DeviceHandleK, DeviceObjectK, DeviceState, IrpPtr, deallocate_irp};
+use crate::io::{DeviceHandleK, DeviceObjectK, DeviceState, IrpPtr};
 use kernel_intf::mem::{PoolAllocator, PoolAllocatorGlobal};
 use kernel_intf::list::{DynList, List, ListNode, ListNodeGuard};
 use kernel_intf::driver::{Irp, IrpMajor, IrpMinor, IrpResult, Status, IRP_BUFFER_ALIGN, IRP_BUFFER_HEAP_THRESHOLD};
@@ -274,13 +274,14 @@ impl Task {
         ExitInfo { reason, code: self.exit_code.load(Ordering::Relaxed) }
     }
 
+    fn find_and_remove_irp(&mut self, irp: *mut Irp) {
+        self.issued_irps.find_and_remove(|e| e.irp == irp);
+    }
+
     fn register_irp(&mut self, entry: IssuedIrp) {
         self.issued_irps.add_node(entry).expect("Failed to register IRP with task");
     }
 
-    fn find_and_remove_irp(&mut self, irp: *mut Irp) {
-        self.issued_irps.find_and_remove(|e| e.irp == irp);
-    }
 
     fn take_irp_list(&mut self) -> DynList<IssuedIrp> {
         take(&mut self.issued_irps)
@@ -946,26 +947,24 @@ extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
     disable_preemption();
     let status = unsafe { (*irp).status };
     assert!(!unsafe{ (*irp).is_completed});
-    crate::io_log!("io_complete: status_code {} on irp {:#X} by thread {}", status as isize, irp.addr(), unsafe{(*irp).thread_id});
+    let device_field = unsafe { (*irp).device.load(Ordering::Acquire) };
+    let device_name = if device_field != 0 {
+        unsafe { (&*(device_field as *const DeviceObjectK)).name() }
+    } else {
+        "<none>"
+    };
+    crate::io_log!(
+        "io_complete: status_code {} on irp {:#X} major={} minor={} device={} by thread {}",
+        status as isize, irp.addr(), unsafe{(*irp).major_code} as usize, unsafe{(*irp).minor_code} as usize, device_name, unsafe{(*irp).thread_id}
+    );
     let ctx_ptr = ctx as *mut AsyncCtx;
     let ctx = unsafe { &mut *ctx_ptr };
+    let is_cancelled = unsafe { (*irp).is_cancelled };
 
-    // If task is not killed and irp exists within the task irp list, remove it
-    if let Some(dispatch_thread) = get_task_info(unsafe { (*irp).thread_id }) {
-        dispatch_thread.lock().find_and_remove_irp(irp);
-    }
-
-    // Reclaim the Arc<DeviceObjectK> reference this IRP was pinning the
-    // device with, removing it from the device's pending list first.
-    let dev = unsafe { Arc::from_raw_in((*irp).device as *const DeviceObjectK, PoolAllocatorGlobal) };
-    crate::io_log!("Removing pending irp from device object");
-    dev.get_pending_irps().lock().find_and_remove(|&p| p == irp);
-    if dev.get_pending_irps().lock().get_nodes() == 0 {
-        dev.pending_irps_drained_event().signal();
-    }
+    release_irp_tracking(irp);
 
     // Copy the IRP-owned scratch buffer's contents back to the caller's own buffer
-    if status != Status::Cancelled {
+    if !is_cancelled {
         let irp_ref = unsafe { &*irp };
         if irp_ref.caller_buffer.size != 0 {
             unsafe {
@@ -993,14 +992,57 @@ extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
     if status != Status::Cancelled {
         deallocate_irp(irp, ctx_ptr);
     }
-    else {
-        // For cancellation path, the deallocation is done once driver calls io_start_processing
-        unsafe {
-            (*irp).is_cancelled = true;
+
+    unsafe { (*irp).is_completed = true }
+    enable_preemption();
+}
+
+// Detach an IRP from the kernel-level bookkeeping allocate_irp registered it
+// in: the issuing task's issued_irps list, and the device's pending_irps
+// list (reclaiming the Arc<DeviceObjectK> pin taken there, and signalling
+// pending_irps_drained_event if that was the last one
+fn release_irp_tracking(irp: *mut Irp) {
+    if let Some(dispatch_thread) = get_task_info(unsafe { (*irp).thread_id }) {
+        dispatch_thread.lock().find_and_remove_irp(irp);
+    }
+
+    let device_field = unsafe { (*irp).device.swap(0, Ordering::AcqRel) };
+    if device_field == 0 {
+        return;
+    }
+
+    let dev = unsafe { Arc::from_raw_in(device_field as *const DeviceObjectK, PoolAllocatorGlobal) };
+    crate::io_log!("Removing pending irp from device object: name={} id={}", dev.name(), dev.id());
+    dev.get_pending_irps().lock().find_and_remove(|&p| p == irp);
+    if dev.get_pending_irps().lock().get_nodes() == 0 {
+        dev.pending_irps_drained_event().signal();
+    }
+}
+
+pub fn deallocate_irp(irp: *mut Irp, ctx: *mut AsyncCtx) {
+    crate::io_log!(
+        "Deallocating irp {:#X} major={} minor={} by thread: {}",
+        irp.addr(), unsafe{(*irp).major_code} as usize, unsafe{(*irp).minor_code} as usize, unsafe{(*irp).thread_id}
+    );
+    disable_preemption();
+    unsafe {
+        if (*irp).caller_buffer.size != 0 {
+            let size = (*irp).buffer.size;
+            if size >= IRP_BUFFER_HEAP_THRESHOLD {
+                let layout = Layout::from_size_align(size, PAGE_SIZE).unwrap();
+                let _ = deallocate_memory((*irp).buffer.base_address as *mut u8, layout, PageDescriptor::VIRTUAL);
+            }
+            else {
+                let layout = Layout::from_size_align(size, IRP_BUFFER_ALIGN).unwrap();
+                alloc::alloc::dealloc((*irp).buffer.base_address as *mut u8, layout);
+            }
         }
     }
 
-    unsafe { (*irp).is_completed = true }
+    release_irp_tracking(irp);
+
+    drop(unsafe { Box::from_raw_in(irp, PoolAllocatorGlobal) });
+    drop(unsafe { Box::from_raw_in(ctx, PoolAllocatorGlobal) });
     enable_preemption();
 }
 
@@ -1107,10 +1149,12 @@ pub fn cancel_irp(irp_ptr: IrpPtr, dev: &DeviceObjectK) {
     // (a) did not get a chance yet to register the cancel routine, or
     // (b) decided that cancellation was not required for this request.
     if irp.cancel_routine.is_none() || irp.is_cancelled {
+        irp.is_cancelled = true;
         release_spinlock(&mut irp.cancel_lock);
         return;
     }
 
+    irp.is_cancelled = true;
     (irp.cancel_routine.unwrap())(dev.device_ptr(), irp_ptr);
     release_spinlock(&mut irp.cancel_lock);
 }

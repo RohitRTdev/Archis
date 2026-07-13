@@ -33,7 +33,7 @@ fn build_backend(source: MountSource) -> Result<MountBackend, KError> {
     match source {
         MountSource::Memory(vfs) => Ok(MountBackend::Memory(Arc::new_in(Spinlock::new(vfs), PoolAllocatorGlobal))),
         MountSource::Device(dev) => {
-            if dev.device_type() != DeviceType::Disk {
+            if dev.device_type() != DeviceType::Partition {
                 return Err(KError::InvalidArgument);
             }
             ModuleBackedFs::identify_and_open(dev).map(MountBackend::Module)
@@ -73,7 +73,7 @@ fn validate_mount_point_and_source(path: &str, source: &MountSource) -> Result<(
 }
 
 pub fn mount(path: &str, source: MountSource) -> Result<(), KError> {
-    // Canonicalize before storing 
+    // Canonicalize before storing
     let canonical = if MOUNTS.lock().is_empty() {
         super::vfs::normalize_path(path)
     } else {
@@ -84,6 +84,19 @@ pub fn mount(path: &str, source: MountSource) -> Result<(), KError> {
     let backend = build_backend(source)?;
     MOUNTS.lock().push(MountEntry { mount_point: canonical, backend });
     Ok(())
+}
+
+// Fetches a clone of the backend currently mounted at `path`, so a caller
+// can restore it later 
+pub fn backend_of(path: &str) -> Option<MountBackend> {
+    MOUNTS.lock().iter().find(|m| m.mount_point == path).map(|m| m.backend.clone())
+}
+
+// Restores a backend fetched via `backend_of` at `path`. Only meant for the
+// rollback case above: `path` must currently be unmounted.
+pub fn remount(path: &str, backend: MountBackend) {
+    let canonical = super::vfs::normalize_path(path);
+    MOUNTS.lock().push(MountEntry { mount_point: canonical, backend });
 }
 
 pub fn unmount(path: &str) -> Result<(), KError> {

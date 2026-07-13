@@ -319,7 +319,15 @@ fn dispatch_read(device: &DeviceObject, request: &mut Irp) -> Status {
     ctx.pending_len += 1;
     release_spinlock(&mut ctx.lock);
 
-    io_set_cancel_routine(request, tty_cancel);
+    if !io_set_cancel_routine(request, tty_cancel) {
+        // Already cancelled before we could register -- nobody else will
+        // complete this irp, so undo our own queue insertion and do it.
+        acquire_spinlock(&mut ctx.lock);
+        ctx.remove_pending(irp_ptr);
+        release_spinlock(&mut ctx.lock);
+        request.complete_irp(Status::Cancelled);
+        return Status::Cancelled;
+    }
     Status::Pending
 }
 

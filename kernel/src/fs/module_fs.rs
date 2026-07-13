@@ -2,6 +2,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
+use alloc::vec::Vec;
 
 use common::{MemoryRegion, StrRef};
 use kernel_intf::{E_SUCCESS, KError};
@@ -11,12 +12,99 @@ use kernel_intf::mem::PoolAllocatorGlobal;
 
 use crate::io::{DeviceHandleK, OpenDeviceHandle, open_device};
 use crate::loader::{LoadedImage, load_image};
-use crate::sync::Spinlock;
+use crate::sync::{KSem, Once, Spinlock, semaphore_guard};
 
 use super::utils::FileBuffer;
 use super::vfs::{DirEntry, EntryType, FileAttrs, ProbeStep};
 
 const FS_MODULE_PATHS: &[&str] = &["/sys/libfat32.so"];
+
+struct FsModule {
+    _image: LoadedImage,
+    identify_fs: FnIdentifyFs,
+    fs_open: FnFsOpen,
+    fs_close: FnFsClose,
+    fs_read: FnFsRead,
+    fs_write: FnFsWrite,
+    fs_stat: FnFsStat,
+    fs_create_file: FnFsCreateFile,
+    fs_mkdir: FnFsMkdir,
+    fs_create_symlink: FnFsCreateSymlink,
+    fs_delete: FnFsDelete,
+    fs_rename: FnFsRename,
+    fs_readdir: FnFsReaddir,
+    fs_unmount: FnFsUnmount
+}
+
+static FS_MODULES_LOCK: Once<KSem> = Once::new();
+static FS_MODULES: Spinlock<Option<Arc<Vec<FsModule>, PoolAllocatorGlobal>>> = Spinlock::new(None);
+
+fn load_fs_modules() -> Vec<FsModule> {
+    let mut out = Vec::new();
+    for path in FS_MODULE_PATHS {
+        let image = match load_image(path, false, true) {
+            Ok(i) => i,
+            Err(_e) => { crate::fs_log!("load_fs_modules: load_image({}) failed: {:?}", path, _e); continue; }
+        };
+        let identify_addr = match image.lock().load_symbol("identify_fs") {
+            Some(a) => a,
+            None => { crate::fs_log!("load_fs_modules: {} has no identify_fs export", path); continue; }
+        };
+        let resolve = |name: &str| -> Option<usize> { image.lock().load_symbol(name) };
+        let resolved = (
+            resolve("fs_open"), resolve("fs_close"), resolve("fs_read"), resolve("fs_write"),
+            resolve("fs_stat"), resolve("fs_create_file"), resolve("fs_mkdir"), resolve("fs_create_symlink"),
+            resolve("fs_delete"), resolve("fs_rename"), resolve("fs_readdir"), resolve("fs_unmount")
+        );
+        let (
+            Some(fs_open), Some(fs_close), Some(fs_read), Some(fs_write),
+            Some(fs_stat), Some(fs_create_file), Some(fs_mkdir), Some(fs_create_symlink),
+            Some(fs_delete), Some(fs_rename), Some(fs_readdir), Some(fs_unmount)
+        ) = resolved else {
+            crate::fs_log!("load_fs_modules: {} missing a required export", path);
+            continue;
+        };
+        out.push(FsModule {
+            _image: image,
+            identify_fs: unsafe { core::mem::transmute(identify_addr) },
+            fs_open: unsafe { core::mem::transmute(fs_open) },
+            fs_close: unsafe { core::mem::transmute(fs_close) },
+            fs_read: unsafe { core::mem::transmute(fs_read) },
+            fs_write: unsafe { core::mem::transmute(fs_write) },
+            fs_stat: unsafe { core::mem::transmute(fs_stat) },
+            fs_create_file: unsafe { core::mem::transmute(fs_create_file) },
+            fs_mkdir: unsafe { core::mem::transmute(fs_mkdir) },
+            fs_create_symlink: unsafe { core::mem::transmute(fs_create_symlink) },
+            fs_delete: unsafe { core::mem::transmute(fs_delete) },
+            fs_rename: unsafe { core::mem::transmute(fs_rename) },
+            fs_readdir: unsafe { core::mem::transmute(fs_readdir) },
+            fs_unmount: unsafe { core::mem::transmute(fs_unmount) }
+        });
+    }
+    out
+}
+
+fn fs_modules() -> Arc<Vec<FsModule>, PoolAllocatorGlobal> {
+    if let Some(m) = FS_MODULES.lock().as_ref() {
+        return m.clone();
+    }
+
+    FS_MODULES_LOCK.call_once(|| KSem::new(1, 1));
+    let _guard = semaphore_guard(FS_MODULES_LOCK.get().unwrap());
+
+    // Someone else may have finished loading while we waited for the guard.
+    if let Some(m) = FS_MODULES.lock().as_ref() {
+        return m.clone();
+    }
+
+    let modules = Arc::new_in(load_fs_modules(), PoolAllocatorGlobal);
+    *FS_MODULES.lock() = Some(modules.clone());
+    modules
+}
+
+pub fn preload_modules() {
+    fs_modules();
+}
 
 type FnIdentifyFs = extern "C" fn(*const DeviceObject) -> bool;
 type FnFsOpen = extern "C" fn(*const DeviceObject, StrRef, bool, *mut usize, *mut bool, MemoryRegion, *mut usize, MemoryRegion, *mut usize) -> i64;
@@ -57,54 +145,29 @@ impl ModuleBackedFs {
     pub fn identify_and_open(dev: DeviceHandleK) -> Result<Arc<ModuleBackedFs, PoolAllocatorGlobal>, KError> {
         let dev_ptr = dev.device_ptr();
 
-        for path in FS_MODULE_PATHS {
-            let image = match load_image(path, false, true) {
-                Ok(i) => i,
-                Err(e) => { crate::fs_log!("identify_and_open: load_image({}) failed: {:?}", path, e); continue; }
-            };
-            let identify_addr = match image.lock().load_symbol("identify_fs") {
-                Some(a) => a,
-                None => { crate::fs_log!("identify_and_open: {} has no identify_fs export", path); continue; }
-            };
-            let identify: FnIdentifyFs = unsafe { core::mem::transmute(identify_addr) };
-            if !identify(dev_ptr) {
-                crate::fs_log!("identify_and_open: {} did not identify the device", path);
+        for module in fs_modules().iter() {
+            if !(module.identify_fs)(dev_ptr) {
+                crate::fs_log!("identify_and_open: a module did not identify the device");
                 continue;
             }
-
-            let resolve = |name: &str| -> Result<usize, KError> {
-                image.lock().load_symbol(name).ok_or(KError::Unsupported)
-            };
-            let fs_open = resolve("fs_open")?;
-            let fs_close = resolve("fs_close")?;
-            let fs_read = resolve("fs_read")?;
-            let fs_write = resolve("fs_write")?;
-            let fs_stat = resolve("fs_stat")?;
-            let fs_create_file = resolve("fs_create_file")?;
-            let fs_mkdir = resolve("fs_mkdir")?;
-            let fs_create_symlink = resolve("fs_create_symlink")?;
-            let fs_delete = resolve("fs_delete")?;
-            let fs_rename = resolve("fs_rename")?;
-            let fs_readdir = resolve("fs_readdir")?;
-            let fs_unmount = resolve("fs_unmount")?;
 
             let open_handle = open_device(dev)?;
 
             let fs = ModuleBackedFs {
-                _image: image,
+                _image: module._image.clone(),
                 dev: open_handle,
-                fs_open: unsafe { core::mem::transmute(fs_open) },
-                fs_close: unsafe { core::mem::transmute(fs_close) },
-                fs_read: unsafe { core::mem::transmute(fs_read) },
-                fs_write: unsafe { core::mem::transmute(fs_write) },
-                fs_stat: unsafe { core::mem::transmute(fs_stat) },
-                fs_create_file: unsafe { core::mem::transmute(fs_create_file) },
-                fs_mkdir: unsafe { core::mem::transmute(fs_mkdir) },
-                fs_create_symlink: unsafe { core::mem::transmute(fs_create_symlink) },
-                fs_delete: unsafe { core::mem::transmute(fs_delete) },
-                fs_rename: unsafe { core::mem::transmute(fs_rename) },
-                fs_readdir: unsafe { core::mem::transmute(fs_readdir) },
-                fs_unmount: unsafe { core::mem::transmute(fs_unmount) },
+                fs_open: module.fs_open,
+                fs_close: module.fs_close,
+                fs_read: module.fs_read,
+                fs_write: module.fs_write,
+                fs_stat: module.fs_stat,
+                fs_create_file: module.fs_create_file,
+                fs_mkdir: module.fs_mkdir,
+                fs_create_symlink: module.fs_create_symlink,
+                fs_delete: module.fs_delete,
+                fs_rename: module.fs_rename,
+                fs_readdir: module.fs_readdir,
+                fs_unmount: module.fs_unmount,
                 open_paths: Spinlock::new(BTreeMap::new()),
                 handle_paths: Spinlock::new(BTreeMap::new())
             };

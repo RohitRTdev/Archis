@@ -9,7 +9,7 @@ use crate::sync::Spinlock;
 use crate::mem::{PageDescriptor, allocate_memory, deallocate_memory, map_memory};
 
 pub const INIT_STACK_SIZE: usize  = PAGE_SIZE * 10;
-pub const INIT_BOOT_CPU_STACK_SIZE: usize  = PAGE_SIZE * 11;
+pub const INIT_BOOT_CPU_STACK_SIZE: usize  = PAGE_SIZE * 20;
 pub const INIT_GUARD_PAGE_SIZE: usize = PAGE_SIZE;
 pub const WORKER_STACK_SIZE: usize = 5 * PAGE_SIZE;
 pub const TOTAL_BOOT_STACK_SIZE: usize = INIT_BOOT_CPU_STACK_SIZE + INIT_GUARD_PAGE_SIZE;

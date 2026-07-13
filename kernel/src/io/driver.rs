@@ -1,15 +1,13 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::cell::UnsafeCell;
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use common::{MemoryRegion, PAGE_SIZE, StrRef};
-use core::alloc::Layout;
+use common::{MemoryRegion, StrRef};
 use kernel_intf::driver::{
-    DeviceObject, DeviceType, DriverObject, EMPTY_REGION, IRP_BUFFER_ALIGN, IRP_BUFFER_HEAP_THRESHOLD, Irp, IrpMajor, IrpMinor, IrpResult, ReqInfo, ResList, Status
+    DeviceObject, DeviceType, DriverObject, EMPTY_REGION, Irp, IrpMajor, IrpMinor, IrpResult, ReqInfo, ResList, Status
 };
 use kernel_intf::{acquire_spinlock, io_complete_irp, release_spinlock};
 use kernel_intf::list::{DynList, List};
@@ -18,8 +16,7 @@ use kernel_intf::{KError, info};
 
 use crate::io::stack::deallocate_device_resources;
 use crate::loader::{LoadedImage, load_image};
-use crate::mem::{PageDescriptor, deallocate_memory};
-use crate::sched::{self, cancel_irp, AsyncCtx, allocate_irp, disable_preemption, enable_preemption};
+use crate::sched::{self, AsyncCtx, allocate_irp, cancel_irp, deallocate_irp, disable_preemption, enable_preemption};
 use crate::sync::{ConfigGuard, KEvent, KSem, Once, Spinlock, semaphore_guard};
 use super::stack::{self, DeviceStack, LevelState};
 pub type DriverHandle = Arc<DriverObjectK, PoolAllocatorGlobal>;
@@ -1039,38 +1036,23 @@ extern "C" fn io_start_processing_ffi(irp: *mut Irp) -> bool {
 
 #[unsafe(no_mangle)]
 extern "C" fn io_set_cancel_routine_ffi(
-    irp: *mut Irp, 
+    irp: *mut Irp,
     routine: extern "C" fn(*const DeviceObject, *mut Irp)
-) {
+) -> bool {
     let irp = unsafe { &mut *irp };
     acquire_spinlock(&mut irp.cancel_lock);
     crate::io_log!("Setting cancel routine by thread: {} on irp {:#X}", irp.thread_id, irp as *const Irp as usize);
-    
-    assert!(!irp.is_cancelled);
+
     assert!(irp.cancel_routine.is_none());
+    if irp.is_cancelled {
+        crate::io_log!("Irp {:#X} cancelled before cancel routine could be set", irp as *const Irp as usize);
+        release_spinlock(&mut irp.cancel_lock);
+        return false;
+    }
+
     irp.cancel_routine = Some(routine);
     release_spinlock(&mut irp.cancel_lock);
-}
-
-pub fn deallocate_irp(irp: *mut Irp, ctx: *mut AsyncCtx) {
-    crate::io_log!("Deallocating irp {:#X} by thread: {}", irp.addr(), unsafe{(*irp).thread_id});
-    disable_preemption();
-    unsafe {
-        if (*irp).caller_buffer.size != 0 {
-            let size = (*irp).buffer.size;
-            if size >= IRP_BUFFER_HEAP_THRESHOLD {
-                let layout = Layout::from_size_align(size, PAGE_SIZE).unwrap();
-                let _ = deallocate_memory((*irp).buffer.base_address as *mut u8, layout, PageDescriptor::VIRTUAL);
-            }
-            else {
-                let layout = Layout::from_size_align(size, IRP_BUFFER_ALIGN).unwrap();
-                alloc::alloc::dealloc((*irp).buffer.base_address as *mut u8, layout);
-            }
-        }
-    }
-    drop(unsafe { Box::from_raw_in(irp, PoolAllocatorGlobal) });
-    drop(unsafe { Box::from_raw_in(ctx, PoolAllocatorGlobal) });
-    enable_preemption();
+    true
 }
 
 fn open_device_handler(name: &str, _flags: u64) -> Result<crate::sched::Handle, kernel_intf::KError> {

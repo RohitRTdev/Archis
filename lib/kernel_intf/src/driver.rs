@@ -1,4 +1,5 @@
 use core::ffi::c_void;
+use core::sync::atomic::AtomicUsize;
 use common::MemoryRegion;
 use crate::io_complete_irp;
 use super::{Lock, StrRef};
@@ -259,7 +260,7 @@ pub struct Irp {
     pub completion_ctx: *mut c_void,
 
     // Kernel accounting; drivers do not read these.
-    pub device: usize,
+    pub device: AtomicUsize,
     pub is_cancelled: bool,
     pub cancel_routine: Option<extern "C" fn(*const DeviceObject, *mut Irp)>,
     pub cancel_lock: Lock,
@@ -317,7 +318,7 @@ impl Irp {
             bytes_completed: 0,
             completion_routine,
             completion_ctx,
-            device,
+            device: AtomicUsize::new(device),
             is_cancelled: false,
             cancel_routine: None,
             cancel_lock,
@@ -423,10 +424,11 @@ impl Default for DispatchTable {
 #[repr(usize)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DeviceType {
-    None  = 0,
-    Input = 1,
-    Disk  = 2,
-    Pci   = 3
+    None      = 0,
+    Input     = 1,
+    Disk      = 2,
+    Pci       = 3,
+    Partition = 4
 }
 
 impl DeviceType {

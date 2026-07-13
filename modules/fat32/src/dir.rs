@@ -137,6 +137,14 @@ pub fn decode_dir_entries(buf: &[u8]) -> Vec<DirEntryView> {
             continue;
         }
 
+        // Volume label entry.
+        // Not a real file or directory, so it never belongs in a listing.
+        if attr & ATTR_VOLUME_ID != 0 {
+            lfn_parts.clear();
+            i += 32;
+            continue;
+        }
+
         let short_name: [u8; 11] = slot[0..11].try_into().unwrap();
         let first_cluster_hi = u16::from_le_bytes([slot[20], slot[21]]) as u32;
         let first_cluster_lo = u16::from_le_bytes([slot[26], slot[27]]) as u32;
