@@ -41,7 +41,8 @@ fn build_backend(source: MountSource) -> Result<MountBackend, KError> {
     }
 }
 
-// Mount point must not already exist, and (except for the bootstrap "/"
+// Mount point must not already exist, there must be no mount points 
+// within this point and (except for the bootstrap "/"
 // mount into an empty table) must be an existing directory as seen through
 // the current mount table.
 fn validate_mount_point_and_source(path: &str, source: &MountSource) -> Result<(), KError> {
@@ -51,6 +52,9 @@ fn validate_mount_point_and_source(path: &str, source: &MountSource) -> Result<(
     }
     if is_mount_point(path) {
         return Err(KError::FileExists);
+    }
+    if has_mount_within(path) {
+        return Err(KError::FileBusy);
     }
     let attrs = crate::fs::stat(path)?;
     if attrs.mode & MODE_DIR == 0 {
@@ -122,13 +126,6 @@ pub fn unmount(path: &str) -> Result<(), KError> {
     }
     mounts.remove(idx);
     Ok(())
-}
-
-pub fn is_device_mounted(dev_ptr: *const DeviceObject) -> bool {
-    MOUNTS.lock().iter().any(|m| match &m.backend {
-        MountBackend::Module(fs) => fs.dev_ptr() == dev_ptr,
-        MountBackend::Memory(_) => false
-    })
 }
 
 pub fn is_mount_point(path: &str) -> bool {

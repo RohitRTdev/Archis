@@ -1,5 +1,4 @@
 // GPT (GUID Partition Table) encode/decode helpers, plus the protective MBR.
-// Pure byte-buffer logic — no device I/O here, that's the caller's job.
 //
 // Deliberate simplifications vs the full UEFI spec: primary header/entries
 // only (no backup GPT at the end of the disk, no repair-from-backup logic).

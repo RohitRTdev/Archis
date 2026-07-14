@@ -24,7 +24,9 @@ pub struct SharedFileState {
 struct DeviceState {
     fat_lock: KSyncHandle,
     dir_locks: BTreeMap<u32, KSyncHandle>,
-    open_files: BTreeMap<(u32, usize), Box<SharedFileState>>
+    open_files: BTreeMap<(u32, usize), Box<SharedFileState>>,
+    next_free_hint: u32,
+    bootstrapped: bool
 }
 
 impl DeviceState {
@@ -32,7 +34,9 @@ impl DeviceState {
         Self {
             fat_lock: sync_create_semaphore(1, 1),
             dir_locks: BTreeMap::new(),
-            open_files: BTreeMap::new()
+            open_files: BTreeMap::new(),
+            next_free_hint: 2,
+            bootstrapped: false
         }
     }
 }
@@ -91,6 +95,25 @@ fn with_device_state<R>(dev: *const DeviceObject, f: impl FnOnce(&mut DeviceStat
 // cluster_at_index-extend) for this device.
 pub fn fat_lock(dev: *const DeviceObject) -> KSyncHandle {
     with_device_state(dev, |s| s.fat_lock)
+}
+
+// Cluster to resume alloc_cluster_raw's free-cluster scan from. Callers must
+// already hold fat_lock for the duration of both the read and the matching
+// write.
+pub fn get_free_hint(dev: *const DeviceObject) -> u32 {
+    with_device_state(dev, |s| s.next_free_hint)
+}
+
+pub fn set_free_hint(dev: *const DeviceObject, cluster: u32) {
+    with_device_state(dev, |s| s.next_free_hint = cluster);
+}
+
+pub fn take_bootstrap(dev: *const DeviceObject) -> bool {
+    with_device_state(dev, |s| {
+        let first = !s.bootstrapped;
+        s.bootstrapped = true;
+        first
+    })
 }
 
 // Guards one directory's own entry-buffer read-modify-write (create/mkdir/

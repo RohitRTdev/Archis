@@ -1503,9 +1503,6 @@ fn kern_main() -> ! {
 
     io::init();
     intf::init();
-    fs::load_root_fs();
-
-    kernel_intf::run_tests!();
     
     #[cfg(all(not(feature = "kunit-test"),feature = "boot-anim"))]
     {
@@ -1513,6 +1510,10 @@ fn kern_main() -> ! {
         stop_boot_animation(true);
     }
 
+    fs::load_root_fs();
+
+    kernel_intf::run_tests!();
+    
     #[cfg(not(feature = "kunit-test"))] 
     {
         info!("Launching init...");

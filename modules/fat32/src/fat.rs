@@ -64,14 +64,37 @@ pub fn write_fat_entry(dev: *const DeviceObject, bpb: &Bpb, cluster: u32, value:
     Ok(())
 }
 
-// Linear scan for a free cluster, starting at 2, then marks it EOC
+// One-time, best-effort estimate of where the free-cluster boundary roughly
+// is, via binary search 
+fn estimate_free_hint(dev: *const DeviceObject, bpb: &Bpb, total: u32) -> u32 {
+    let mut lo = 2u32;
+    let mut hi = total + 2;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match read_fat_entry(dev, bpb, mid) {
+            Ok(v) if is_free(v) => hi = mid,
+            Ok(_) => lo = mid + 1,
+            Err(_) => return lo
+        }
+    }
+    lo
+}
+
+// Linear scan for a free cluster
 fn alloc_cluster_raw(dev: *const DeviceObject, bpb: &Bpb) -> Result<u32, i64> {
-    let total = bpb.num_clusters();
-    for cluster in 2..(total + 2) {
-        let cluster = cluster as u32;
+    let total = bpb.num_clusters() as u32;
+
+    if sync_state::take_bootstrap(dev) {
+        let estimate = estimate_free_hint(dev, bpb, total);
+        sync_state::set_free_hint(dev, estimate);
+    }
+
+    let hint = sync_state::get_free_hint(dev).clamp(2, total + 2);
+    for cluster in (hint..(total + 2)).chain(2..hint) {
         let v = read_fat_entry(dev, bpb, cluster)?;
         if is_free(v) {
             write_fat_entry(dev, bpb, cluster, EOC)?;
+            sync_state::set_free_hint(dev, cluster + 1);
             return Ok(cluster);
         }
     }
