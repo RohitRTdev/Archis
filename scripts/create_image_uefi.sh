@@ -44,6 +44,7 @@ install_kernel_image() {
   mkdir -p "$dst_blr/efi/boot"
   mkdir -p "$dst_kernel/bin"
   mkdir -p "$dst_kernel/conf"
+  mkdir -p "$dst_kernel/mnt/another_dir"
 
   cp "$src"/drivers/*.so "$dst_kernel/sys/drivers/" || echo "No drivers found..."
   cp "$src/drivers/boot.conf" "$dst_kernel/sys/drivers/" || echo "boot.conf not found..."

@@ -134,6 +134,14 @@ syscall_status_t sys_mkdir(const char *path) {
     return do_syscall(SYSCALL_MKDIR, (uint64_t)path, 0, 0, 0, 0, 0);
 }
 
+syscall_status_t sys_mount(const char *device, const char *path) {
+    return do_syscall(SYSCALL_MOUNT, (uint64_t)device, (uint64_t)path, 0, 0, 0, 0);
+}
+
+syscall_status_t sys_unmount(const char *path) {
+    return do_syscall(SYSCALL_UNMOUNT, (uint64_t)path, 0, 0, 0, 0, 0);
+}
+
 syscall_status_t sys_stat(const char *path, uint64_t flags, file_stat_t *out) {
     return do_syscall(SYSCALL_STAT, (uint64_t)path, flags, (uint64_t)out, 0, 0, 0);
 }

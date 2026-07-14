@@ -275,6 +275,8 @@ fn create_partition_device(
 
 fn stop_partitions(ctx: &mut RawDiskCtx) {
     for p in &ctx.parts {
+        let name = unsafe { (*p.dev_ptr).get_name().expect("Partition device expected to have name!") };
+        info!("Stopping partition device: {}", name);
         io_stop_device(p.dev_ptr);
     }
 }

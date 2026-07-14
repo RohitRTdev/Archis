@@ -48,7 +48,9 @@ enum syscall_t {
     SYSCALL_SHUTDOWN,
     SYSCALL_INTF_REQUEST,
     SYSCALL_TERMINATE_PROCESS,
-    SYSCALL_TERMINATE_THREAD
+    SYSCALL_TERMINATE_THREAD,
+    SYSCALL_MOUNT,
+    SYSCALL_UNMOUNT
 };
 
 typedef enum {
@@ -235,6 +237,8 @@ syscall_status_t sys_create_symlink(const char *path, const char *target);
 syscall_status_t sys_delete(const char *path);
 syscall_status_t sys_rename_file(const char *from, const char *to);
 syscall_status_t sys_mkdir(const char *path);
+syscall_status_t sys_mount(const char *device, const char *path);
+syscall_status_t sys_unmount(const char *path);
 syscall_status_t sys_stat(const char *path, uint64_t flags, file_stat_t *out);
 ssize_t          sys_seek(handle_t handle, ssize_t offset, seek_whence_t whence);
 syscall_status_t sys_fstat(handle_t handle, file_stat_t *out);

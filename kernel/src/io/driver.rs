@@ -558,6 +558,10 @@ pub fn devices_by_type(t: DeviceType) -> Vec<DeviceHandleK> {
     DEVICE_REGISTRY.lock().values().filter(|d| d.device_type() == t).cloned().collect()
 }
 
+pub fn device_by_name(name: &str) -> Option<DeviceHandleK> {
+    DEVICE_BY_NAME.lock().get(name).cloned()
+}
+
 pub fn root_device() -> DeviceHandleK {
     ROOT_DEVICE.get().expect("root device not initialized").clone()
 }

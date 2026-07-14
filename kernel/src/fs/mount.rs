@@ -100,11 +100,16 @@ pub fn remount(path: &str, backend: MountBackend) {
 }
 
 pub fn unmount(path: &str) -> Result<(), KError> {
-    if has_mount_within(path) {
+    if MOUNTS.lock().is_empty() {
+        return Err(KError::NotFound);
+    } 
+    let canonical = crate::fs::resolve_symlink(path)?;
+
+    if has_mount_within(&canonical) {
         return Err(KError::FileBusy);
     }
     let mut mounts = MOUNTS.lock();
-    let idx = mounts.iter().position(|m| m.mount_point == path).ok_or(KError::NotFound)?;
+    let idx = mounts.iter().position(|m| m.mount_point == canonical).ok_or(KError::NotFound)?;
     let busy = match &mounts[idx].backend {
         MountBackend::Memory(vfs) => vfs.lock().root_busy(),
         MountBackend::Module(fs) => fs.is_busy()

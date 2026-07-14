@@ -20,7 +20,7 @@ use super::*;
 use kernel_intf::*;
 use kernel_intf::driver::{IrpMajor, IrpMinor, ReqInfo, TtyControlInfo, TtyModeInfo, EMPTY_REGION, Status};
 
-const MAX_SYSCALLS: usize = 44;
+const MAX_SYSCALLS: usize = 46;
 const PROCESS_SUSPENDED_FLAG: u64 = 1 << 0;
 
 const OPEN_INHERITABLE_FLAG: u64 = 1 << 0;
@@ -82,7 +82,9 @@ static SYSCALL_TABLE: [fn(&[u64; MAX_ARCH_ARGS]) -> i64; MAX_SYSCALLS] = [
     sys_shutdown_handler,
     sys_intf_request_handler,
     sys_terminate_process_handler,
-    sys_terminate_thread_handler
+    sys_terminate_thread_handler,
+    sys_mount_handler,
+    sys_unmount_handler
 ];
 
 const STRLEN_SCAN_CHUNK: usize = 128;
@@ -1259,6 +1261,45 @@ fn sys_rename_file_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
         None => return E_INVALID_MEMORY_RANGE
     };
     match crate::fs::rename(&from, &to) {
+        Ok(()) => E_SUCCESS,
+        Err(e) => e.into()
+    }
+}
+
+// arg0 = device name or "tmpfs" ptr, arg1 = mount path ptr
+fn sys_mount_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let device = match read_user_string(args[0] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    let path = match read_user_string(args[1] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    let source = if device == "tmpfs" {
+        crate::fs::new_memory_source()
+    } else {
+        match crate::io::device_by_name(&device) {
+            Some(dev) => crate::fs::MountSource::Device(dev),
+            None => return E_NOT_FOUND
+        }
+    };
+    match crate::fs::mount(&path, source) {
+        Ok(()) => E_SUCCESS,
+        Err(e) => e.into()
+    }
+}
+
+// arg0 = mount path ptr
+fn sys_unmount_handler(args: &[u64; MAX_ARCH_ARGS]) -> i64 {
+    let path = match read_user_string(args[0] as usize) {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => return E_INVALID,
+        None => return E_INVALID_MEMORY_RANGE
+    };
+    match crate::fs::unmount(&path) {
         Ok(()) => E_SUCCESS,
         Err(e) => e.into()
     }
