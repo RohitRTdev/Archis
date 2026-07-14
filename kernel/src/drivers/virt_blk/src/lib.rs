@@ -697,16 +697,14 @@ extern "C" fn virtblk_dw(ctx_ptr: *mut c_void) {
     release_spinlock(&mut ctx.lock);
 
     for i in 0..completed_len {
-        if io_start_processing(completed_requests[i].0) {
-            let status = if completed_requests[i].1 == VIRTIO_BLK_S_OK {
-                Status::Success
-            }
-            else {
-                Status::Failed
-            };
-
-            io_complete_irp(completed_requests[i].0, status); 
+        let status = if completed_requests[i].1 == VIRTIO_BLK_S_OK {
+            Status::Success
         }
+        else {
+            Status::Failed
+        };
+
+        io_complete_irp(completed_requests[i].0, status); 
     }
 
     // Release the reference taken in virtblk_isr; if do_remove already ran

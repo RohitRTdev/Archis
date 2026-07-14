@@ -980,12 +980,17 @@ extern "C" fn io_complete(irp: *mut Irp, ctx: *mut c_void) {
     // Run the completion routines.
     match &mut ctx.comp_type {
         CompletionCtxType::Sync((event, result_ptr)) => {
-            unsafe { result_ptr.write((*irp).to_result()); }
+            if !is_cancelled {
+                unsafe { result_ptr.write((*irp).to_result()); }
+            }
             event.signal();
         },
         CompletionCtxType::Async((user_routine, user_ctx)) => {
-            let result = unsafe { (*irp).to_result() };
-            user_routine(&result as *const IrpResult, *user_ctx);
+            // Once cancelled, completion routine is not safe to call
+            if !is_cancelled {
+                let result = unsafe { (*irp).to_result() };
+                user_routine(&result as *const IrpResult, *user_ctx);
+            }
         }
     }
 
